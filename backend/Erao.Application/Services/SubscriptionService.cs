@@ -1,5 +1,6 @@
 using Erao.Core.DTOs.Subscription;
 using Erao.Core.Enums;
+using Erao.Core.Helpers;
 using Erao.Core.Interfaces;
 
 namespace Erao.Application.Services;
@@ -15,64 +16,30 @@ public class SubscriptionService : ISubscriptionService
 {
     private readonly IUnitOfWork _unitOfWork;
 
-    private static readonly List<SubscriptionPlanDto> _plans = new()
-    {
-        new SubscriptionPlanDto
-        {
-            Tier = SubscriptionTier.Starter,
-            Name = "Starter",
-            Price = 49m,
-            Description = "Perfect for trying out Erao",
-            QueriesPerMonth = 500,
-            DatabaseConnections = 1,
-            SupportLevel = "Basic",
-            Features = new List<string>
-            {
-                "500 queries/month",
-                "1 database connection",
-                "Basic support"
-            },
-            IsPopular = false
-        },
-        new SubscriptionPlanDto
-        {
-            Tier = SubscriptionTier.Professional,
-            Name = "Professional",
-            Price = 99m,
-            Description = "For growing teams",
-            QueriesPerMonth = 3000,
-            DatabaseConnections = 5,
-            SupportLevel = "Priority",
-            Features = new List<string>
-            {
-                "3,000 queries/month",
-                "5 database connections",
-                "Priority support"
-            },
-            IsPopular = true
-        },
-        new SubscriptionPlanDto
-        {
-            Tier = SubscriptionTier.Enterprise,
-            Name = "Enterprise",
-            Price = 299m,
-            Description = "For large organizations",
-            QueriesPerMonth = 15000,
-            DatabaseConnections = -1, // Unlimited
-            SupportLevel = "24/7 Dedicated",
-            Features = new List<string>
-            {
-                "15,000 queries/month",
-                "Unlimited connections",
-                "24/7 dedicated support"
-            },
-            IsPopular = false
-        }
-    };
-
     public SubscriptionService(IUnitOfWork unitOfWork)
     {
         _unitOfWork = unitOfWork;
+    }
+
+    /// <summary>
+    /// Generate subscription plans from the centralized SubscriptionLimits helper.
+    /// </summary>
+    private static List<SubscriptionPlanDto> GetAllPlans()
+    {
+        return Enum.GetValues<SubscriptionTier>()
+            .Select(tier => new SubscriptionPlanDto
+            {
+                Tier = tier,
+                Name = SubscriptionLimits.GetDisplayName(tier),
+                Price = SubscriptionLimits.GetPrice(tier),
+                Description = SubscriptionLimits.GetDescription(tier),
+                QueriesPerMonth = SubscriptionLimits.GetQueryLimit(tier),
+                DatabaseConnections = SubscriptionLimits.GetDatabaseConnectionLimit(tier),
+                SupportLevel = SubscriptionLimits.GetSupportLevel(tier),
+                Features = SubscriptionLimits.GetFeatures(tier),
+                IsPopular = SubscriptionLimits.IsPopular(tier)
+            })
+            .ToList();
     }
 
     public async Task<IEnumerable<SubscriptionPlanDto>> GetPlansAsync(Guid userId)
@@ -80,19 +47,12 @@ public class SubscriptionService : ISubscriptionService
         var user = await _unitOfWork.Users.GetByIdAsync(userId);
         var currentTier = user?.SubscriptionTier ?? SubscriptionTier.Starter;
 
-        return _plans.Select(p => new SubscriptionPlanDto
+        var plans = GetAllPlans();
+        foreach (var plan in plans)
         {
-            Tier = p.Tier,
-            Name = p.Name,
-            Price = p.Price,
-            Description = p.Description,
-            QueriesPerMonth = p.QueriesPerMonth,
-            DatabaseConnections = p.DatabaseConnections,
-            SupportLevel = p.SupportLevel,
-            Features = p.Features,
-            IsCurrent = p.Tier == currentTier,
-            IsPopular = p.IsPopular
-        });
+            plan.IsCurrent = plan.Tier == currentTier;
+        }
+        return plans;
     }
 
     public async Task<SubscriptionResponse> GetCurrentSubscriptionAsync(Guid userId)
@@ -106,7 +66,7 @@ public class SubscriptionService : ISubscriptionService
         return new SubscriptionResponse
         {
             CurrentTier = user.SubscriptionTier,
-            TierName = user.SubscriptionTier.ToString(),
+            TierName = SubscriptionLimits.GetDisplayName(user.SubscriptionTier),
             QueriesPerMonth = user.QueryLimitPerMonth,
             QueriesUsed = user.QueriesUsedThisMonth,
             BillingCycleReset = user.BillingCycleReset
@@ -121,20 +81,35 @@ public class SubscriptionService : ISubscriptionService
             throw new InvalidOperationException("User not found");
         }
 
-        // Validate upgrade (can only upgrade, not downgrade for now)
-        if (newTier <= user.SubscriptionTier)
-        {
-            throw new InvalidOperationException("Can only upgrade to a higher tier");
-        }
-
-        var newPlan = _plans.FirstOrDefault(p => p.Tier == newTier);
-        if (newPlan == null)
+        // Validate tier exists
+        if (!Enum.IsDefined(typeof(SubscriptionTier), newTier))
         {
             throw new InvalidOperationException("Invalid subscription tier");
         }
 
+        // Can't change to same tier
+        if (newTier == user.SubscriptionTier)
+        {
+            throw new InvalidOperationException("Already on this plan");
+        }
+
+        // Check if downgrading - verify user doesn't exceed new limits
+        if (newTier < user.SubscriptionTier)
+        {
+            var newDbLimit = SubscriptionLimits.GetDatabaseConnectionLimit(newTier);
+            if (newDbLimit != -1) // -1 means unlimited
+            {
+                var currentDbCount = (await _unitOfWork.DatabaseConnections.GetByUserIdAsync(userId)).Count();
+                if (currentDbCount > newDbLimit)
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot downgrade: You have {currentDbCount} database connections but {SubscriptionLimits.GetDisplayName(newTier)} plan only allows {newDbLimit}. Please remove some databases first.");
+                }
+            }
+        }
+
         user.SubscriptionTier = newTier;
-        user.QueryLimitPerMonth = newPlan.QueriesPerMonth;
+        user.QueryLimitPerMonth = SubscriptionLimits.GetQueryLimit(newTier);
         // Keep the current billing cycle, just update the limit
 
         await _unitOfWork.Users.UpdateAsync(user);
@@ -143,7 +118,7 @@ public class SubscriptionService : ISubscriptionService
         return new SubscriptionResponse
         {
             CurrentTier = user.SubscriptionTier,
-            TierName = user.SubscriptionTier.ToString(),
+            TierName = SubscriptionLimits.GetDisplayName(newTier),
             QueriesPerMonth = user.QueryLimitPerMonth,
             QueriesUsed = user.QueriesUsedThisMonth,
             BillingCycleReset = user.BillingCycleReset

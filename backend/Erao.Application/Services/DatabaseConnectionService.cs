@@ -1,6 +1,7 @@
 using AutoMapper;
 using Erao.Core.DTOs.Database;
 using Erao.Core.Entities;
+using Erao.Core.Helpers;
 using Erao.Core.Interfaces;
 
 namespace Erao.Application.Services;
@@ -53,6 +54,25 @@ public class DatabaseConnectionService : IDatabaseConnectionService
 
     public async Task<DatabaseConnectionDto> CreateAsync(Guid userId, CreateDatabaseConnectionRequest request)
     {
+        // Check database connection limit based on subscription tier
+        var user = await _unitOfWork.Users.GetByIdAsync(userId);
+        if (user == null)
+        {
+            throw new InvalidOperationException("User not found");
+        }
+
+        var existingConnections = await _unitOfWork.DatabaseConnections.GetByUserIdAsync(userId);
+        var connectionCount = existingConnections.Count();
+        var connectionLimit = SubscriptionLimits.GetDatabaseConnectionLimit(user.SubscriptionTier);
+
+        // -1 means unlimited
+        if (connectionLimit != -1 && connectionCount >= connectionLimit)
+        {
+            var tierName = SubscriptionLimits.GetDisplayName(user.SubscriptionTier);
+            throw new InvalidOperationException(
+                $"Database connection limit reached. Your {tierName} plan allows {connectionLimit} database connection(s). Please upgrade to add more.");
+        }
+
         var connection = new DatabaseConnection
         {
             UserId = userId,

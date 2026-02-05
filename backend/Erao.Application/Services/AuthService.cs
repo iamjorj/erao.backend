@@ -3,6 +3,7 @@ using Erao.Core.DTOs;
 using Erao.Core.DTOs.Auth;
 using Erao.Core.Entities;
 using Erao.Core.Enums;
+using Erao.Core.Helpers;
 using Erao.Core.Interfaces;
 using Microsoft.Extensions.Configuration;
 
@@ -355,12 +356,6 @@ public class AuthService : IAuthService
 
     private static int GetQueryLimitForTier(SubscriptionTier tier)
     {
-        return tier switch
-        {
-            SubscriptionTier.Starter => 100,
-            SubscriptionTier.Professional => 1000,
-            SubscriptionTier.Enterprise => 10000,
-            _ => 100
-        };
+        return SubscriptionLimits.GetQueryLimit(tier);
     }
 }

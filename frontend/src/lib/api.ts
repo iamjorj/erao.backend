@@ -720,8 +720,10 @@ class ChatHubConnection {
           }
         }, 100);
       });
-      if (this.connection?.state === signalR.HubConnectionState.Connected) {
-        return this.connection;
+      // Re-check connection state after waiting - use fresh variable to avoid TS narrowing issues
+      const conn = this.connection;
+      if (conn && conn.state === signalR.HubConnectionState.Connected) {
+        return conn;
       }
     }
 

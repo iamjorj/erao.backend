@@ -2,7 +2,6 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
 import { api, User, auth } from "@/lib/api";
 
 export default function ProfilePage() {
@@ -94,15 +93,15 @@ export default function ProfilePage() {
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex flex-col items-center justify-center gap-6 p-10 transition-colors relative">
       {/* Back Button - Top Left */}
-      <Link
-        href="/ai"
+      <button
+        onClick={() => router.back()}
         className="absolute top-6 left-6 flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white transition-colors"
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
         </svg>
         Back
-      </Link>
+      </button>
 
       {/* Header */}
       <div className="w-full max-w-lg bg-white dark:bg-gray-800 rounded-2xl p-5 transition-colors">

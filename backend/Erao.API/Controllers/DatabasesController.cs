@@ -67,6 +67,11 @@ public class DatabasesController : ControllerBase
             return CreatedAtAction(nameof(GetById), new { id = connection.Id },
                 ApiResponse<DatabaseConnectionDto>.SuccessResponse(connection, "Database connection created"));
         }
+        catch (InvalidOperationException ex)
+        {
+            // Handle limit exceeded or validation errors
+            return BadRequest(ApiResponse<DatabaseConnectionDto>.ErrorResponse(ex.Message));
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error creating database connection");

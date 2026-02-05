@@ -18,6 +18,7 @@ import {
 } from "@/lib/api";
 import { DataChart, ChartType, detectChartType } from "@/components/DataChart";
 import { DataViewerModal } from "@/components/DataViewerModal";
+import { MarkdownResponse } from "@/components/MarkdownResponse";
 import { useVirtualizer } from "@tanstack/react-virtual";
 
 // Helper to strip SQL/JSON code blocks and query result blocks from AI response text
@@ -35,6 +36,28 @@ function stripCodeBlocks(content: string): string {
     .replace(/\(Query returned[^)\n]*\)?/gi, "") // Remove "(Query returned...)" text
     .replace(/\n{3,}/g, "\n\n") // Clean up extra newlines
     .trim();
+}
+
+// Helper to convert array rows to object rows
+function normalizeRows(columns: string[], rows: unknown[]): Record<string, unknown>[] {
+  if (!rows || rows.length === 0) return [];
+
+  // Check if rows are already objects
+  if (rows[0] && typeof rows[0] === 'object' && !Array.isArray(rows[0])) {
+    return rows as Record<string, unknown>[];
+  }
+
+  // Convert array rows to object rows
+  return rows.map(row => {
+    if (Array.isArray(row)) {
+      const obj: Record<string, unknown> = {};
+      columns.forEach((col, idx) => {
+        obj[col] = row[idx];
+      });
+      return obj;
+    }
+    return row as Record<string, unknown>;
+  });
 }
 
 // Helper to safely parse queryResult (can be string, object, or null)
@@ -58,7 +81,11 @@ function parseQueryResult(queryResult: QueryResult | string | null): QueryResult
       const results: QueryResult[] = [];
       for (const table of tablesData) {
         if (table && typeof table === "object" && "rows" in table && "columns" in table) {
-          results.push(table as QueryResult);
+          const t = table as { columns: string[]; rows: unknown[] };
+          results.push({
+            ...t,
+            rows: normalizeRows(t.columns, t.rows),
+          } as QueryResult);
         }
       }
       return results.length > 0 ? results : null;
@@ -67,7 +94,11 @@ function parseQueryResult(queryResult: QueryResult | string | null): QueryResult
 
   // Single table format
   if (parsed && typeof parsed === "object" && "rows" in parsed && "columns" in parsed) {
-    return [parsed as QueryResult];
+    const p = parsed as { columns: string[]; rows: unknown[] };
+    return [{
+      ...p,
+      rows: normalizeRows(p.columns, p.rows),
+    } as QueryResult];
   }
 
   return null;
@@ -212,9 +243,20 @@ export default function AIPage() {
   // Conversations state
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const [initialLoadComplete, setInitialLoadComplete] = useState(false);
+  const initialConversationIdRef = useRef<string | null>(
+    typeof window !== "undefined" ? localStorage.getItem("selectedConversationId") : null
+  );
   const [messages, setMessages] = useState<Message[]>([]);
-  const [loadingConversations, setLoadingConversations] = useState(false);
+  const [loadingConversations, setLoadingConversations] = useState(true);
   const [loadingMessages, setLoadingMessages] = useState(false);
+
+  // Persist selected conversation to localStorage
+  useEffect(() => {
+    if (selectedConversationId) {
+      localStorage.setItem("selectedConversationId", selectedConversationId);
+    }
+  }, [selectedConversationId]);
 
   // Database connections state
   const [databases, setDatabases] = useState<DatabaseConnection[]>([]);
@@ -237,6 +279,19 @@ export default function AIPage() {
 
   // Loading phase indicator
   const [currentPhase, setCurrentPhase] = useState<"writing" | "executing" | null>(null);
+  const phaseTimeoutsRef = useRef<{ writing?: NodeJS.Timeout; executing?: NodeJS.Timeout }>({});
+
+  // Track pending request's conversation ID to handle background completion
+  const pendingConversationRef = useRef<string | null>(null);
+
+  // Track current selected conversation (for async callbacks)
+  const selectedConversationIdRef = useRef<string | null>(null);
+
+  // Track all conversations with pending requests (for UI indicator)
+  const [pendingConversations, setPendingConversations] = useState<Set<string>>(new Set());
+
+  // Track pending message info per conversation (message content and phase)
+  const pendingMessagesRef = useRef<Map<string, { message: string; phase: "writing" | "executing" | null }>>(new Map());
 
   // Error state
   const [error, setError] = useState<string | null>(null);
@@ -286,6 +341,11 @@ export default function AIPage() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Keep selectedConversationIdRef in sync with state (for async callbacks)
+  useEffect(() => {
+    selectedConversationIdRef.current = selectedConversationId;
+  }, [selectedConversationId]);
 
   // Close chat menu when clicking outside
   useEffect(() => {
@@ -364,20 +424,58 @@ export default function AIPage() {
   }, [router]);
 
   const loadConversations = async () => {
-    setLoadingConversations(true);
     try {
+      // Set loading state for chat area immediately if we have a saved conversation
+      const savedId = initialConversationIdRef.current;
+      if (savedId) {
+        setSelectedConversationId(savedId);
+        setLoadingMessages(true);
+      }
+
       const response = await api.getConversations();
       if (response.success) {
         setConversations(response.data);
-        // Auto-select first conversation if available
-        if (response.data.length > 0 && !selectedConversationId) {
-          selectConversation(response.data[0].id);
+
+        const savedExists = savedId && response.data.some(c => c.id === savedId);
+
+        if (savedExists && savedId) {
+          // Load messages for saved conversation
+          try {
+            const convResponse = await api.getConversation(savedId);
+            if (convResponse.success) {
+              setMessages(convResponse.data.messages);
+              if (convResponse.data.databaseConnectionId) {
+                setSelectedDatabaseId(convResponse.data.databaseConnectionId);
+                setSelectedFileId(null);
+              } else if (convResponse.data.fileDocumentId) {
+                setSelectedFileId(convResponse.data.fileDocumentId);
+                setSelectedDatabaseId(null);
+              }
+            }
+          } catch {
+            console.error("Failed to load saved conversation");
+          } finally {
+            setLoadingMessages(false);
+          }
+        } else if (response.data.length > 0) {
+          // Clear invalid saved ID and select first
+          if (savedId) {
+            localStorage.removeItem("selectedConversationId");
+          }
+          await selectConversation(response.data[0].id);
+        } else {
+          // No conversations exist - clear loading state
+          setLoadingMessages(false);
+          if (savedId) {
+            localStorage.removeItem("selectedConversationId");
+          }
         }
       }
     } catch (err) {
       console.error("Failed to load conversations:", err);
     } finally {
       setLoadingConversations(false);
+      setInitialLoadComplete(true);
     }
   };
 
@@ -500,6 +598,15 @@ export default function AIPage() {
     setSelectedConversationId(conversationId);
     setLoadingMessages(true);
     setError(null);
+    // Reset sending state when switching conversations
+    setIsSending(false);
+    setCurrentPhase(null);
+    // Clear any pending phase timers
+    if (phaseTimeoutsRef.current.writing) clearTimeout(phaseTimeoutsRef.current.writing);
+    if (phaseTimeoutsRef.current.executing) clearTimeout(phaseTimeoutsRef.current.executing);
+    phaseTimeoutsRef.current = {};
+    // Update pending ref to new conversation - callbacks from old requests will see the mismatch
+    pendingConversationRef.current = conversationId;
 
     try {
       const response = await api.getConversation(conversationId);
@@ -598,32 +705,74 @@ export default function AIPage() {
     };
     setMessages((prev) => [...prev, tempUserMessage]);
 
+    // Track which conversation this request is for
+    const requestConversationId = conversationId!;
+    pendingConversationRef.current = requestConversationId;
+
+    // Add to pending conversations set (for UI indicator in sidebar)
+    setPendingConversations(prev => new Set(prev).add(requestConversationId));
+
+    // Store pending message info for this conversation
+    pendingMessagesRef.current.set(requestConversationId, { message: messageContent, phase: null });
+
     try {
       // Fake phases - show "writing" after 500ms, "executing" after 2s
-      const writingTimeout = setTimeout(() => setCurrentPhase("writing"), 500);
-      const executingTimeout = setTimeout(() => setCurrentPhase("executing"), 2000);
+      phaseTimeoutsRef.current.writing = setTimeout(() => {
+        setCurrentPhase("writing");
+        // Update phase in pending messages ref
+        const pending = pendingMessagesRef.current.get(requestConversationId);
+        if (pending) pendingMessagesRef.current.set(requestConversationId, { ...pending, phase: "writing" });
+      }, 500);
+      phaseTimeoutsRef.current.executing = setTimeout(() => {
+        setCurrentPhase("executing");
+        // Update phase in pending messages ref
+        const pending = pendingMessagesRef.current.get(requestConversationId);
+        if (pending) pendingMessagesRef.current.set(requestConversationId, { ...pending, phase: "executing" });
+      }, 2000);
 
-      // Use REST API
+      // Use REST API - this completes even if user switches away
       const response = await api.sendMessage({
-        conversationId: conversationId!,
+        conversationId: requestConversationId,
         message: messageContent,
         executeQuery: true,
       });
 
       // Clear fake phase timers
-      clearTimeout(writingTimeout);
-      clearTimeout(executingTimeout);
+      if (phaseTimeoutsRef.current.writing) clearTimeout(phaseTimeoutsRef.current.writing);
+      if (phaseTimeoutsRef.current.executing) clearTimeout(phaseTimeoutsRef.current.executing);
+      phaseTimeoutsRef.current = {};
 
-      if (response.success) {
-        // Replace temp message with real user message
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === tempUserMessage.id ? response.data.userMessage : m
-          )
-        );
+      // Check if user is currently viewing the same conversation (using ref for accurate async check)
+      const currentlyViewingConversation = selectedConversationIdRef.current === requestConversationId;
 
-        // Add assistant message
-        setMessages((prev) => [...prev, response.data.assistantMessage]);
+      // Clear pending ref if this was the tracked conversation
+      if (pendingConversationRef.current === requestConversationId) {
+        pendingConversationRef.current = null;
+      }
+
+      // Remove from pending conversations set and clean up pending message info
+      setPendingConversations(prev => {
+        const next = new Set(prev);
+        next.delete(requestConversationId);
+        return next;
+      });
+      pendingMessagesRef.current.delete(requestConversationId);
+
+      if (response.success && currentlyViewingConversation) {
+        // Reload messages from API to get fresh data
+        // This handles both normal completion and when user switched away and back
+        try {
+          const convResponse = await api.getConversation(requestConversationId);
+          if (convResponse.success) {
+            setMessages(convResponse.data.messages);
+          }
+        } catch {
+          // Fallback: try to update messages directly
+          setMessages((prev) => {
+            const filtered = prev.filter(m => m.id !== tempUserMessage.id);
+            return [...filtered, response.data.userMessage, response.data.assistantMessage];
+          });
+        }
 
         // Check if user requested a specific chart type
         const requestedChartType = detectRequestedChartType(messageContent);
@@ -633,24 +782,59 @@ export default function AIPage() {
             [response.data.assistantMessage.id]: requestedChartType,
           }));
         }
-
-        // Refresh conversations to get updated title
-        loadConversations();
       }
 
-      setCurrentPhase(null);
-      setIsSending(false);
+      // Always refresh conversations to get updated title (even if switched away)
+      loadConversations();
+
+      // Only update loading state if still on same conversation
+      if (currentlyViewingConversation) {
+        setCurrentPhase(null);
+        setIsSending(false);
+      }
     } catch (err) {
-      // Remove optimistic message on error
-      setMessages((prev) => prev.filter((m) => m && m.id !== tempUserMessage.id));
-      setCurrentPhase(null);
-      setIsSending(false);
-      if (err instanceof ApiError) {
-        setError(err.message);
-      } else {
-        setError("Failed to send message");
+      // Clear fake phase timers on error too
+      if (phaseTimeoutsRef.current.writing) clearTimeout(phaseTimeoutsRef.current.writing);
+      if (phaseTimeoutsRef.current.executing) clearTimeout(phaseTimeoutsRef.current.executing);
+      phaseTimeoutsRef.current = {};
+
+      // Check if user is currently viewing the same conversation
+      const currentlyViewingConversation = selectedConversationIdRef.current === requestConversationId;
+
+      // Clear pending ref if this was the tracked conversation
+      if (pendingConversationRef.current === requestConversationId) {
+        pendingConversationRef.current = null;
       }
-      setInputValue(messageContent);
+
+      // Remove from pending conversations set and clean up pending message info
+      setPendingConversations(prev => {
+        const next = new Set(prev);
+        next.delete(requestConversationId);
+        return next;
+      });
+      pendingMessagesRef.current.delete(requestConversationId);
+
+      // Only update UI if still on same conversation
+      if (currentlyViewingConversation) {
+        // Reload messages to remove optimistic message
+        try {
+          const convResponse = await api.getConversation(requestConversationId);
+          if (convResponse.success) {
+            setMessages(convResponse.data.messages);
+          }
+        } catch {
+          // Fallback: remove optimistic message
+          setMessages((prev) => prev.filter((m) => m && m.id !== tempUserMessage.id));
+        }
+        setCurrentPhase(null);
+        setIsSending(false);
+        if (err instanceof ApiError) {
+          setError(err.message);
+        } else {
+          setError("Failed to send message");
+        }
+        setInputValue(messageContent);
+      }
     }
   };
 
@@ -718,10 +902,11 @@ export default function AIPage() {
   const selectedDatabase = databases.find((d) => d.id === selectedDatabaseId);
   const selectedFile = files.find((f) => f.id === selectedFileId);
 
+  // Show loading only for auth check
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-[#f9fafb] flex items-center justify-center">
-        <div className="text-gray-500 text-sm">Loading...</div>
+      <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex items-center justify-center">
+        <div className="text-gray-500 dark:text-gray-400 text-sm">Loading...</div>
       </div>
     );
   }
@@ -804,9 +989,19 @@ export default function AIPage() {
                           onClick={(e) => e.stopPropagation()}
                         />
                       ) : (
-                        <span className="text-sm font-medium truncate pr-8 text-gray-900 dark:text-white">
-                          {chat.title || "New Chat"}
-                        </span>
+                        <div className="flex items-center gap-2 pr-8">
+                          <span className="text-sm font-medium truncate text-gray-900 dark:text-white">
+                            {chat.title || "New Chat"}
+                          </span>
+                          {pendingConversations.has(chat.id) && (
+                            <div className="flex-shrink-0 flex items-center gap-1">
+                              <span className="relative flex h-2.5 w-2.5">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-gray-400 dark:bg-gray-500 opacity-75"></span>
+                                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-gray-500 dark:bg-gray-400"></span>
+                              </span>
+                            </div>
+                          )}
+                        </div>
                       )}
                       <div className="flex items-center gap-1.5 text-xs text-gray-400 dark:text-gray-500 pr-8">
                         {(chat.databaseConnectionName || chat.fileDocumentName) && (
@@ -1048,7 +1243,7 @@ export default function AIPage() {
         <div className="flex-1 overflow-y-auto overflow-x-hidden px-8 py-6 flex flex-col gap-6 custom-scrollbar">
           {loadingMessages ? (
             <div className="flex items-center justify-center h-full">
-              <div className="text-gray-400 dark:text-gray-500 text-sm">Loading messages...</div>
+              <div className="w-8 h-8 border-2 border-gray-200 dark:border-gray-700 border-t-gray-800 dark:border-t-white rounded-full animate-spin" />
             </div>
           ) : messages.length === 0 ? (
             <div className="flex items-center justify-center h-full">
@@ -1091,9 +1286,7 @@ export default function AIPage() {
                 {message.role === "Assistant" ? (
                   <div className="w-[70%] max-w-[70%] bg-white dark:bg-gray-800 rounded-2xl p-5 flex flex-col gap-3.5 shadow-sm border border-gray-100/80 dark:border-gray-700/80 overflow-hidden">
                     <span className="font-semibold text-base text-gray-900 dark:text-white">Erao</span>
-                    <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed whitespace-pre-wrap">
-                      {stripCodeBlocks(message.content)}
-                    </p>
+                    <MarkdownResponse content={stripCodeBlocks(message.content)} />
                     {(() => {
                       const parsedResults = parseQueryResult(message.queryResult);
                       if (!parsedResults || parsedResults.length === 0) return null;
@@ -1233,13 +1426,20 @@ export default function AIPage() {
 
                       // Single table - render normally
                       const parsedResult = parsedResults[0];
-                      if (!parsedResult.rows || parsedResult.rows.length === 0) return null;
+                      if (!parsedResult.rows || parsedResult.rows.length === 0) {
+                        // Show empty state instead of hiding completely
+                        return (
+                          <div className="bg-[#fafafc] dark:bg-gray-800 rounded-xl p-4 mt-2 text-center">
+                            <p className="text-sm text-gray-500 dark:text-gray-400">No data returned</p>
+                          </div>
+                        );
+                      }
 
                       // For single row results, show as a clean card instead of a table
                       if (parsedResult.rows.length === 1) {
                         const row = parsedResult.rows[0];
                         const values = parsedResult.columns.map((col) => ({
-                          label: col.replace(/_/g, ' ').replace(/([A-Z])/g, ' $1').trim(),
+                          label: col.replace(/_/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').trim(),
                           value: row[col],
                         }));
 
@@ -1252,27 +1452,34 @@ export default function AIPage() {
                         const otherValues = values.filter((_, idx) => idx !== mainValueIdx);
 
                         return (
-                          <div className="bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-900/30 dark:to-teal-900/30 border border-emerald-200 dark:border-emerald-700 rounded-xl p-5 mt-2">
-                            {/* Main value highlight */}
+                          <div className="mt-3 space-y-3">
+                            {/* Main value - featured card */}
                             {mainValue && (
-                              <div className="mb-4">
-                                <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400 uppercase tracking-wide">
-                                  {mainValue.label}
-                                </span>
-                                <div className="text-3xl font-bold text-gray-900 dark:text-white mt-1">
-                                  {typeof mainValue.value === "number"
-                                    ? mainValue.value.toLocaleString(undefined, { maximumFractionDigits: 2 })
-                                    : String(mainValue.value)}
+                              <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-gray-900 to-gray-800 dark:from-gray-100 dark:to-gray-200 p-5">
+                                <div className="absolute top-0 right-0 w-32 h-32 bg-white/5 dark:bg-black/5 rounded-full -translate-y-1/2 translate-x-1/2"></div>
+                                <div className="absolute bottom-0 left-0 w-24 h-24 bg-white/5 dark:bg-black/5 rounded-full translate-y-1/2 -translate-x-1/2"></div>
+                                <div className="relative">
+                                  <span className="text-xs font-medium text-gray-400 dark:text-gray-500 uppercase tracking-wider">
+                                    {mainValue.label}
+                                  </span>
+                                  <div className="text-4xl font-bold text-white dark:text-gray-900 mt-1 tracking-tight">
+                                    {typeof mainValue.value === "number"
+                                      ? mainValue.value.toLocaleString(undefined, { maximumFractionDigits: 2 })
+                                      : String(mainValue.value)}
+                                  </div>
                                 </div>
                               </div>
                             )}
-                            {/* Other values */}
+                            {/* Other values - stat cards */}
                             {otherValues.length > 0 && (
-                              <div className={`grid gap-3 ${otherValues.length > 2 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                              <div className={`grid gap-2 ${otherValues.length >= 3 ? 'grid-cols-3' : otherValues.length === 2 ? 'grid-cols-2' : 'grid-cols-1'}`}>
                                 {otherValues.map((item, idx) => (
-                                  <div key={idx} className="bg-white/60 dark:bg-gray-800/60 rounded-lg px-3 py-2">
-                                    <span className="text-xs text-gray-500 dark:text-gray-400 capitalize">{item.label}</span>
-                                    <div className="text-sm font-semibold text-gray-800 dark:text-gray-200 mt-0.5">
+                                  <div
+                                    key={idx}
+                                    className="rounded-xl bg-gray-100 dark:bg-gray-800 px-4 py-3 hover:bg-gray-150 dark:hover:bg-gray-750 transition-colors"
+                                  >
+                                    <span className="text-[10px] text-gray-500 dark:text-gray-400 uppercase tracking-wider font-medium block">{item.label}</span>
+                                    <div className="text-lg font-semibold text-gray-900 dark:text-white mt-1">
                                       {typeof item.value === "number"
                                         ? item.value.toLocaleString(undefined, { maximumFractionDigits: 2 })
                                         : String(item.value)}
@@ -1413,48 +1620,196 @@ export default function AIPage() {
               </div>
             ))
           )}
-          {isSending && (
-            <div className="w-[70%] max-w-[70%] bg-white dark:bg-gray-800 rounded-2xl p-5 shadow-sm border border-gray-100/80 dark:border-gray-700/80">
-              <p className="font-semibold text-base text-gray-900 dark:text-white mb-3">Erao</p>
-              {currentPhase === "writing" ? (
-                /* Writing response phase */
-                <div className="flex items-center gap-3">
-                  <span className="flex gap-1.5">
-                    <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                    <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse [animation-delay:0.2s]" />
-                    <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse [animation-delay:0.4s]" />
-                  </span>
-                  <span className="text-sm text-green-600 dark:text-green-400">
-                    Writing response...
-                  </span>
+          {/* Show processing indicator when actively sending OR when this conversation has pending request */}
+          {(isSending || (selectedConversationId && pendingConversations.has(selectedConversationId) && !isSending)) && (() => {
+            // Get pending message info for background processing
+            const pendingInfo = selectedConversationId ? pendingMessagesRef.current.get(selectedConversationId) : null;
+            const effectivePhase = isSending ? currentPhase : pendingInfo?.phase ?? null;
+            const pendingMessage = !isSending && pendingInfo ? pendingInfo.message : null;
+
+            return (
+              <>
+                {/* Show user's pending message when returning to conversation */}
+                {pendingMessage && (
+                  <div className="flex justify-end mb-4">
+                    <div className="max-w-[70%] bg-gradient-to-br from-gray-800 to-gray-900 rounded-2xl px-[18px] py-3.5 shadow-sm">
+                      <p className="text-sm text-white leading-relaxed">
+                        {pendingMessage}
+                      </p>
+                    </div>
+                  </div>
+                )}
+                <div className="w-[70%] max-w-[70%] bg-white dark:bg-gray-800 rounded-2xl p-5 shadow-sm border border-gray-100/80 dark:border-gray-700/80">
+                  <p className="font-semibold text-base text-gray-900 dark:text-white mb-4">Erao</p>
+                  <div className="flex items-center gap-5">
+                    {/* Robot Animation Container */}
+                <div className="relative w-20 h-20 flex-shrink-0">
+                  <svg viewBox="0 0 300 300" className="w-full h-full overflow-visible">
+                    {/* Thought rings orbiting around */}
+                    <ellipse
+                      cx="150" cy="150" rx="90" ry="30"
+                      className="fill-none stroke-black dark:stroke-white opacity-30"
+                      strokeWidth="1.5"
+                      style={{ transformOrigin: '150px 150px', animation: 'orbit-ring 4s linear infinite' }}
+                    />
+                    <ellipse
+                      cx="150" cy="150" rx="70" ry="25"
+                      className="fill-none stroke-black dark:stroke-white opacity-30"
+                      strokeWidth="1.5"
+                      style={{ transformOrigin: '150px 150px', animation: 'orbit-ring 4s linear infinite reverse', animationDelay: '-2s' }}
+                    />
+
+                    {/* Floating particles */}
+                    <circle cx="80" cy="100" r="3" className="fill-black dark:fill-white" style={{ animation: 'particle-float 2s ease-in-out infinite' }} />
+                    <circle cx="220" cy="110" r="2" className="fill-black dark:fill-white" style={{ animation: 'particle-float 2s ease-in-out infinite', animationDelay: '0.3s' }} />
+                    <circle cx="70" cy="180" r="2.5" className="fill-black dark:fill-white" style={{ animation: 'particle-float 2s ease-in-out infinite', animationDelay: '0.6s' }} />
+                    <circle cx="230" cy="190" r="2" className="fill-black dark:fill-white" style={{ animation: 'particle-float 2s ease-in-out infinite', animationDelay: '0.9s' }} />
+                    <circle cx="150" cy="60" r="3" className="fill-black dark:fill-white" style={{ animation: 'particle-float 2s ease-in-out infinite', animationDelay: '1.2s' }} />
+                    <circle cx="150" cy="240" r="2" className="fill-black dark:fill-white" style={{ animation: 'particle-float 2s ease-in-out infinite', animationDelay: '1.5s' }} />
+
+                    {/* Main robot group with float + sway */}
+                    <g style={{ animation: 'robot-float 3s ease-in-out infinite' }}>
+                      <g style={{ transformOrigin: '150px 150px', animation: 'robot-sway 4s ease-in-out infinite' }}>
+
+                        {/* Body */}
+                        <rect
+                          x="100" y="100" width="100" height="100" rx="8"
+                          className="fill-none stroke-black dark:stroke-white"
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+
+                        {/* Inner frame */}
+                        <rect
+                          x="110" y="110" width="80" height="80" rx="4"
+                          className="fill-none stroke-black dark:stroke-white"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          style={{ animation: 'pulse-glow 2s ease-in-out infinite' }}
+                        />
+
+                        {/* Thinking eye/core */}
+                        <g style={{ animation: 'pulse-glow 2s ease-in-out infinite' }}>
+                          <circle
+                            cx="150" cy="150" r="25"
+                            className="fill-none stroke-black dark:stroke-white"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                          />
+
+                          {/* Spinning inner elements */}
+                          <g style={{ transformOrigin: '150px 150px', animation: 'think-spin 3s linear infinite' }}>
+                            <circle cx="150" cy="130" r="4" className="fill-black dark:fill-white" />
+                            <circle cx="170" cy="150" r="3" className="fill-black dark:fill-white" />
+                            <circle cx="150" cy="170" r="4" className="fill-black dark:fill-white" />
+                            <circle cx="130" cy="150" r="3" className="fill-black dark:fill-white" />
+                          </g>
+                        </g>
+
+                        {/* Antenna */}
+                        <line
+                          x1="150" y1="100" x2="150" y2="70"
+                          className="stroke-black dark:stroke-white"
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                        <circle
+                          cx="150" cy="65" r="6"
+                          className="fill-black dark:fill-white"
+                          style={{ animation: 'antenna-blink 1s ease-in-out infinite' }}
+                        />
+
+                        {/* Arms */}
+                        <g style={{ transformOrigin: '90px 135px', animation: 'arm-wave-left 2s ease-in-out infinite' }}>
+                          <polygon
+                            points="100,120 70,140 70,160 100,150"
+                            className="fill-none stroke-black dark:stroke-white"
+                            strokeWidth="3"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                          <circle
+                            cx="70" cy="150" r="8"
+                            className="fill-none stroke-black dark:stroke-white"
+                            strokeWidth="1.5"
+                            style={{ animation: 'pulse-glow 2s ease-in-out infinite' }}
+                          />
+                        </g>
+
+                        <g style={{ transformOrigin: '210px 135px', animation: 'arm-wave-right 2s ease-in-out infinite' }}>
+                          <polygon
+                            points="200,120 230,140 230,160 200,150"
+                            className="fill-none stroke-black dark:stroke-white"
+                            strokeWidth="3"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                          <circle
+                            cx="230" cy="150" r="8"
+                            className="fill-none stroke-black dark:stroke-white"
+                            strokeWidth="1.5"
+                            style={{ animation: 'pulse-glow 2s ease-in-out infinite' }}
+                          />
+                        </g>
+
+                        {/* Legs */}
+                        <g style={{ animation: 'leg-float 2.5s ease-in-out infinite' }}>
+                          <polygon
+                            points="120,200 130,240 110,240"
+                            className="fill-none stroke-black dark:stroke-white"
+                            strokeWidth="3"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                          <circle
+                            cx="120" cy="245" r="5"
+                            className="fill-none stroke-black dark:stroke-white"
+                            strokeWidth="1.5"
+                          />
+                        </g>
+
+                        <g style={{ animation: 'leg-float 2.5s ease-in-out infinite', animationDelay: '-1.25s' }}>
+                          <polygon
+                            points="180,200 190,240 170,240"
+                            className="fill-none stroke-black dark:stroke-white"
+                            strokeWidth="3"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                          <circle
+                            cx="180" cy="245" r="5"
+                            className="fill-none stroke-black dark:stroke-white"
+                            strokeWidth="1.5"
+                          />
+                        </g>
+
+                      </g>
+                    </g>
+                  </svg>
                 </div>
-              ) : currentPhase === "executing" ? (
-                /* Executing query phase */
-                <div className="flex items-center gap-3">
-                  <span className="flex gap-1.5">
-                    <span className="w-2 h-2 bg-blue-500 rounded-full animate-pulse" />
-                    <span className="w-2 h-2 bg-blue-500 rounded-full animate-pulse [animation-delay:0.2s]" />
-                    <span className="w-2 h-2 bg-blue-500 rounded-full animate-pulse [animation-delay:0.4s]" />
-                  </span>
-                  <span className="text-sm text-blue-600 dark:text-blue-400">
-                    Running query...
-                  </span>
+
+                {/* Phase Text */}
+                    <div className="flex flex-col gap-1.5">
+                      <span className="text-sm font-medium text-gray-900 dark:text-white tracking-wide">
+                        {effectivePhase === "writing"
+                          ? "Writing response"
+                          : effectivePhase === "executing"
+                          ? "Running query"
+                          : "Thinking"}
+                      </span>
+                      <span className="flex gap-1 items-center">
+                        <span className="w-1 h-1 bg-black dark:bg-white rounded-full animate-bounce" />
+                        <span className="w-1 h-1 bg-black dark:bg-white rounded-full animate-bounce [animation-delay:0.1s]" />
+                        <span className="w-1 h-1 bg-black dark:bg-white rounded-full animate-bounce [animation-delay:0.2s]" />
+                      </span>
+                    </div>
+                  </div>
                 </div>
-              ) : (
-                /* Initial thinking state */
-                <div className="flex items-center gap-3">
-                  <span className="flex gap-1.5">
-                    <span className="w-2 h-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-pulse" />
-                    <span className="w-2 h-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-pulse [animation-delay:0.2s]" />
-                    <span className="w-2 h-2 bg-gray-400 dark:bg-gray-500 rounded-full animate-pulse [animation-delay:0.4s]" />
-                  </span>
-                  <span className="text-sm text-gray-500 dark:text-gray-400">
-                    Thinking...
-                  </span>
-                </div>
-              )}
-            </div>
-          )}
+              </>
+            );
+          })()}
           <div ref={messagesEndRef} />
         </div>
 
