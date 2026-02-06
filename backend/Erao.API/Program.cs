@@ -53,4 +53,7 @@ app.UseAuthorization();
 
 app.MapControllers();
 
+// Health check endpoint for Railway / Docker
+app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
+
 app.Run();

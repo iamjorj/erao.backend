@@ -15,3 +15,8 @@
 **/*.suo
 **/.DS_Store
 **/Thumbs.db
+**/README.md
+**/LICENSE
+**/docker-compose*.yml
+**/railway.toml
+**/.github

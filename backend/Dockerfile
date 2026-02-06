@@ -32,16 +32,14 @@ USER appuser
 # Copy published application
 COPY --from=build /app/publish .
 
-# Expose port
-EXPOSE 8080
+# Railway injects PORT env var - default to 8080 for local
+ENV PORT=8080
+EXPOSE ${PORT}
 
-# Set environment variables
-ENV ASPNETCORE_URLS=http://+:8080
+# .NET container optimizations
+ENV DOTNET_RUNNING_IN_CONTAINER=true
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
 ENV ASPNETCORE_ENVIRONMENT=Production
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
-
-# Entry point
-ENTRYPOINT ["dotnet", "Erao.API.dll"]
+# Use PORT env var so Railway can control the port
+ENTRYPOINT ["sh", "-c", "dotnet Erao.API.dll --urls http://+:${PORT}"]
