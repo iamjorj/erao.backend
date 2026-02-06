@@ -57,14 +57,41 @@ public class SubscriptionsController : ControllerBase
         }
     }
 
-    [HttpPut("upgrade")]
-    public async Task<ActionResult<ApiResponse<SubscriptionResponse>>> UpgradeSubscription([FromBody] UpgradeSubscriptionRequest request)
+    /// <summary>
+    /// Create a Dodo Payments checkout session to upgrade to a paid plan.
+    /// Returns a checkout URL - redirect the user there to pay.
+    /// </summary>
+    [HttpPost("upgrade")]
+    public async Task<ActionResult<ApiResponse<CheckoutResponse>>> UpgradeSubscription([FromBody] UpgradeSubscriptionRequest request)
     {
         try
         {
             var userId = GetUserId();
-            var subscription = await _subscriptionService.UpgradeSubscriptionAsync(userId, request.NewTier);
-            return Ok(ApiResponse<SubscriptionResponse>.SuccessResponse(subscription, "Subscription upgraded successfully"));
+            var checkout = await _subscriptionService.CreateUpgradeCheckoutAsync(userId, request.NewTier, request.ReturnUrl);
+            return Ok(ApiResponse<CheckoutResponse>.SuccessResponse(checkout, "Checkout session created"));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(ApiResponse<CheckoutResponse>.ErrorResponse(ex.Message));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error creating upgrade checkout");
+            return StatusCode(500, ApiResponse<CheckoutResponse>.ErrorResponse("An error occurred"));
+        }
+    }
+
+    /// <summary>
+    /// Downgrade to the free (Starter) plan.
+    /// </summary>
+    [HttpPost("downgrade")]
+    public async Task<ActionResult<ApiResponse<SubscriptionResponse>>> DowngradeSubscription()
+    {
+        try
+        {
+            var userId = GetUserId();
+            var subscription = await _subscriptionService.DowngradeToFreeAsync(userId);
+            return Ok(ApiResponse<SubscriptionResponse>.SuccessResponse(subscription, "Downgraded to free plan"));
         }
         catch (InvalidOperationException ex)
         {
@@ -72,7 +99,7 @@ public class SubscriptionsController : ControllerBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error upgrading subscription");
+            _logger.LogError(ex, "Error downgrading subscription");
             return StatusCode(500, ApiResponse<SubscriptionResponse>.ErrorResponse("An error occurred"));
         }
     }

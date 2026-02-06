@@ -11,6 +11,7 @@ public class MinioService : IMinioService
     private readonly IMinioClient _minioClient;
     private readonly ILogger<MinioService> _logger;
     private readonly string _bucketName;
+    private bool _bucketVerified;
 
     public MinioService(IConfiguration configuration, ILogger<MinioService> logger)
     {
@@ -20,13 +21,24 @@ public class MinioService : IMinioService
         var accessKey = configuration["Minio:AccessKey"] ?? "minioadmin";
         var secretKey = configuration["Minio:SecretKey"] ?? "minioadmin";
         var useSSL = configuration.GetValue<bool>("Minio:UseSSL", false);
+        var region = configuration["Minio:Region"] ?? "";
         _bucketName = configuration["Minio:BucketName"] ?? "erao-files";
 
-        _minioClient = new MinioClient()
+        var clientBuilder = new MinioClient()
             .WithEndpoint(endpoint)
-            .WithCredentials(accessKey, secretKey)
-            .WithSSL(useSSL)
-            .Build();
+            .WithCredentials(accessKey, secretKey);
+
+        if (useSSL)
+            clientBuilder = clientBuilder.WithSSL();
+
+        // Region is required for AWS S3 and Cloudflare R2
+        if (!string.IsNullOrEmpty(region))
+            clientBuilder = clientBuilder.WithRegion(region);
+
+        _minioClient = clientBuilder.Build();
+
+        _logger.LogInformation("Storage initialized: endpoint={Endpoint}, bucket={Bucket}, ssl={SSL}, region={Region}",
+            endpoint, _bucketName, useSSL, string.IsNullOrEmpty(region) ? "(default)" : region);
     }
 
     public async Task<string> UploadFileAsync(Stream fileStream, string fileName, string contentType, Guid userId)
@@ -44,7 +56,7 @@ public class MinioService : IMinioService
 
         await _minioClient.PutObjectAsync(putObjectArgs);
 
-        _logger.LogInformation("File uploaded to MinIO: {ObjectName}", objectName);
+        _logger.LogInformation("File uploaded: {ObjectName}", objectName);
 
         return objectName;
     }
@@ -72,7 +84,7 @@ public class MinioService : IMinioService
 
         await _minioClient.RemoveObjectAsync(removeObjectArgs);
 
-        _logger.LogInformation("File deleted from MinIO: {ObjectName}", objectName);
+        _logger.LogInformation("File deleted: {ObjectName}", objectName);
     }
 
     public async Task<bool> FileExistsAsync(string objectName)
@@ -99,14 +111,28 @@ public class MinioService : IMinioService
 
     private async Task EnsureBucketExistsAsync()
     {
-        var bucketExistsArgs = new BucketExistsArgs().WithBucket(_bucketName);
-        var exists = await _minioClient.BucketExistsAsync(bucketExistsArgs);
+        // Only check once per app lifetime (singleton service)
+        if (_bucketVerified) return;
 
-        if (!exists)
+        try
         {
-            var makeBucketArgs = new MakeBucketArgs().WithBucket(_bucketName);
-            await _minioClient.MakeBucketAsync(makeBucketArgs);
-            _logger.LogInformation("Created MinIO bucket: {BucketName}", _bucketName);
+            var bucketExistsArgs = new BucketExistsArgs().WithBucket(_bucketName);
+            var exists = await _minioClient.BucketExistsAsync(bucketExistsArgs);
+
+            if (!exists)
+            {
+                var makeBucketArgs = new MakeBucketArgs().WithBucket(_bucketName);
+                await _minioClient.MakeBucketAsync(makeBucketArgs);
+                _logger.LogInformation("Created bucket: {BucketName}", _bucketName);
+            }
+
+            _bucketVerified = true;
+        }
+        catch (Exception ex)
+        {
+            // R2/S3 may not support ListBuckets - bucket might already exist
+            _logger.LogWarning(ex, "Could not verify bucket exists. If using R2/S3, create the bucket manually in the dashboard.");
+            _bucketVerified = true;
         }
     }
 }

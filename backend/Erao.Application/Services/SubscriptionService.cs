@@ -9,16 +9,19 @@ public interface ISubscriptionService
 {
     Task<IEnumerable<SubscriptionPlanDto>> GetPlansAsync(Guid userId);
     Task<SubscriptionResponse> GetCurrentSubscriptionAsync(Guid userId);
-    Task<SubscriptionResponse> UpgradeSubscriptionAsync(Guid userId, SubscriptionTier newTier);
+    Task<SubscriptionResponse> DowngradeToFreeAsync(Guid userId);
+    Task<CheckoutResponse> CreateUpgradeCheckoutAsync(Guid userId, SubscriptionTier newTier, string returnUrl);
 }
 
 public class SubscriptionService : ISubscriptionService
 {
     private readonly IUnitOfWork _unitOfWork;
+    private readonly IDodoPaymentsService _dodoPayments;
 
-    public SubscriptionService(IUnitOfWork unitOfWork)
+    public SubscriptionService(IUnitOfWork unitOfWork, IDodoPaymentsService dodoPayments)
     {
         _unitOfWork = unitOfWork;
+        _dodoPayments = dodoPayments;
     }
 
     /// <summary>
@@ -73,44 +76,52 @@ public class SubscriptionService : ISubscriptionService
         };
     }
 
-    public async Task<SubscriptionResponse> UpgradeSubscriptionAsync(Guid userId, SubscriptionTier newTier)
+    public async Task<CheckoutResponse> CreateUpgradeCheckoutAsync(Guid userId, SubscriptionTier newTier, string returnUrl)
     {
         var user = await _unitOfWork.Users.GetByIdAsync(userId);
         if (user == null)
-        {
             throw new InvalidOperationException("User not found");
-        }
 
-        // Validate tier exists
         if (!Enum.IsDefined(typeof(SubscriptionTier), newTier))
-        {
             throw new InvalidOperationException("Invalid subscription tier");
-        }
 
-        // Can't change to same tier
         if (newTier == user.SubscriptionTier)
-        {
             throw new InvalidOperationException("Already on this plan");
-        }
 
-        // Check if downgrading - verify user doesn't exceed new limits
-        if (newTier < user.SubscriptionTier)
+        if (newTier == SubscriptionTier.Starter)
+            throw new InvalidOperationException("Use the downgrade endpoint to switch to the free plan");
+
+        var checkoutUrl = await _dodoPayments.CreateCheckoutSessionAsync(
+            userId,
+            user.Email,
+            $"{user.FirstName} {user.LastName}".Trim(),
+            newTier,
+            returnUrl);
+
+        return new CheckoutResponse { CheckoutUrl = checkoutUrl };
+    }
+
+    public async Task<SubscriptionResponse> DowngradeToFreeAsync(Guid userId)
+    {
+        var user = await _unitOfWork.Users.GetByIdAsync(userId);
+        if (user == null)
+            throw new InvalidOperationException("User not found");
+
+        if (user.SubscriptionTier == SubscriptionTier.Starter)
+            throw new InvalidOperationException("Already on the free plan");
+
+        // Check database connection limits
+        var newDbLimit = SubscriptionLimits.GetDatabaseConnectionLimit(SubscriptionTier.Starter);
+        var currentDbCount = (await _unitOfWork.DatabaseConnections.GetByUserIdAsync(userId)).Count();
+        if (currentDbCount > newDbLimit)
         {
-            var newDbLimit = SubscriptionLimits.GetDatabaseConnectionLimit(newTier);
-            if (newDbLimit != -1) // -1 means unlimited
-            {
-                var currentDbCount = (await _unitOfWork.DatabaseConnections.GetByUserIdAsync(userId)).Count();
-                if (currentDbCount > newDbLimit)
-                {
-                    throw new InvalidOperationException(
-                        $"Cannot downgrade: You have {currentDbCount} database connections but {SubscriptionLimits.GetDisplayName(newTier)} plan only allows {newDbLimit}. Please remove some databases first.");
-                }
-            }
+            throw new InvalidOperationException(
+                $"Cannot downgrade: You have {currentDbCount} database connections but Free plan only allows {newDbLimit}. Please remove some databases first.");
         }
 
-        user.SubscriptionTier = newTier;
-        user.QueryLimitPerMonth = SubscriptionLimits.GetQueryLimit(newTier);
-        // Keep the current billing cycle, just update the limit
+        user.SubscriptionTier = SubscriptionTier.Starter;
+        user.QueryLimitPerMonth = SubscriptionLimits.GetQueryLimit(SubscriptionTier.Starter);
+        user.DodoSubscriptionId = null;
 
         await _unitOfWork.Users.UpdateAsync(user);
         await _unitOfWork.SaveChangesAsync();
@@ -118,7 +129,7 @@ public class SubscriptionService : ISubscriptionService
         return new SubscriptionResponse
         {
             CurrentTier = user.SubscriptionTier,
-            TierName = SubscriptionLimits.GetDisplayName(newTier),
+            TierName = SubscriptionLimits.GetDisplayName(user.SubscriptionTier),
             QueriesPerMonth = user.QueryLimitPerMonth,
             QueriesUsed = user.QueriesUsedThisMonth,
             BillingCycleReset = user.BillingCycleReset

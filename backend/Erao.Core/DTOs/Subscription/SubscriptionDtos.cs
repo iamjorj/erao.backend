@@ -19,6 +19,12 @@ public class SubscriptionPlanDto
 public class UpgradeSubscriptionRequest
 {
     public SubscriptionTier NewTier { get; set; }
+    public string ReturnUrl { get; set; } = string.Empty;
+}
+
+public class CheckoutResponse
+{
+    public string CheckoutUrl { get; set; } = string.Empty;
 }
 
 public class SubscriptionResponse

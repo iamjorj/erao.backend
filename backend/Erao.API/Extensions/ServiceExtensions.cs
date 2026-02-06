@@ -44,6 +44,7 @@ public static class ServiceExtensions
         services.AddHttpClient<IOllamaService, OllamaService>();
         services.AddScoped<IDatabaseQueryService, DatabaseQueryService>();
         services.AddScoped<IEmailService, EmailService>();
+        services.AddHttpClient<IDodoPaymentsService, DodoPaymentsService>();
 
         // File parsing services
         services.AddScoped<IFileParser, ExcelFileParser>();

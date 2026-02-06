@@ -25,6 +25,10 @@ public class User : BaseEntity
     public string? EmailVerificationOtp { get; set; }
     public DateTime? EmailVerificationOtpExpiry { get; set; }
 
+    // Dodo Payments
+    public string? DodoCustomerId { get; set; }
+    public string? DodoSubscriptionId { get; set; }
+
     // Navigation properties
     public virtual ICollection<DatabaseConnection> DatabaseConnections { get; set; } = new List<DatabaseConnection>();
     public virtual ICollection<Conversation> Conversations { get; set; } = new List<Conversation>();

@@ -1,7 +1,9 @@
 using System.Text.Json.Serialization;
+using Microsoft.EntityFrameworkCore;
 using Serilog;
 using Erao.API.Extensions;
 using Erao.API.Middleware;
+using Erao.Infrastructure.Data;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -30,6 +32,22 @@ builder.Services.AddSwaggerDocumentation();
 builder.Services.AddCorsPolicies(builder.Configuration);
 
 var app = builder.Build();
+
+// Auto-apply database migrations on startup
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<EraoDbContext>();
+    try
+    {
+        db.Database.Migrate();
+        Log.Information("Database migrations applied successfully");
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Failed to apply database migrations");
+        throw;
+    }
+}
 
 // Configure the HTTP request pipeline
 if (app.Environment.IsDevelopment())
