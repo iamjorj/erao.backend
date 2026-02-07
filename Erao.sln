@@ -1,0 +1,48 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.3.11304.161 d18.3
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{D94B86C6-E958-49E3-A9D6-12A5A9958BFE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Erao.API", "src\Erao.API\Erao.API.csproj", "{07EE5215-8909-ECC1-8CCB-199257840406}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Erao.Application", "src\Erao.Application\Erao.Application.csproj", "{AB19BFB4-5247-37A6-E063-771E578901F3}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Erao.Core", "src\Erao.Core\Erao.Core.csproj", "{9F5B04B1-C2DF-FA81-7CAC-846F882D8D1E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Erao.Infrastructure", "src\Erao.Infrastructure\Erao.Infrastructure.csproj", "{CFDFA817-B37B-255E-B509-785318B3969E}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{07EE5215-8909-ECC1-8CCB-199257840406}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{07EE5215-8909-ECC1-8CCB-199257840406}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{07EE5215-8909-ECC1-8CCB-199257840406}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{07EE5215-8909-ECC1-8CCB-199257840406}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AB19BFB4-5247-37A6-E063-771E578901F3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AB19BFB4-5247-37A6-E063-771E578901F3}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AB19BFB4-5247-37A6-E063-771E578901F3}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AB19BFB4-5247-37A6-E063-771E578901F3}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9F5B04B1-C2DF-FA81-7CAC-846F882D8D1E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9F5B04B1-C2DF-FA81-7CAC-846F882D8D1E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9F5B04B1-C2DF-FA81-7CAC-846F882D8D1E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9F5B04B1-C2DF-FA81-7CAC-846F882D8D1E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{CFDFA817-B37B-255E-B509-785318B3969E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{CFDFA817-B37B-255E-B509-785318B3969E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{CFDFA817-B37B-255E-B509-785318B3969E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{CFDFA817-B37B-255E-B509-785318B3969E}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{07EE5215-8909-ECC1-8CCB-199257840406} = {D94B86C6-E958-49E3-A9D6-12A5A9958BFE}
+		{AB19BFB4-5247-37A6-E063-771E578901F3} = {D94B86C6-E958-49E3-A9D6-12A5A9958BFE}
+		{9F5B04B1-C2DF-FA81-7CAC-846F882D8D1E} = {D94B86C6-E958-49E3-A9D6-12A5A9958BFE}
+		{CFDFA817-B37B-255E-B509-785318B3969E} = {D94B86C6-E958-49E3-A9D6-12A5A9958BFE}
+	EndGlobalSection
+EndGlobal
