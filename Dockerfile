@@ -4,10 +4,10 @@ WORKDIR /src
 
 # Copy solution and project files
 COPY Erao.sln .
-COPY Erao.Core/Erao.Core.csproj Erao.Core/
-COPY Erao.Infrastructure/Erao.Infrastructure.csproj Erao.Infrastructure/
-COPY Erao.Application/Erao.Application.csproj Erao.Application/
-COPY Erao.API/Erao.API.csproj Erao.API/
+COPY src/Erao.Core/Erao.Core.csproj src/Erao.Core/
+COPY src/Erao.Infrastructure/Erao.Infrastructure.csproj src/Erao.Infrastructure/
+COPY src/Erao.Application/Erao.Application.csproj src/Erao.Application/
+COPY src/Erao.API/Erao.API.csproj src/Erao.API/
 
 # Restore dependencies
 RUN dotnet restore
@@ -19,7 +19,7 @@ COPY . .
 RUN dotnet build -c Release --no-restore
 
 # Publish the application
-RUN dotnet publish Erao.API/Erao.API.csproj -c Release -o /app/publish --no-build
+RUN dotnet publish src/Erao.API/Erao.API.csproj -c Release -o /app/publish --no-build
 
 # Runtime stage
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
