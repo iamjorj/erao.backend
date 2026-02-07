@@ -1,19 +1,20 @@
+using System.Net.Http.Json;
+using System.Text.Json;
 using Erao.Core.Interfaces;
-using MailKit.Net.Smtp;
-using MailKit.Security;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using MimeKit;
 
 namespace Erao.Infrastructure.Services;
 
 public class EmailService : IEmailService
 {
+    private readonly HttpClient _httpClient;
     private readonly IConfiguration _configuration;
     private readonly ILogger<EmailService> _logger;
 
-    public EmailService(IConfiguration configuration, ILogger<EmailService> logger)
+    public EmailService(HttpClient httpClient, IConfiguration configuration, ILogger<EmailService> logger)
     {
+        _httpClient = httpClient;
         _configuration = configuration;
         _logger = logger;
     }
@@ -95,31 +96,42 @@ public class EmailService : IEmailService
     {
         try
         {
-            var smtpHost = _configuration["Email:SmtpHost"];
-            var smtpPort = int.Parse(_configuration["Email:SmtpPort"] ?? "587");
-            var smtpUser = _configuration["Email:SmtpUser"];
-            var smtpPassword = _configuration["Email:SmtpPassword"];
+            var apiKey = _configuration["Email:BrevoApiKey"];
             var fromEmail = _configuration["Email:FromEmail"];
             var fromName = _configuration["Email:FromName"] ?? "Erao";
 
-            var message = new MimeMessage();
-            message.From.Add(new MailboxAddress(fromName, fromEmail));
-            message.To.Add(new MailboxAddress(toEmail, toEmail));
-            message.Subject = subject;
-
-            var bodyBuilder = new BodyBuilder
+            if (string.IsNullOrEmpty(apiKey))
             {
-                HtmlBody = htmlBody
+                _logger.LogError("Brevo API key not configured");
+                throw new InvalidOperationException("Email service not configured");
+            }
+
+            var request = new HttpRequestMessage(HttpMethod.Post, "https://api.brevo.com/v3/smtp/email");
+            request.Headers.Add("api-key", apiKey);
+
+            var payload = new
+            {
+                sender = new { name = fromName, email = fromEmail },
+                to = new[] { new { email = toEmail } },
+                subject = subject,
+                htmlContent = htmlBody
             };
-            message.Body = bodyBuilder.ToMessageBody();
 
-            using var client = new SmtpClient();
-            await client.ConnectAsync(smtpHost, smtpPort, SecureSocketOptions.StartTls);
-            await client.AuthenticateAsync(smtpUser, smtpPassword);
-            await client.SendAsync(message);
-            await client.DisconnectAsync(true);
+            request.Content = JsonContent.Create(payload);
 
-            _logger.LogInformation("Email sent successfully to {Email}", toEmail);
+            var response = await _httpClient.SendAsync(request);
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("Email sent successfully to {Email}", toEmail);
+            }
+            else
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                _logger.LogError("Failed to send email to {Email}. Status: {Status}, Error: {Error}",
+                    toEmail, response.StatusCode, error);
+                throw new Exception($"Failed to send email: {error}");
+            }
         }
         catch (Exception ex)
         {
