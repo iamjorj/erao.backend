@@ -44,8 +44,7 @@ using (var scope = app.Services.CreateScope())
     }
     catch (Exception ex)
     {
-        Log.Error(ex, "Failed to apply database migrations");
-        throw;
+        Log.Error(ex, "Failed to apply database migrations. The app will start but database features may not work.");
     }
 }
 

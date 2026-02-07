@@ -20,9 +20,17 @@ public static class ServiceExtensions
 {
     public static IServiceCollection AddApplicationServices(this IServiceCollection services, IConfiguration configuration)
     {
-        // Database
+        // Database - support Railway's DATABASE_URL or standard connection string
+        var connectionString = configuration.GetConnectionString("DefaultConnection");
+        var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
+
+        if (!string.IsNullOrEmpty(databaseUrl))
+        {
+            connectionString = ConvertPostgresUrl(databaseUrl);
+        }
+
         services.AddDbContext<EraoDbContext>(options =>
-            options.UseNpgsql(configuration.GetConnectionString("DefaultConnection")));
+            options.UseNpgsql(connectionString));
 
         // Repositories
         services.AddScoped<IUnitOfWork, UnitOfWork>();
@@ -150,5 +158,22 @@ public static class ServiceExtensions
         });
 
         return services;
+    }
+
+    /// <summary>
+    /// Converts a PostgreSQL URL (postgresql://user:pass@host:port/db) to a .NET connection string.
+    /// Railway provides DATABASE_URL in this format.
+    /// </summary>
+    private static string ConvertPostgresUrl(string databaseUrl)
+    {
+        var uri = new Uri(databaseUrl);
+        var userInfo = uri.UserInfo.Split(':');
+        var host = uri.Host;
+        var port = uri.Port > 0 ? uri.Port : 5432;
+        var database = uri.AbsolutePath.TrimStart('/');
+        var username = userInfo[0];
+        var password = userInfo.Length > 1 ? userInfo[1] : "";
+
+        return $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Require;Trust Server Certificate=true";
     }
 }
