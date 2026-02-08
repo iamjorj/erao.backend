@@ -32,15 +32,22 @@ public class SubscriptionsController : ControllerBase
     /// </summary>
     [HttpGet("test-payments")]
     [AllowAnonymous]
-    public async Task<ActionResult<ApiResponse<object>>> TestPaymentsConnection()
+    public async Task<ActionResult> TestPaymentsConnection()
     {
         var (isConfigured, isConnected, message) = await _dodoPayments.TestConnectionAsync();
-        var result = new { isConfigured, isConnected, message };
+
+        var result = new
+        {
+            success = isConnected,
+            isConfigured,
+            isConnected,
+            message
+        };
 
         if (isConnected)
-            return Ok(ApiResponse<object>.SuccessResponse(result, "Payment system connected"));
+            return Ok(result);
 
-        return BadRequest(ApiResponse<object>.ErrorResponse(message, result));
+        return BadRequest(result);
     }
 
     [HttpGet("plans")]
