@@ -15,4 +15,10 @@ public interface IDodoPaymentsService
     /// Verifies signature and processes subscription/payment events.
     /// </summary>
     Task HandleWebhookAsync(string payload, IDictionary<string, string> headers);
+
+    /// <summary>
+    /// Test the Dodo Payments API connection.
+    /// Returns configuration status and any errors.
+    /// </summary>
+    Task<(bool IsConfigured, bool IsConnected, string Message)> TestConnectionAsync();
 }

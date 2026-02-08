@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using Erao.Application.Services;
 using Erao.Core.DTOs.Common;
 using Erao.Core.DTOs.Subscription;
+using Erao.Core.Interfaces;
 using System.Security.Claims;
 
 namespace Erao.API.Controllers;
@@ -13,12 +14,33 @@ namespace Erao.API.Controllers;
 public class SubscriptionsController : ControllerBase
 {
     private readonly ISubscriptionService _subscriptionService;
+    private readonly IDodoPaymentsService _dodoPayments;
     private readonly ILogger<SubscriptionsController> _logger;
 
-    public SubscriptionsController(ISubscriptionService subscriptionService, ILogger<SubscriptionsController> logger)
+    public SubscriptionsController(
+        ISubscriptionService subscriptionService,
+        IDodoPaymentsService dodoPayments,
+        ILogger<SubscriptionsController> logger)
     {
         _subscriptionService = subscriptionService;
+        _dodoPayments = dodoPayments;
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Test Dodo Payments API connection (for debugging)
+    /// </summary>
+    [HttpGet("test-payments")]
+    [AllowAnonymous]
+    public async Task<ActionResult<ApiResponse<object>>> TestPaymentsConnection()
+    {
+        var (isConfigured, isConnected, message) = await _dodoPayments.TestConnectionAsync();
+        var result = new { isConfigured, isConnected, message };
+
+        if (isConnected)
+            return Ok(ApiResponse<object>.SuccessResponse(result, "Payment system connected"));
+
+        return BadRequest(ApiResponse<object>.ErrorResponse(message, result));
     }
 
     [HttpGet("plans")]

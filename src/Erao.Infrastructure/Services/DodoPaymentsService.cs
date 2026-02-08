@@ -26,9 +26,9 @@ public class DodoPaymentsService : IDodoPaymentsService
         _unitOfWork = unitOfWork;
         _logger = logger;
 
-        var apiKey = configuration["DodoPayments:ApiKey"] ?? "";
+        var apiKey = (configuration["DodoPayments:ApiKey"] ?? "").Trim();
         var isTestMode = configuration.GetValue<bool>("DodoPayments:TestMode", true);
-        _webhookKey = configuration["DodoPayments:WebhookKey"] ?? "";
+        _webhookKey = (configuration["DodoPayments:WebhookKey"] ?? "").Trim();
 
         var baseUrl = isTestMode
             ? "https://test.dodopayments.com"
@@ -83,16 +83,36 @@ public class DodoPaymentsService : IDodoPaymentsService
             }
         };
 
-        _logger.LogInformation("Creating Dodo checkout for user {UserId}, tier {Tier}, product {ProductId}",
-            userId, targetTier, productId);
+        // Log API key info for debugging (masked)
+        var authHeader = _httpClient.DefaultRequestHeaders.Authorization;
+        var apiKeyPreview = authHeader?.Parameter?.Length > 8
+            ? $"{authHeader.Parameter[..4]}...{authHeader.Parameter[^4..]}"
+            : "(not set or too short)";
+
+        _logger.LogInformation(
+            "Creating Dodo checkout: User={UserId}, Tier={Tier}, Product={ProductId}, BaseUrl={BaseUrl}, ApiKey={ApiKeyPreview}",
+            userId, targetTier, productId, _httpClient.BaseAddress, apiKeyPreview);
 
         var response = await _httpClient.PostAsJsonAsync("/checkouts", requestBody);
 
         if (!response.IsSuccessStatusCode)
         {
             var errorContent = await response.Content.ReadAsStringAsync();
-            _logger.LogError("Dodo Payments API error: {StatusCode} - {Content}", response.StatusCode, errorContent);
-            throw new InvalidOperationException($"Payment provider error: {response.StatusCode}");
+            _logger.LogError(
+                "Dodo Payments API error: Status={StatusCode}, Response={Content}, ApiKey={ApiKeyPreview}, BaseUrl={BaseUrl}",
+                response.StatusCode, errorContent, apiKeyPreview, _httpClient.BaseAddress);
+
+            // Parse error message if possible
+            var errorMessage = response.StatusCode switch
+            {
+                System.Net.HttpStatusCode.Forbidden => "Invalid API key. Please check DodoPayments__ApiKey environment variable.",
+                System.Net.HttpStatusCode.Unauthorized => "API key not authorized. Verify the key in Dodo dashboard.",
+                System.Net.HttpStatusCode.NotFound => "Invalid endpoint or product ID not found.",
+                System.Net.HttpStatusCode.BadRequest => $"Invalid request: {errorContent}",
+                _ => $"Payment provider error: {response.StatusCode}"
+            };
+
+            throw new InvalidOperationException(errorMessage);
         }
 
         var json = await response.Content.ReadAsStringAsync();
@@ -281,5 +301,56 @@ public class DodoPaymentsService : IDodoPaymentsService
             }
         }
         return metadata;
+    }
+
+    public async Task<(bool IsConfigured, bool IsConnected, string Message)> TestConnectionAsync()
+    {
+        // Check if API key is configured
+        var authHeader = _httpClient.DefaultRequestHeaders.Authorization;
+        var apiKey = authHeader?.Parameter ?? "";
+
+        if (string.IsNullOrEmpty(apiKey))
+        {
+            return (false, false, "API key not configured. Set DodoPayments__ApiKey environment variable.");
+        }
+
+        // Show key details for debugging (safely masked)
+        var keyLength = apiKey.Length;
+        var keyPreview = keyLength > 20
+            ? $"{apiKey[..10]}...{apiKey[^6..]} (length={keyLength})"
+            : $"(too short, length={keyLength})";
+        var hasSpecialChars = apiKey.Any(c => !char.IsLetterOrDigit(c) && c != '_' && c != '-');
+
+        // Check if products are configured
+        var hasProfessional = _productIds.TryGetValue(SubscriptionTier.Professional, out var profId) && !string.IsNullOrEmpty(profId);
+        var hasEnterprise = _productIds.TryGetValue(SubscriptionTier.Enterprise, out var entId) && !string.IsNullOrEmpty(entId);
+
+        if (!hasProfessional || !hasEnterprise)
+        {
+            return (false, false, $"Products not configured. Professional={profId ?? "not set"}, Enterprise={entId ?? "not set"}");
+        }
+
+        // Try to list products to verify API connection
+        try
+        {
+            var response = await _httpClient.GetAsync("/products?page_size=1");
+            var content = await response.Content.ReadAsStringAsync();
+
+            var details = $"BaseUrl={_httpClient.BaseAddress}, Key={keyPreview}, HasSpecialChars={hasSpecialChars}, Professional={profId}, Enterprise={entId}";
+
+            if (response.IsSuccessStatusCode)
+            {
+                return (true, true, $"Connected! {details}");
+            }
+
+            // Show response headers for debugging
+            var responseHeaders = string.Join(", ", response.Headers.Select(h => $"{h.Key}={string.Join(",", h.Value)}"));
+
+            return (true, false, $"API error: {response.StatusCode}. Response={content}. Headers={responseHeaders}. {details}");
+        }
+        catch (Exception ex)
+        {
+            return (true, false, $"Connection error: {ex.Message}. Key={keyPreview}");
+        }
     }
 }
