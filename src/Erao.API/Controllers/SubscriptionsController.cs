@@ -72,12 +72,18 @@ public class SubscriptionsController : ControllerBase
         }
         catch (InvalidOperationException ex)
         {
+            _logger.LogWarning(ex, "Invalid operation during upgrade checkout");
             return BadRequest(ApiResponse<CheckoutResponse>.ErrorResponse(ex.Message));
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogError(ex, "Payment provider API error during upgrade checkout");
+            return StatusCode(503, ApiResponse<CheckoutResponse>.ErrorResponse("Payment service temporarily unavailable. Please try again later."));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error creating upgrade checkout");
-            return StatusCode(500, ApiResponse<CheckoutResponse>.ErrorResponse("An error occurred"));
+            _logger.LogError(ex, "Unexpected error creating upgrade checkout: {Message}", ex.Message);
+            return StatusCode(500, ApiResponse<CheckoutResponse>.ErrorResponse("Failed to create checkout. Please try again or contact support."));
         }
     }
 

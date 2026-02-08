@@ -30,11 +30,15 @@ public class DodoPaymentsService : IDodoPaymentsService
         var isTestMode = configuration.GetValue<bool>("DodoPayments:TestMode", true);
         _webhookKey = configuration["DodoPayments:WebhookKey"] ?? "";
 
-        _httpClient.BaseAddress = new Uri(isTestMode
+        var baseUrl = isTestMode
             ? "https://test.dodopayments.com"
-            : "https://live.dodopayments.com");
+            : "https://live.dodopayments.com";
+
+        _httpClient.BaseAddress = new Uri(baseUrl);
         _httpClient.DefaultRequestHeaders.Authorization =
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+        _httpClient.DefaultRequestHeaders.Accept.Add(
+            new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
 
         // Map subscription tiers to Dodo product IDs (create products in Dodo dashboard first)
         _productIds = new Dictionary<SubscriptionTier, string>
@@ -42,6 +46,9 @@ public class DodoPaymentsService : IDodoPaymentsService
             { SubscriptionTier.Professional, configuration["DodoPayments:Products:Professional"] ?? "" },
             { SubscriptionTier.Enterprise, configuration["DodoPayments:Products:Enterprise"] ?? "" }
         };
+
+        _logger.LogInformation("DodoPayments initialized: BaseUrl={BaseUrl}, TestMode={TestMode}, ApiKeySet={ApiKeySet}",
+            baseUrl, isTestMode, !string.IsNullOrEmpty(apiKey));
     }
 
     public async Task<string> CreateCheckoutSessionAsync(
@@ -50,8 +57,12 @@ public class DodoPaymentsService : IDodoPaymentsService
         if (targetTier == SubscriptionTier.Starter)
             throw new InvalidOperationException("Cannot checkout for the free tier");
 
+        // Check if API key is configured
+        if (_httpClient.DefaultRequestHeaders.Authorization?.Parameter is null or "")
+            throw new InvalidOperationException("Payment system is not configured. Please contact support.");
+
         if (!_productIds.TryGetValue(targetTier, out var productId) || string.IsNullOrEmpty(productId))
-            throw new InvalidOperationException($"Product not configured for tier: {targetTier}");
+            throw new InvalidOperationException($"Payment product not configured for {targetTier} plan. Please contact support.");
 
         var requestBody = new
         {
@@ -72,12 +83,35 @@ public class DodoPaymentsService : IDodoPaymentsService
             }
         };
 
-        var response = await _httpClient.PostAsJsonAsync("/checkout-sessions", requestBody);
-        response.EnsureSuccessStatusCode();
+        _logger.LogInformation("Creating Dodo checkout for user {UserId}, tier {Tier}, product {ProductId}",
+            userId, targetTier, productId);
+
+        var response = await _httpClient.PostAsJsonAsync("/checkouts", requestBody);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            _logger.LogError("Dodo Payments API error: {StatusCode} - {Content}", response.StatusCode, errorContent);
+            throw new InvalidOperationException($"Payment provider error: {response.StatusCode}");
+        }
 
         var json = await response.Content.ReadAsStringAsync();
+        _logger.LogDebug("Dodo checkout response: {Response}", json);
+
         using var doc = JsonDocument.Parse(json);
-        var checkoutUrl = doc.RootElement.GetProperty("checkout_url").GetString()
+
+        // Try to get checkout_url from the response
+        if (!doc.RootElement.TryGetProperty("checkout_url", out var urlElement))
+        {
+            // Try alternate property name
+            if (!doc.RootElement.TryGetProperty("url", out urlElement))
+            {
+                _logger.LogError("Unexpected Dodo response format: {Response}", json);
+                throw new InvalidOperationException("Invalid response from payment provider");
+            }
+        }
+
+        var checkoutUrl = urlElement.GetString()
             ?? throw new InvalidOperationException("No checkout URL returned from Dodo Payments");
 
         _logger.LogInformation(
