@@ -60,16 +60,20 @@ public class ChatService : IChatService
             throw new InvalidOperationException("Query limit reached for this billing cycle");
         }
 
-        // Get conversation
-        var conversation = await _unitOfWork.Conversations.GetWithMessagesAsync(request.ConversationId);
+        // Get conversation (without messages — loaded separately below)
+        var conversation = await _unitOfWork.Conversations.GetWithConnectionsAsync(request.ConversationId);
         if (conversation == null || conversation.UserId != userId)
         {
             throw new InvalidOperationException("Conversation not found");
         }
 
-        // Auto-generate conversation title from first message if empty (check before adding new message)
+        // Load only recent messages for AI context (not all messages)
+        const int maxContextMessages = 20;
+        var recentMessages = await _unitOfWork.Messages.GetRecentAsync(conversation.Id, maxContextMessages);
+
+        // Auto-generate conversation title from first message if empty
         var isFirstMessage = string.IsNullOrEmpty(conversation.Title) || conversation.Title == "New Chat";
-        if (isFirstMessage && (conversation.Messages == null || conversation.Messages.Count == 0))
+        if (isFirstMessage && recentMessages.Count == 0)
         {
             conversation.Title = GenerateTitle(request.Message);
             await _unitOfWork.Conversations.UpdateAsync(conversation);
@@ -123,10 +127,9 @@ public class ChatService : IChatService
             }
         }
 
-        // Build chat history from previous messages - include query results for context
+        // Build chat history from recent messages - include query results for context
         // Use [DATA_CONTEXT] tags so AI understands this is reference info, not text to repeat
-        var history = (conversation.Messages ?? Enumerable.Empty<Message>())
-            .OrderBy(m => m.CreatedAt)
+        var history = recentMessages
             .Select(m => {
                 var role = m.Role == MessageRole.User ? "user" : "assistant";
                 var content = m.Content;
@@ -186,6 +189,18 @@ public class ChatService : IChatService
         string? sqlQuery = null;
         string? queryResult = null;
 
+        // Decrypt credentials once if needed for DB queries
+        string? dbHost = null, dbDatabase = null, dbUsername = null, dbPassword = null;
+        int dbPort = 0;
+        if (dbConnection != null && request.ExecuteQuery)
+        {
+            dbHost = _encryptionService.Decrypt(dbConnection.EncryptedHost);
+            dbPort = int.Parse(_encryptionService.Decrypt(dbConnection.EncryptedPort));
+            dbDatabase = _encryptionService.Decrypt(dbConnection.EncryptedDatabaseName);
+            dbUsername = _encryptionService.Decrypt(dbConnection.EncryptedUsername);
+            dbPassword = _encryptionService.Decrypt(dbConnection.EncryptedPassword);
+        }
+
         if (dbConnection != null && request.ExecuteQuery)
         {
             var sqlQueries = ExtractAllSqlFromResponse(aiResponse);
@@ -196,37 +211,23 @@ public class ChatService : IChatService
 
                 try
                 {
-                    var host = _encryptionService.Decrypt(dbConnection.EncryptedHost);
-                    var port = int.Parse(_encryptionService.Decrypt(dbConnection.EncryptedPort));
-                    var database = _encryptionService.Decrypt(dbConnection.EncryptedDatabaseName);
-                    var username = _encryptionService.Decrypt(dbConnection.EncryptedUsername);
-                    var password = _encryptionService.Decrypt(dbConnection.EncryptedPassword);
-
                     if (sqlQueries.Count == 1)
                     {
-                        // Single query - existing behavior
                         queryResult = await _databaseQueryService.ExecuteQueryAsync(
-                            dbConnection.DatabaseType, host, port, database, username, password, sqlQueries[0]);
+                            dbConnection.DatabaseType, dbHost!, dbPort, dbDatabase!, dbUsername!, dbPassword!, sqlQueries[0]);
                     }
                     else
                     {
-                        // Multiple queries - execute each and combine results
+                        // Single connection, all queries — no repeated TCP handshakes
+                        var results = await _databaseQueryService.ExecuteQueriesAsync(
+                            dbConnection.DatabaseType, dbHost!, dbPort, dbDatabase!, dbUsername!, dbPassword!, sqlQueries);
                         var allResults = new List<object>();
-                        foreach (var sql in sqlQueries)
+                        foreach (var result in results)
                         {
-                            try
+                            if (!string.IsNullOrEmpty(result))
                             {
-                                var result = await _databaseQueryService.ExecuteQueryAsync(
-                                    dbConnection.DatabaseType, host, port, database, username, password, sql);
-                                if (!string.IsNullOrEmpty(result))
-                                {
-                                    var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
-                                    allResults.Add(parsed!);
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                allResults.Add(new { error = ex.Message, query = sql });
+                                var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
+                                allResults.Add(parsed!);
                             }
                         }
                         queryResult = System.Text.Json.JsonSerializer.Serialize(new { tables = allResults });
@@ -239,7 +240,6 @@ public class ChatService : IChatService
             }
             else
             {
-                // Fallback: If AI returned [DATA_CONTEXT] without SQL, parse it as data
                 queryResult = ExtractDataContextAsResult(aiResponse);
             }
         }
@@ -261,22 +261,16 @@ public class ChatService : IChatService
                     }
                     else
                     {
+                        // Load data once, run all queries on same SQLite connection
+                        var results = await _fileQueryService.ExecuteQueriesAsync(
+                            fileDocument.ParsedContent, fileDocument.SchemaInfo, sqlQueries);
                         var allResults = new List<object>();
-                        foreach (var sql in sqlQueries)
+                        foreach (var result in results)
                         {
-                            try
+                            if (!string.IsNullOrEmpty(result))
                             {
-                                var result = await _fileQueryService.ExecuteQueryAsync(
-                                    fileDocument.ParsedContent, fileDocument.SchemaInfo, sql);
-                                if (!string.IsNullOrEmpty(result))
-                                {
-                                    var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
-                                    allResults.Add(parsed!);
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                allResults.Add(new { error = ex.Message, query = sql });
+                                var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
+                                allResults.Add(parsed!);
                             }
                         }
                         queryResult = System.Text.Json.JsonSerializer.Serialize(new { tables = allResults });
@@ -367,64 +361,64 @@ public class ChatService : IChatService
             _ => "double-quote identifiers: \"TableName\", \"ColumnName\""
         };
 
-        var prompt = $@"You are Erao, a helpful data assistant. You help users query and understand their databases through natural conversation.
+        var prompt = $@"You are Erao, an AI data analyst. The user has connected their {dialect} database and is asking questions about their data in plain English. Your job is to explore their data by writing SQL.
 
-The database type is **{dialect}**. Write all SQL in {dialect} syntax.
+## How this system works
+1. You write a SQL query inside a ```sql code block
+2. The system AUTOMATICALLY executes it against the user's live database
+3. The results appear as an interactive table below your message
+4. You then provide a brief interpretation of what the results show
 
-## CRITICAL RULE — SQL IS MANDATORY
+The user never runs SQL manually — the system does it for you. Every ```sql block you write gets executed immediately.
 
-Every time the user asks ANYTHING about their data, you MUST include a ```sql code block in your response. This is NON-NEGOTIABLE. Without the SQL block, the system cannot fetch data and the user sees NOTHING.
+## Response format
+Always follow this structure:
+```sql
+-- your query here
+```
+Your brief, natural-language interpretation of the results (1-3 sentences).
 
-- ""how many users?"" → MUST have ```sql block
-- ""show me all users"" → MUST have ```sql block
-- ""what are the trends?"" → MUST have ```sql block
-- ANY question about data → MUST have ```sql block
+Every data question requires a ```sql block. Without it, the user sees nothing — the system has no other way to fetch data.
 
-The ```sql block MUST appear BEFORE your text explanation. Write the SQL first, then ALWAYS write a brief text response after it. NEVER respond with only a SQL block and nothing else.
+## SQL syntax
+- Dialect: {dialect}
+- Identifiers: {quoteStyle}
+- SELECT queries only (read-only access)
+- JOIN tables to show readable names instead of raw IDs/foreign keys
+- Use LIMIT 50 for broad queries, no limit for aggregations
+- Use {dialect}-native functions (date formatting, string ops, etc.)
 
-## SQL Rules
-- {quoteStyle}
-- Use LIMIT for potentially large results (unless user asks for all)
-- JOIN to get readable names, not raw IDs
-- SELECT only (no INSERT/UPDATE/DELETE)
-- Use {dialect}-compatible functions and syntax
+## Handling ambiguity
+- The user's database could be anything — e-commerce, SaaS, analytics, CRM, etc. Study the schema to understand what the data represents.
+- When the user says ""my"", ""our"", ""we"" — they mean the data in their database. Query all relevant data, don't ask for an ID or filter.
+- ""my revenue"" → find the table/column that holds revenue and aggregate it
+- ""how many customers"" → find the customers/users table and COUNT(*)
+- If multiple tables could answer the question, pick the most relevant one and mention what you chose.
+- If the schema genuinely has no table matching the question, say so clearly and suggest what data IS available.
 
-## How to Respond
-
-Be natural and conversational. Match your response length to the question:
-- Simple questions → SQL + short answer, 1-2 sentences max
-- Data requests → SQL + a brief one-liner
-- Analytical questions → SQL + insights with bullet points
-
-Do NOT use rigid section headers like ""Overview:"", ""Key Insights:"" for every response.
-
-## Formatting
-- Use **bold** for important numbers
-- Keep responses concise — don't pad with filler analysis
-- Don't repeat data that's already shown in the table results
-- Don't hardcode numbers in your text — describe what the query will show
-
-## What NOT to do
-- Don't answer data questions without a ```sql block
-- Don't guess or hardcode numbers — let the SQL query compute them
-- Don't repeat data from tables in your text
-- Don't give unsolicited analysis
+## Writing style
+- Be conversational — no rigid headers like ""Overview:"" or ""Key Insights:""
+- Keep it short. The data table speaks for itself.
+- Don't repeat numbers that are visible in the results table
+- Use **bold** for key figures when summarizing
+- Match response length to question complexity: simple question → 1 sentence, analytical → bullet points
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
         {
             prompt += $@"
+## Database schema
+Study this carefully — these are the actual tables and columns available. Use EXACT names, properly quoted for {dialect}.
 
-The user's database has the following schema:
 {schemaContext}
 
-IMPORTANT: Use this schema to understand the database structure. Use the EXACT table and column names as shown above, properly quoted for {dialect}.";
+Analyze the table and column names to understand what this database is about. Use this understanding to answer the user's questions intelligently — map their natural language to the right tables and columns.";
         }
         else
         {
             prompt += @"
 
-No database schema is available. You can help with general SQL questions or ask the user to connect a database.";
+No database schema is available yet. Help with general SQL questions or let the user know they need to connect a database first.";
         }
 
         return prompt;
@@ -684,71 +678,49 @@ No database schema is available. You can help with general SQL questions or ask 
     {
         var rowInfo = rowCount.HasValue ? $"The file contains {rowCount.Value:N0} rows of data." : "";
 
-        var prompt = $@"You are Erao, a helpful data assistant working with the file '{fileName}'.
-{rowInfo}
+        var prompt = $@"You are Erao, an AI data analyst. The user has uploaded a file called '{fileName}'. {rowInfo}
 
-The file data is loaded into a SQLite database table called ""data"". You MUST write SQL queries to answer questions about the data.
+## How this system works
+1. The file data is loaded into a SQLite table called ""data""
+2. You write a SQL query inside a ```sql code block
+3. The system AUTOMATICALLY executes it against the full dataset
+4. The results appear as an interactive table below your message
+5. You then provide a brief interpretation
 
-## CRITICAL RULE — SQL IS MANDATORY
+The user never runs SQL manually. Every ```sql block you write gets executed immediately against all {(rowCount.HasValue ? $"{rowCount.Value:N0}" : "the")} rows.
 
-Every time the user asks ANYTHING about their data, you MUST include a ```sql code block. Without it, the system cannot fetch data and the user sees NOTHING.
-
-- ""how many rows?"" → MUST have ```sql block
-- ""show me top 5"" → MUST have ```sql block
-- ""what's the average?"" → MUST have ```sql block
-- ANY question about the file data → MUST have ```sql block
-
-The ```sql block MUST appear BEFORE your text explanation. Write the SQL first, then ALWAYS write a brief text response after it. NEVER respond with only a SQL block and nothing else.
-
-## SQL Rules
-- The table is called ""data"" — always use it
-- Double-quote column names: SELECT ""ColumnName"" FROM ""data""
-- Use standard SQLite SQL syntax
-- SELECT only (no INSERT/UPDATE/DELETE)
-- Use LIMIT for potentially large results (unless user asks for all)
-- For counts, use COUNT(*); for averages, use AVG(); for sums, use SUM()
-- Column names are CASE-SENSITIVE — use the exact names from the schema
-
-## How to Respond
-
-Be natural and conversational. Match your response to what the user asked:
-- Simple questions → SQL + short answer, 1-2 sentences
-- Data requests → SQL + brief one-liner
-- Analytical questions → SQL + insights with bullet points
-
-Do NOT use rigid ""Overview:"", ""Key Insights:"" headers for every response.
-
-## Examples
-
-User: ""what's in this file?""
+## Response format
+Always follow this structure:
 ```sql
-SELECT COUNT(*) AS ""TotalRows"" FROM ""data""
+-- your query here
 ```
-This file contains [describe based on query result and schema columns].
+Your brief, natural-language interpretation (1-3 sentences).
 
-User: ""how many rows?""
-```sql
-SELECT COUNT(*) AS ""Count"" FROM ""data""
-```
-[Describe the count from the query result.]
+Every data question requires a ```sql block. Without it, the user sees nothing.
 
-User: ""show me top 5 by sales""
-```sql
-SELECT ""Product"", ""Sales"" FROM ""data"" ORDER BY ""Sales"" DESC LIMIT 5
-```
-Here are the top 5 by sales.
+## SQL syntax
+- Dialect: SQLite
+- Table name: ""data"" (always this, nothing else)
+- Double-quote all column names: SELECT ""ColumnName"" FROM ""data""
+- Column names are CASE-SENSITIVE — use exact names from the schema
+- SELECT queries only
+- Use LIMIT 50 for broad queries, no limit for aggregations
+- Standard SQLite functions: COUNT, SUM, AVG, MIN, MAX, ROUND, GROUP_CONCAT, etc.
 
-User: ""what's the average revenue?""
-```sql
-SELECT ROUND(AVG(""Revenue""), 2) AS ""AvgRevenue"" FROM ""data""
-```
-[Describe the average from the query result.]
+## Handling questions
+- Study the column names to understand what this file contains (sales data, employee records, inventory, etc.)
+- Map the user's natural language to the right columns
+- ""how many rows"" → COUNT(*)
+- ""total revenue"" → find the revenue/amount/sales column and SUM it
+- ""top 5 by X"" → ORDER BY ""X"" DESC LIMIT 5
+- ""what's in this file"" → describe the columns and do a COUNT(*)
+- If the user asks about something not in the schema, say what IS available
 
-## What NOT to do
-- Don't answer data questions without a ```sql block
-- Don't guess or hardcode numbers — let the SQL query compute them
-- Don't repeat data that will be shown in the query results table
-- Don't give unsolicited analysis
+## Writing style
+- Be conversational — no rigid headers
+- Keep it short. The data table speaks for itself.
+- Don't repeat numbers visible in the results table
+- Use **bold** for key figures
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))

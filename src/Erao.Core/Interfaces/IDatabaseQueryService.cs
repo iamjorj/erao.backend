@@ -10,4 +10,8 @@ public interface IDatabaseQueryService
     Task<string> GetSchemaAsync(DatabaseType dbType, string host, int port, string database, string username, string password);
     Task<List<TableSchema>> GetStructuredSchemaAsync(DatabaseType dbType, string host, int port, string database, string username, string password);
     Task<string> ExecuteQueryAsync(DatabaseType dbType, string host, int port, string database, string username, string password, string query);
+    /// <summary>
+    /// Executes multiple queries on a single connection. Opens once, runs all, returns list of results.
+    /// </summary>
+    Task<List<string>> ExecuteQueriesAsync(DatabaseType dbType, string host, int port, string database, string username, string password, List<string> queries);
 }

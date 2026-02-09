@@ -18,4 +18,17 @@ public class MessageRepository : Repository<Message>, IMessageRepository
             .OrderBy(m => m.CreatedAt)
             .ToListAsync();
     }
+
+    public async Task<List<Message>> GetRecentAsync(Guid conversationId, int count)
+    {
+        // Take the last N messages by ordering DESC, then reverse to get oldest-first
+        var messages = await _dbSet
+            .Where(m => m.ConversationId == conversationId)
+            .OrderByDescending(m => m.CreatedAt)
+            .Take(count)
+            .ToListAsync();
+
+        messages.Reverse();
+        return messages;
+    }
 }

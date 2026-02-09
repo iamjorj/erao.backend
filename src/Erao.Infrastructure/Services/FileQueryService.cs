@@ -58,6 +58,47 @@ public class FileQueryService : IFileQueryService
         }
     }
 
+    public async Task<List<string>> ExecuteQueriesAsync(string parsedContentJson, string schemaInfoJson, List<string> queries)
+    {
+        var stopwatch = Stopwatch.StartNew();
+
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+
+        await using (var pragmaCmd = connection.CreateCommand())
+        {
+            pragmaCmd.CommandText = "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;";
+            await pragmaCmd.ExecuteNonQueryAsync();
+        }
+
+        var columns = ParseSchema(schemaInfoJson);
+        if (columns.Count == 0)
+        {
+            var errorJson = JsonSerializer.Serialize(new { error = "No schema information available", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+            return queries.Select(_ => errorJson).ToList();
+        }
+
+        await CreateTableAsync(connection, columns);
+        var rowsInserted = await LoadDataAsync(connection, parsedContentJson, columns);
+        _logger.LogInformation("Loaded {RowCount} rows into SQLite in {ElapsedMs}ms for {QueryCount} queries", rowsInserted, stopwatch.ElapsedMilliseconds, queries.Count);
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                results.Add(await ExecuteSqlAsync(connection, query, Stopwatch.StartNew()));
+            }
+            catch (SqliteException ex)
+            {
+                _logger.LogWarning(ex, "SQLite query failed: {Query}", query);
+                results.Add(JsonSerializer.Serialize(new { error = $"Query error: {ex.Message}", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+
+        return results;
+    }
+
     public string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount)
     {
         var columns = ParseSchema(schemaInfoJson);

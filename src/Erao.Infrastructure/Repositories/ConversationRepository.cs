@@ -29,4 +29,12 @@ public class ConversationRepository : Repository<Conversation>, IConversationRep
             .Include(c => c.FileDocument)
             .FirstOrDefaultAsync(c => c.Id == id);
     }
+
+    public async Task<Conversation?> GetWithConnectionsAsync(Guid id)
+    {
+        return await _dbSet
+            .Include(c => c.DatabaseConnection)
+            .Include(c => c.FileDocument)
+            .FirstOrDefaultAsync(c => c.Id == id);
+    }
 }

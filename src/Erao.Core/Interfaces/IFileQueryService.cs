@@ -12,6 +12,12 @@ public interface IFileQueryService
     Task<string> ExecuteQueryAsync(string parsedContentJson, string schemaInfoJson, string query);
 
     /// <summary>
+    /// Executes multiple SQL queries against file data using a single in-memory SQLite database.
+    /// Loads data once, runs all queries, returns list of results.
+    /// </summary>
+    Task<List<string>> ExecuteQueriesAsync(string parsedContentJson, string schemaInfoJson, List<string> queries);
+
+    /// <summary>
     /// Builds a SQLite-compatible schema description from file schema info.
     /// </summary>
     string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount);

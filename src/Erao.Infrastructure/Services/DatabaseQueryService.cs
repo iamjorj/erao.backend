@@ -107,6 +107,26 @@ public class DatabaseQueryService : IDatabaseQueryService
         }
     }
 
+    public async Task<List<string>> ExecuteQueriesAsync(DatabaseType dbType, string host, int port, string database, string username, string password, List<string> queries)
+    {
+        try
+        {
+            return dbType switch
+            {
+                DatabaseType.PostgreSQL => await ExecutePostgreSqlQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.MySQL => await ExecuteMySqlQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.SQLServer => await ExecuteSqlServerQueriesAsync(host, port, database, username, password, queries),
+                // MongoDB doesn't support multiple SQL queries
+                _ => throw new NotSupportedException($"Batch queries not supported for {dbType}")
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to execute batch queries for {DbType}", dbType);
+            throw;
+        }
+    }
+
     #region PostgreSQL
 
     private async Task<bool> TestPostgreSqlConnectionAsync(string host, int port, string database, string username, string password)
@@ -124,51 +144,99 @@ public class DatabaseQueryService : IDatabaseQueryService
         await connection.OpenAsync();
 
         var schema = new StringBuilder();
-        schema.AppendLine("-- PostgreSQL Database Schema");
-        schema.AppendLine();
 
-        var tableQuery = @"
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-            ORDER BY table_name";
-
-        await using var tableCmd = new NpgsqlCommand(tableQuery, connection);
-        await using var tableReader = await tableCmd.ExecuteReaderAsync();
-
-        var tables = new List<string>();
-        while (await tableReader.ReadAsync())
-        {
-            tables.Add(tableReader.GetString(0));
-        }
-        await tableReader.CloseAsync();
-
-        foreach (var table in tables)
-        {
-            schema.AppendLine($"-- Table: {table}");
-            schema.AppendLine($"CREATE TABLE {table} (");
-
-            var columnQuery = @"
-                SELECT column_name, data_type, is_nullable, column_default
+        // Single query: tables + row counts + all columns + all foreign keys
+        // This replaces 3 separate queries (tables, FKs, N columns queries) with 1
+        var allDataQuery = @"
+            WITH table_info AS (
+                SELECT c.relname AS table_name, c.reltuples::bigint AS approx_rows
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relkind = 'r'
+            ),
+            all_columns AS (
+                SELECT table_name, column_name, data_type, is_nullable, ordinal_position
                 FROM information_schema.columns
-                WHERE table_schema = 'public' AND table_name = @tableName
-                ORDER BY ordinal_position";
+                WHERE table_schema = 'public'
+            ),
+            all_fks AS (
+                SELECT
+                    tc.table_name AS from_table,
+                    kcu.column_name AS from_column,
+                    ccu.table_name AS to_table,
+                    ccu.column_name AS to_column
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                    ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+                JOIN information_schema.constraint_column_usage ccu
+                    ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+                WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+            )
+            SELECT 'T' AS row_type, t.table_name, t.approx_rows::text, NULL, NULL, NULL, NULL, 0
+            FROM table_info t
+            UNION ALL
+            SELECT 'C', c.table_name, c.column_name, c.data_type, c.is_nullable, NULL, NULL, c.ordinal_position
+            FROM all_columns c
+            UNION ALL
+            SELECT 'F', f.from_table, f.from_column, f.to_table, f.to_column, NULL, NULL, 0
+            FROM all_fks f
+            ORDER BY 2, 1, 8";
 
-            await using var columnCmd = new NpgsqlCommand(columnQuery, connection);
-            columnCmd.Parameters.AddWithValue("tableName", table);
-            await using var columnReader = await columnCmd.ExecuteReaderAsync();
+        var tables = new Dictionary<string, long>();
+        var columns = new Dictionary<string, List<string>>();
+        var foreignKeys = new Dictionary<string, List<string>>();
 
-            var columns = new List<string>();
-            while (await columnReader.ReadAsync())
+        await using var cmd = new NpgsqlCommand(allDataQuery, connection);
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            var rowType = reader.GetString(0);
+            var tableName = reader.GetString(1);
+
+            switch (rowType)
             {
-                var columnName = columnReader.GetString(0);
-                var dataType = columnReader.GetString(1);
-                var isNullable = columnReader.GetString(2) == "YES" ? "NULL" : "NOT NULL";
-                columns.Add($"    {columnName} {dataType} {isNullable}");
+                case "T":
+                    tables[tableName] = long.Parse(reader.GetString(2));
+                    break;
+                case "C":
+                {
+                    var colName = reader.GetString(2);
+                    var dataType = reader.GetString(3);
+                    var isNullable = reader.GetString(4) == "YES" ? "NULL" : "NOT NULL";
+                    if (!columns.ContainsKey(tableName))
+                        columns[tableName] = new List<string>();
+                    columns[tableName].Add($"    \"{colName}\" {dataType} {isNullable}");
+                    break;
+                }
+                case "F":
+                {
+                    var fromCol = reader.GetString(2);
+                    var toTable = reader.GetString(3);
+                    var toCol = reader.GetString(4);
+                    if (!foreignKeys.ContainsKey(tableName))
+                        foreignKeys[tableName] = new List<string>();
+                    foreignKeys[tableName].Add($"    -- FK: {fromCol} → {toTable}.{toCol}");
+                    break;
+                }
             }
-            await columnReader.CloseAsync();
+        }
 
-            schema.AppendLine(string.Join(",\n", columns));
+        foreach (var (table, rows) in tables.OrderBy(t => t.Key))
+        {
+            schema.AppendLine($"-- {table} (~{rows:N0} rows)");
+            schema.AppendLine($"CREATE TABLE \"{table}\" (");
+
+            if (columns.TryGetValue(table, out var cols))
+            {
+                schema.AppendLine(string.Join(",\n", cols));
+            }
+
+            if (foreignKeys.TryGetValue(table, out var fks))
+            {
+                schema.AppendLine(string.Join("\n", fks));
+            }
+
             schema.AppendLine(");");
             schema.AppendLine();
         }
@@ -186,6 +254,29 @@ public class DatabaseQueryService : IDatabaseQueryService
         await using var reader = await command.ExecuteReaderAsync();
 
         return await DataReaderToJsonAsync(reader);
+    }
+
+    private async Task<List<string>> ExecutePostgreSqlQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
+    {
+        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password}";
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                await using var command = new NpgsqlCommand(query, connection);
+                await using var reader = await command.ExecuteReaderAsync();
+                results.Add(await DataReaderToJsonAsync(reader));
+            }
+            catch (Exception ex)
+            {
+                results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+        return results;
     }
 
     private async Task<List<TableSchema>> GetPostgreSqlStructuredSchemaAsync(string host, int port, string database, string username, string password)
@@ -465,6 +556,29 @@ public class DatabaseQueryService : IDatabaseQueryService
         return await DataReaderToJsonAsync(reader);
     }
 
+    private async Task<List<string>> ExecuteMySqlQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
+    {
+        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password}";
+        await using var connection = new MySqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                await using var command = new MySqlCommand(query, connection);
+                await using var reader = await command.ExecuteReaderAsync();
+                results.Add(await DataReaderToJsonAsync(reader));
+            }
+            catch (Exception ex)
+            {
+                results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+        return results;
+    }
+
     private async Task<List<TableSchema>> GetMySqlStructuredSchemaAsync(string host, int port, string database, string username, string password)
     {
         var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password}";
@@ -701,6 +815,29 @@ public class DatabaseQueryService : IDatabaseQueryService
         await using var reader = await command.ExecuteReaderAsync();
 
         return await DataReaderToJsonAsync(reader);
+    }
+
+    private async Task<List<string>> ExecuteSqlServerQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
+    {
+        var connectionString = $"Server={host},{port};Database={database};User Id={username};Password={password};TrustServerCertificate=True";
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                await using var command = new SqlCommand(query, connection);
+                await using var reader = await command.ExecuteReaderAsync();
+                results.Add(await DataReaderToJsonAsync(reader));
+            }
+            catch (Exception ex)
+            {
+                results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+        return results;
     }
 
     private async Task<List<TableSchema>> GetSqlServerStructuredSchemaAsync(string host, int port, string database, string username, string password)
@@ -1072,9 +1209,11 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> DataReaderToJsonAsync(IDataReader reader)
     {
+        const int maxResultRows = 1000;
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var columns = new List<string>();
         var rows = new List<Dictionary<string, object?>>();
+        var truncated = false;
 
         // Get column names
         for (int i = 0; i < reader.FieldCount; i++)
@@ -1082,9 +1221,18 @@ public class DatabaseQueryService : IDatabaseQueryService
             columns.Add(reader.GetName(i));
         }
 
-        // Get rows
-        while (await Task.Run(() => reader.Read()))
+        // Use DbDataReader for true async ReadAsync (Npgsql, MySql, SqlClient all support it)
+        var dbReader = reader as System.Data.Common.DbDataReader;
+
+        // Get rows with cap
+        while (dbReader != null ? await dbReader.ReadAsync() : await Task.Run(() => reader.Read()))
         {
+            if (rows.Count >= maxResultRows)
+            {
+                truncated = true;
+                break;
+            }
+
             var row = new Dictionary<string, object?>();
             for (int i = 0; i < reader.FieldCount; i++)
             {
@@ -1096,13 +1244,19 @@ public class DatabaseQueryService : IDatabaseQueryService
 
         stopwatch.Stop();
 
-        var result = new
+        var result = new Dictionary<string, object?>
         {
-            columns,
-            rows,
-            rowCount = rows.Count,
-            executionTimeMs = (int)stopwatch.ElapsedMilliseconds
+            ["columns"] = columns,
+            ["rows"] = rows,
+            ["rowCount"] = rows.Count,
+            ["executionTimeMs"] = (int)stopwatch.ElapsedMilliseconds
         };
+
+        if (truncated)
+        {
+            result["truncated"] = true;
+            result["maxRows"] = maxResultRows;
+        }
 
         return JsonSerializer.Serialize(result, new JsonSerializerOptions
         {
