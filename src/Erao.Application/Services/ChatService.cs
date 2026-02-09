@@ -17,6 +17,7 @@ public class ChatService : IChatService
     private readonly IUnitOfWork _unitOfWork;
     private readonly IOllamaService _ollamaService;
     private readonly IDatabaseQueryService _databaseQueryService;
+    private readonly IFileQueryService _fileQueryService;
     private readonly IEncryptionService _encryptionService;
     private readonly IMapper _mapper;
 
@@ -24,12 +25,14 @@ public class ChatService : IChatService
         IUnitOfWork unitOfWork,
         IOllamaService ollamaService,
         IDatabaseQueryService databaseQueryService,
+        IFileQueryService fileQueryService,
         IEncryptionService encryptionService,
         IMapper mapper)
     {
         _unitOfWork = unitOfWork;
         _ollamaService = ollamaService;
         _databaseQueryService = databaseQueryService;
+        _fileQueryService = fileQueryService;
         _encryptionService = encryptionService;
         _mapper = mapper;
     }
@@ -52,7 +55,7 @@ public class ChatService : IChatService
             user.BillingCycleReset = DateTime.UtcNow.AddMonths(1);
         }
 
-        if (user.QueriesUsedThisMonth >= user.QueryLimitPerMonth)
+        if (user.QueryLimitPerMonth != -1 && user.QueriesUsedThisMonth >= user.QueryLimitPerMonth)
         {
             throw new InvalidOperationException("Query limit reached for this billing cycle");
         }
@@ -83,7 +86,6 @@ public class ChatService : IChatService
 
         // Get schema context if database connection or file is set
         string? schemaContext = null;
-        string? fileDataContext = null;
         DatabaseConnection? dbConnection = null;
         FileDocument? fileDocument = null;
 
@@ -115,8 +117,9 @@ public class ChatService : IChatService
             fileDocument = await _unitOfWork.FileDocuments.GetByIdAsync(conversation.FileDocumentId.Value);
             if (fileDocument != null)
             {
-                schemaContext = fileDocument.SchemaInfo;
-                fileDataContext = fileDocument.ParsedContent;
+                // Build a SQLite-oriented schema description for the AI
+                schemaContext = _fileQueryService.BuildSchemaDescription(
+                    fileDocument.SchemaInfo ?? "[]", "data", fileDocument.RowCount);
             }
         }
 
@@ -173,8 +176,8 @@ public class ChatService : IChatService
 
         // Build system prompt - different for database vs file
         var systemPrompt = fileDocument != null
-            ? BuildFileSystemPrompt(schemaContext, fileDataContext, fileDocument.OriginalFileName)
-            : BuildSystemPrompt(schemaContext);
+            ? BuildFileSystemPrompt(schemaContext, fileDocument.OriginalFileName, fileDocument.RowCount)
+            : BuildSystemPrompt(schemaContext, dbConnection?.DatabaseType);
 
         // Get AI response with full conversation history
         var (aiResponse, tokensUsed) = await _ollamaService.ChatAsync(request.Message, history, systemPrompt);
@@ -240,15 +243,59 @@ public class ChatService : IChatService
                 queryResult = ExtractDataContextAsResult(aiResponse);
             }
         }
-        else if (fileDocument != null)
+        else if (fileDocument != null && request.ExecuteQuery)
         {
-            // For file-based conversations, extract JSON data for table display
-            queryResult = ExtractJsonBlock(aiResponse);
+            // File mode: extract SQL from AI response and execute against in-memory SQLite
+            var sqlQueries = ExtractAllSqlFromResponse(aiResponse);
 
-            // Fallback: If no JSON block but has [DATA_CONTEXT], parse that
-            if (string.IsNullOrEmpty(queryResult))
+            if (sqlQueries.Count > 0 && !string.IsNullOrEmpty(fileDocument.ParsedContent) && !string.IsNullOrEmpty(fileDocument.SchemaInfo))
             {
-                queryResult = ExtractDataContextAsResult(aiResponse);
+                sqlQuery = string.Join("\n\n-- Next Query --\n\n", sqlQueries);
+
+                try
+                {
+                    if (sqlQueries.Count == 1)
+                    {
+                        queryResult = await _fileQueryService.ExecuteQueryAsync(
+                            fileDocument.ParsedContent, fileDocument.SchemaInfo, sqlQueries[0]);
+                    }
+                    else
+                    {
+                        var allResults = new List<object>();
+                        foreach (var sql in sqlQueries)
+                        {
+                            try
+                            {
+                                var result = await _fileQueryService.ExecuteQueryAsync(
+                                    fileDocument.ParsedContent, fileDocument.SchemaInfo, sql);
+                                if (!string.IsNullOrEmpty(result))
+                                {
+                                    var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
+                                    allResults.Add(parsed!);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                allResults.Add(new { error = ex.Message, query = sql });
+                            }
+                        }
+                        queryResult = System.Text.Json.JsonSerializer.Serialize(new { tables = allResults });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    queryResult = $"Error executing query: {ex.Message}";
+                }
+            }
+            else
+            {
+                // Fallback: extract JSON data blocks from AI response
+                queryResult = ExtractJsonBlock(aiResponse);
+
+                if (string.IsNullOrEmpty(queryResult))
+                {
+                    queryResult = ExtractDataContextAsResult(aiResponse);
+                }
             }
         }
 
@@ -302,73 +349,67 @@ public class ChatService : IChatService
         };
     }
 
-    private static string BuildSystemPrompt(string? schemaContext)
+    private static string BuildSystemPrompt(string? schemaContext, DatabaseType? dbType = null)
     {
-        var prompt = """
-You are Erao, a helpful data assistant. You help users query and understand their databases through natural conversation.
+        var dialect = dbType switch
+        {
+            DatabaseType.PostgreSQL => "PostgreSQL",
+            DatabaseType.MySQL => "MySQL",
+            DatabaseType.SQLServer => "SQL Server",
+            DatabaseType.MongoDB => "MongoDB",
+            _ => "PostgreSQL"
+        };
+
+        var quoteStyle = dbType switch
+        {
+            DatabaseType.MySQL => "backtick-quote identifiers: `TableName`, `ColumnName`",
+            DatabaseType.SQLServer => "bracket-quote identifiers: [TableName], [ColumnName]",
+            _ => "double-quote identifiers: \"TableName\", \"ColumnName\""
+        };
+
+        var prompt = $@"You are Erao, a helpful data assistant. You help users query and understand their databases through natural conversation.
+
+The database type is **{dialect}**. Write all SQL in {dialect} syntax.
 
 ## CRITICAL RULE — SQL IS MANDATORY
 
 Every time the user asks ANYTHING about their data, you MUST include a ```sql code block in your response. This is NON-NEGOTIABLE. Without the SQL block, the system cannot fetch data and the user sees NOTHING.
 
-- "how many users?" → MUST have ```sql block
-- "show me all users" → MUST have ```sql block
-- "give me all users with all info" → MUST have ```sql block
-- "what are the trends?" → MUST have ```sql block
+- ""how many users?"" → MUST have ```sql block
+- ""show me all users"" → MUST have ```sql block
+- ""what are the trends?"" → MUST have ```sql block
 - ANY question about data → MUST have ```sql block
 
 The ```sql block MUST appear BEFORE your text explanation. Write the SQL first, then ALWAYS write a brief text response after it. NEVER respond with only a SQL block and nothing else.
 
 ## SQL Rules
-- Double-quote identifiers: "TableName", "ColumnName"
+- {quoteStyle}
 - Use LIMIT for potentially large results (unless user asks for all)
 - JOIN to get readable names, not raw IDs
 - SELECT only (no INSERT/UPDATE/DELETE)
+- Use {dialect}-compatible functions and syntax
 
 ## How to Respond
 
 Be natural and conversational. Match your response length to the question:
-- Simple questions ("how many users?") → SQL + short answer, 1-2 sentences max
-- Data requests ("show me all users") → SQL + a brief one-liner like "Here are all your users."
-- Analytical questions ("what are the trends?") → SQL + insights with bullet points
+- Simple questions → SQL + short answer, 1-2 sentences max
+- Data requests → SQL + a brief one-liner
+- Analytical questions → SQL + insights with bullet points
 
-Do NOT use rigid section headers like "Overview:", "Key Insights:", "Patterns:", "Recommendation:" for every response.
+Do NOT use rigid section headers like ""Overview:"", ""Key Insights:"" for every response.
 
 ## Formatting
 - Use **bold** for important numbers
 - Keep responses concise — don't pad with filler analysis
 - Don't repeat data that's already shown in the table results
+- Don't hardcode numbers in your text — describe what the query will show
 
-## Examples
-
-User: "how many orders this month?"
-```sql
-SELECT COUNT(*) AS "TotalOrders" FROM "Orders" WHERE "CreatedAt" >= DATE_TRUNC('month', CURRENT_DATE)
-```
-You have **142** orders this month.
-
-User: "show me all users"
-```sql
-SELECT * FROM "Users"
-```
-Here are all your users.
-
-User: "give me all users with all info"
-```sql
-SELECT * FROM "Users"
-```
-Here are all your users with their complete information.
-
-User: "analyze our sales trends"
-```sql
-SELECT DATE_TRUNC('month', "CreatedAt") AS "Month", COUNT(*) AS "Orders", SUM("Amount") AS "Revenue"
-FROM "Orders" GROUP BY "Month" ORDER BY "Month" DESC LIMIT 12
-```
-A few things stand out:
-- Revenue grew **23%** month-over-month in March
-- **Q1** accounts for **$1.2M** of total sales
-- Order volume dipped in February but recovered strongly
-""";
+## What NOT to do
+- Don't answer data questions without a ```sql block
+- Don't guess or hardcode numbers — let the SQL query compute them
+- Don't repeat data from tables in your text
+- Don't give unsolicited analysis
+";
 
         if (!string.IsNullOrEmpty(schemaContext))
         {
@@ -377,7 +418,7 @@ A few things stand out:
 The user's database has the following schema:
 {schemaContext}
 
-IMPORTANT: Use this schema to understand the database structure. Use the EXACT table and column names as shown above, wrapped in double quotes to preserve case sensitivity.";
+IMPORTANT: Use this schema to understand the database structure. Use the EXACT table and column names as shown above, properly quoted for {dialect}.";
         }
         else
         {
@@ -639,110 +680,88 @@ No database schema is available. You can help with general SQL questions or ask 
         return string.IsNullOrEmpty(cleaned) ? "New Chat" : cleaned;
     }
 
-    private static string BuildFileSystemPrompt(string? schemaContext, string? fileDataContext, string fileName)
+    private static string BuildFileSystemPrompt(string? schemaContext, string fileName, int? rowCount)
     {
-        var prompt = $@"You are Erao, a helpful data assistant working with '{fileName}'.
+        var rowInfo = rowCount.HasValue ? $"The file contains {rowCount.Value:N0} rows of data." : "";
+
+        var prompt = $@"You are Erao, a helpful data assistant working with the file '{fileName}'.
+{rowInfo}
+
+The file data is loaded into a SQLite database table called ""data"". You MUST write SQL queries to answer questions about the data.
+
+## CRITICAL RULE — SQL IS MANDATORY
+
+Every time the user asks ANYTHING about their data, you MUST include a ```sql code block. Without it, the system cannot fetch data and the user sees NOTHING.
+
+- ""how many rows?"" → MUST have ```sql block
+- ""show me top 5"" → MUST have ```sql block
+- ""what's the average?"" → MUST have ```sql block
+- ANY question about the file data → MUST have ```sql block
+
+The ```sql block MUST appear BEFORE your text explanation. Write the SQL first, then ALWAYS write a brief text response after it. NEVER respond with only a SQL block and nothing else.
+
+## SQL Rules
+- The table is called ""data"" — always use it
+- Double-quote column names: SELECT ""ColumnName"" FROM ""data""
+- Use standard SQLite SQL syntax
+- SELECT only (no INSERT/UPDATE/DELETE)
+- Use LIMIT for potentially large results (unless user asks for all)
+- For counts, use COUNT(*); for averages, use AVG(); for sums, use SUM()
+- Column names are CASE-SENSITIVE — use the exact names from the schema
 
 ## How to Respond
 
 Be natural and conversational. Match your response to what the user asked:
-- Simple questions → short answer, 1-2 sentences
-- Data requests (""show me the data"") → show the data with a brief one-liner. No forced analysis.
-- Analytical questions (""what are the trends?"") → provide insights with bullet points
+- Simple questions → SQL + short answer, 1-2 sentences
+- Data requests → SQL + brief one-liner
+- Analytical questions → SQL + insights with bullet points
 
-Do NOT use rigid ""Overview:"", ""Key Insights:"", ""Recommendation:"" headers for every response. Only provide analysis when the user asks for it.
+Do NOT use rigid ""Overview:"", ""Key Insights:"" headers for every response.
 
-## JSON Data Rules
-- Include ```json blocks when showing tabular data
-- Add ""title"" field to label tables
-- FIRST column: label/category (name, date, text)
-- SECOND+ columns: numeric values
-- Sort by value for ""top X"" queries
-
-## Formatting
-- Use **bold** for important numbers
-- Use bullet points (-) for lists when needed
-- Keep responses concise — no filler
-- Don't repeat data that's already in the table
-
-## Example Responses
+## Examples
 
 User: ""what's in this file?""
-This file contains **1,659** sales records with columns for property details, sale prices, and dates.
-
-User: ""show me top 5 sales""
-Here are the top 5 by sale price:
-```json
-{{""title"": ""Top 5 Sales"", ""columns"": [""Property"", ""SalePrice""], ""rows"": [...], ""rowCount"": 5}}
+```sql
+SELECT COUNT(*) AS ""TotalRows"" FROM ""data""
 ```
+This file contains [describe based on query result and schema columns].
 
-User: ""analyze the pricing trends""
-A few patterns in the data:
-- Average sale price is **$256,690**
-- Top sale reached **$458,000**
-- **78%** of sales are above $200K — this market skews premium
+User: ""how many rows?""
+```sql
+SELECT COUNT(*) AS ""Count"" FROM ""data""
+```
+[Describe the count from the query result.]
+
+User: ""show me top 5 by sales""
+```sql
+SELECT ""Product"", ""Sales"" FROM ""data"" ORDER BY ""Sales"" DESC LIMIT 5
+```
+Here are the top 5 by sales.
+
+User: ""what's the average revenue?""
+```sql
+SELECT ROUND(AVG(""Revenue""), 2) AS ""AvgRevenue"" FROM ""data""
+```
+[Describe the average from the query result.]
 
 ## What NOT to do
-- Don't add ""Overview:"", ""Key Insights:"" headers to simple requests
-- Don't analyze data the user didn't ask to analyze
-- Don't just list column names and counts (that's metadata, not useful)
-- Don't repeat data from tables in your text
-- Don't give unsolicited recommendations
+- Don't answer data questions without a ```sql block
+- Don't guess or hardcode numbers — let the SQL query compute them
+- Don't repeat data that will be shown in the query results table
+- Don't give unsolicited analysis
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
         {
             prompt += $@"
 
-The file has the following structure (columns):
+## File Schema
 {schemaContext}
-";
-        }
 
-        if (!string.IsNullOrEmpty(fileDataContext))
-        {
-            // Limit data context to avoid token limits (take first ~50 rows)
-            var dataPreview = TruncateDataContext(fileDataContext, 50);
-            prompt += $@"
-
-Here is the data from the file (first rows):
-{dataPreview}
-
-Use this data to answer the user's questions. Calculate statistics, find patterns, and provide insights as requested.";
+IMPORTANT: Use the EXACT column names from the schema above, wrapped in double quotes.";
         }
 
         return prompt;
-    }
-
-    private static string TruncateDataContext(string jsonData, int maxRows)
-    {
-        try
-        {
-            using var doc = System.Text.Json.JsonDocument.Parse(jsonData);
-            var root = doc.RootElement;
-
-            if (root.ValueKind == System.Text.Json.JsonValueKind.Array)
-            {
-                var rows = new List<System.Text.Json.JsonElement>();
-                foreach (var item in root.EnumerateArray())
-                {
-                    if (rows.Count >= maxRows) break;
-                    rows.Add(item);
-                }
-
-                return System.Text.Json.JsonSerializer.Serialize(rows);
-            }
-        }
-        catch
-        {
-            // If parsing fails, just truncate the string
-            if (jsonData.Length > 10000)
-            {
-                return jsonData.Substring(0, 10000) + "... (truncated)";
-            }
-        }
-
-        return jsonData;
     }
 
     private static string? ExtractJsonBlock(string response)
