@@ -8,11 +8,13 @@ namespace Erao.Infrastructure.Services;
 
 public class FileQueryService : IFileQueryService
 {
+    private readonly IUnitOfWork _unitOfWork;
     private readonly ILogger<FileQueryService> _logger;
     private const string TableName = "data";
 
-    public FileQueryService(ILogger<FileQueryService> logger)
+    public FileQueryService(IUnitOfWork unitOfWork, ILogger<FileQueryService> logger)
     {
+        _unitOfWork = unitOfWork;
         _logger = logger;
     }
 
@@ -320,6 +322,169 @@ public class FileQueryService : IFileQueryService
             "date" or "datetime" => "TEXT",
             _ => "TEXT"
         };
+    }
+
+    public async Task<string> GetPreviewDataAsync(Guid fileId, int limit = 50)
+    {
+        var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
+        if (file == null || string.IsNullOrEmpty(file.ParsedContent))
+        {
+            return JsonSerializer.Serialize(new { columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+        }
+
+        var query = $"SELECT * FROM {TableName} LIMIT {Math.Min(limit, 100)}";
+        return await ExecuteQueryAsync(file.ParsedContent, file.SchemaInfo ?? "[]", query);
+    }
+
+    public async Task<string> GetColumnStatsAsync(Guid fileId, string columnName)
+    {
+        var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
+        if (file == null || string.IsNullOrEmpty(file.ParsedContent))
+        {
+            return JsonSerializer.Serialize(new { error = "File not found" });
+        }
+
+        var safeColumn = new string(columnName.Where(c => char.IsLetterOrDigit(c) || c == '_' || c == ' ').ToArray());
+        var quotedColumn = $"\"{safeColumn}\"";
+
+        var stopwatch = Stopwatch.StartNew();
+
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+
+        var columns = ParseSchema(file.SchemaInfo ?? "[]");
+        if (columns.Count == 0)
+        {
+            return JsonSerializer.Serialize(new { error = "No schema available" });
+        }
+
+        await CreateTableAsync(connection, columns);
+        var rowsInserted = await LoadDataAsync(connection, file.ParsedContent, columns);
+
+        // Get statistics
+        var statsQuery = $@"
+            SELECT
+                COUNT(*) as total_count,
+                COUNT(*) - COUNT({quotedColumn}) as null_count,
+                COUNT(DISTINCT {quotedColumn}) as unique_count,
+                MIN({quotedColumn}) as min_value,
+                MAX({quotedColumn}) as max_value,
+                AVG(CASE WHEN typeof({quotedColumn}) IN ('integer', 'real') THEN CAST({quotedColumn} AS REAL) ELSE NULL END) as avg_value
+            FROM {TableName}";
+
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = statsQuery;
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var result = new Dictionary<string, object?>();
+        if (await reader.ReadAsync())
+        {
+            var totalCount = reader.GetInt64(0);
+            var nullCount = reader.GetInt64(1);
+
+            result["columnName"] = columnName;
+            result["dataType"] = columns.FirstOrDefault(c => c.Name == columnName)?.DataType ?? "unknown";
+            result["totalCount"] = totalCount;
+            result["nullCount"] = nullCount;
+            result["nullPercentage"] = totalCount > 0 ? Math.Round((double)nullCount / totalCount * 100, 2) : 0;
+            result["uniqueCount"] = reader.GetInt64(2);
+            result["minValue"] = reader.IsDBNull(3) ? null : reader.GetValue(3);
+            result["maxValue"] = reader.IsDBNull(4) ? null : reader.GetValue(4);
+            result["avgValue"] = reader.IsDBNull(5) ? null : Math.Round(reader.GetDouble(5), 2);
+        }
+
+        // Get sample values
+        var sampleQuery = $"SELECT DISTINCT {quotedColumn} FROM {TableName} WHERE {quotedColumn} IS NOT NULL LIMIT 10";
+        await using var sampleCmd = connection.CreateCommand();
+        sampleCmd.CommandText = sampleQuery;
+        await using var sampleReader = await sampleCmd.ExecuteReaderAsync();
+
+        var samples = new List<object?>();
+        while (await sampleReader.ReadAsync())
+        {
+            samples.Add(sampleReader.IsDBNull(0) ? null : sampleReader.GetValue(0));
+        }
+        result["sampleValues"] = samples;
+
+        return JsonSerializer.Serialize(result);
+    }
+
+    public async Task<string> GetSchemaAsync(Guid fileId)
+    {
+        var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
+        if (file == null)
+        {
+            return "[]";
+        }
+        return file.SchemaInfo ?? "[]";
+    }
+
+    public async Task<string> GetFileStatsAsync(Guid fileId)
+    {
+        var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
+        if (file == null || string.IsNullOrEmpty(file.ParsedContent))
+        {
+            return JsonSerializer.Serialize(new { rowCount = 0, columns = Array.Empty<object>() });
+        }
+
+        var columns = ParseSchema(file.SchemaInfo ?? "[]");
+
+        // Count rows
+        long rowCount = 0;
+        try
+        {
+            using var doc = JsonDocument.Parse(file.ParsedContent);
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                rowCount = doc.RootElement.GetArrayLength();
+            }
+        }
+        catch
+        {
+            // Ignore parse errors
+        }
+
+        // Calculate column stats
+        var columnStats = new List<object>();
+        if (rowCount > 0)
+        {
+            await using var connection = new SqliteConnection("Data Source=:memory:");
+            await connection.OpenAsync();
+
+            await CreateTableAsync(connection, columns);
+            await LoadDataAsync(connection, file.ParsedContent, columns);
+
+            foreach (var col in columns.Take(10))
+            {
+                try
+                {
+                    var quotedCol = $"\"{col.Name}\"";
+                    var query = $"SELECT COUNT(*) - COUNT({quotedCol}) as null_count FROM {TableName}";
+
+                    await using var cmd = connection.CreateCommand();
+                    cmd.CommandText = query;
+                    var nullCount = (long)(await cmd.ExecuteScalarAsync() ?? 0);
+
+                    columnStats.Add(new
+                    {
+                        name = col.Name,
+                        dataType = col.DataType,
+                        nullPercentage = rowCount > 0 ? Math.Round((double)nullCount / rowCount * 100, 2) : 0
+                    });
+                }
+                catch
+                {
+                    columnStats.Add(new { name = col.Name, dataType = col.DataType, nullPercentage = 0 });
+                }
+            }
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            rowCount,
+            columnCount = columns.Count,
+            columns = columnStats
+        });
     }
 
     private class ColumnDef

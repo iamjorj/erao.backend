@@ -21,4 +21,24 @@ public interface IFileQueryService
     /// Builds a SQLite-compatible schema description from file schema info.
     /// </summary>
     string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount);
+
+    /// <summary>
+    /// Gets preview data from a file (first N rows).
+    /// </summary>
+    Task<string> GetPreviewDataAsync(Guid fileId, int limit = 50);
+
+    /// <summary>
+    /// Gets column statistics for a file column.
+    /// </summary>
+    Task<string> GetColumnStatsAsync(Guid fileId, string columnName);
+
+    /// <summary>
+    /// Gets file schema information.
+    /// </summary>
+    Task<string> GetSchemaAsync(Guid fileId);
+
+    /// <summary>
+    /// Gets overall file statistics.
+    /// </summary>
+    Task<string> GetFileStatsAsync(Guid fileId);
 }

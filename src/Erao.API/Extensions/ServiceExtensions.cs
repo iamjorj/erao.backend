@@ -47,6 +47,7 @@ public static class ServiceExtensions
         services.AddScoped<IUsageService, UsageService>();
         services.AddScoped<IAccountService, AccountService>();
         services.AddScoped<ISubscriptionService, SubscriptionService>();
+        services.AddScoped<IDataExplorationService, DataExplorationService>();
 
         // External services
         services.AddHttpClient<IOllamaService, OllamaService>();
