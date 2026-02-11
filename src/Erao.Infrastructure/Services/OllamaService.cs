@@ -1,25 +1,21 @@
 using System.Net.Http.Json;
-using System.Text;
 using System.Text.Json;
 using Erao.Core.Interfaces;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging;
 
 namespace Erao.Infrastructure.Services;
 
 public class OllamaService : IOllamaService
 {
     private readonly HttpClient _httpClient;
-    private readonly ILogger<OllamaService> _logger;
     private readonly string _model;
     private readonly string _baseUrl;
     private readonly string _provider; // "ollama" or "openai"
     private readonly string? _apiKey;
 
-    public OllamaService(HttpClient httpClient, IConfiguration configuration, ILogger<OllamaService> logger)
+    public OllamaService(HttpClient httpClient, IConfiguration configuration)
     {
         _httpClient = httpClient;
-        _logger = logger;
         _baseUrl = configuration["Ollama:BaseUrl"] ?? "http://localhost:11434";
         _model = configuration["Ollama:Model"] ?? "gpt-oss:120b-cloud";
         _apiKey = configuration["Ollama:ApiKey"];
@@ -81,7 +77,6 @@ If the question cannot be answered with the given schema, respond with: ERROR: [
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error communicating with AI service (provider: {Provider})", _provider);
             throw new InvalidOperationException("Failed to get response from AI service", ex);
         }
     }
