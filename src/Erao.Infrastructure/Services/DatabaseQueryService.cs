@@ -1209,11 +1209,12 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> DataReaderToJsonAsync(IDataReader reader)
     {
-        const int maxResultRows = 1000;
+        const int maxResultRows = 100000; // Support up to 100k rows
+        const int maxCellLength = 5000; // Truncate individual cell values longer than this
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var columns = new List<string>();
-        var rows = new List<Dictionary<string, object?>>();
         var truncated = false;
+        var rowCount = 0;
 
         // Get column names
         for (int i = 0; i < reader.FieldCount; i++)
@@ -1221,48 +1222,135 @@ public class DatabaseQueryService : IDatabaseQueryService
             columns.Add(reader.GetName(i));
         }
 
-        // Use DbDataReader for true async ReadAsync (Npgsql, MySql, SqlClient all support it)
+        // Use streaming JSON writer to avoid building huge object in memory
+        using var stream = new MemoryStream();
+        using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { SkipValidation = true });
+
+        writer.WriteStartObject();
+
+        // Write columns
+        writer.WritePropertyName("columns");
+        writer.WriteStartArray();
+        foreach (var col in columns)
+        {
+            writer.WriteStringValue(col);
+        }
+        writer.WriteEndArray();
+
+        // Write rows array - streaming
+        writer.WritePropertyName("rows");
+        writer.WriteStartArray();
+
         var dbReader = reader as System.Data.Common.DbDataReader;
 
-        // Get rows with cap
         while (dbReader != null ? await dbReader.ReadAsync() : await Task.Run(() => reader.Read()))
         {
-            if (rows.Count >= maxResultRows)
+            if (rowCount >= maxResultRows)
             {
                 truncated = true;
                 break;
             }
 
-            var row = new Dictionary<string, object?>();
+            writer.WriteStartObject();
             for (int i = 0; i < reader.FieldCount; i++)
             {
-                var value = reader.GetValue(i);
-                row[reader.GetName(i)] = value == DBNull.Value ? null : value;
+                var colName = reader.GetName(i);
+                writer.WritePropertyName(colName);
+
+                if (reader.IsDBNull(i))
+                {
+                    writer.WriteNullValue();
+                }
+                else
+                {
+                    var value = reader.GetValue(i);
+                    WriteJsonValue(writer, value, maxCellLength);
+                }
             }
-            rows.Add(row);
+            writer.WriteEndObject();
+            rowCount++;
+
+            // Flush periodically to avoid huge buffers
+            if (rowCount % 10000 == 0)
+            {
+                await writer.FlushAsync();
+            }
         }
+
+        writer.WriteEndArray();
 
         stopwatch.Stop();
 
-        var result = new Dictionary<string, object?>
-        {
-            ["columns"] = columns,
-            ["rows"] = rows,
-            ["rowCount"] = rows.Count,
-            ["executionTimeMs"] = (int)stopwatch.ElapsedMilliseconds
-        };
+        // Write metadata
+        writer.WriteNumber("rowCount", rowCount);
+        writer.WriteNumber("executionTimeMs", (int)stopwatch.ElapsedMilliseconds);
 
         if (truncated)
         {
-            result["truncated"] = true;
-            result["maxRows"] = maxResultRows;
+            writer.WriteBoolean("truncated", true);
+            writer.WriteNumber("maxRows", maxResultRows);
         }
 
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions
+        writer.WriteEndObject();
+        await writer.FlushAsync();
+
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private static void WriteJsonValue(Utf8JsonWriter writer, object value, int maxCellLength)
+    {
+        switch (value)
         {
-            WriteIndented = false,
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        });
+            case string strVal:
+                if (strVal.Length > maxCellLength)
+                    writer.WriteStringValue(strVal.Substring(0, maxCellLength) + "...");
+                else
+                    writer.WriteStringValue(strVal);
+                break;
+            case bool boolVal:
+                writer.WriteBooleanValue(boolVal);
+                break;
+            case int intVal:
+                writer.WriteNumberValue(intVal);
+                break;
+            case long longVal:
+                writer.WriteNumberValue(longVal);
+                break;
+            case decimal decVal:
+                writer.WriteNumberValue(decVal);
+                break;
+            case double doubleVal:
+                if (double.IsNaN(doubleVal) || double.IsInfinity(doubleVal))
+                    writer.WriteNullValue();
+                else
+                    writer.WriteNumberValue(doubleVal);
+                break;
+            case float floatVal:
+                if (float.IsNaN(floatVal) || float.IsInfinity(floatVal))
+                    writer.WriteNullValue();
+                else
+                    writer.WriteNumberValue(floatVal);
+                break;
+            case DateTime dateVal:
+                writer.WriteStringValue(dateVal.ToString("O"));
+                break;
+            case DateTimeOffset dtoVal:
+                writer.WriteStringValue(dtoVal.ToString("O"));
+                break;
+            case Guid guidVal:
+                writer.WriteStringValue(guidVal.ToString());
+                break;
+            case byte[] byteVal:
+                writer.WriteStringValue(byteVal.Length > 100 ? $"[Binary: {byteVal.Length} bytes]" : Convert.ToBase64String(byteVal));
+                break;
+            default:
+                var strValue = value?.ToString() ?? "";
+                if (strValue.Length > maxCellLength)
+                    writer.WriteStringValue(strValue.Substring(0, maxCellLength) + "...");
+                else
+                    writer.WriteStringValue(strValue);
+                break;
+        }
     }
 
     #endregion

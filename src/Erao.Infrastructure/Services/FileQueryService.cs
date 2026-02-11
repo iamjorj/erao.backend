@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using Erao.Core.Interfaces;
 using Microsoft.Data.Sqlite;
@@ -253,7 +254,8 @@ public class FileQueryService : IFileQueryService
 
     private async Task<string> ExecuteSqlAsync(SqliteConnection connection, string query, Stopwatch stopwatch)
     {
-        const int maxResultRows = 1000;
+        const int maxResultRows = 100000; // Support up to 100k rows
+        const int maxCellLength = 5000;
 
         await using var cmd = connection.CreateCommand();
         cmd.CommandText = query;
@@ -266,50 +268,112 @@ public class FileQueryService : IFileQueryService
             columnNames.Add(reader.GetName(i));
         }
 
-        var rows = new List<Dictionary<string, object?>>();
+        // Use streaming JSON writer to avoid building huge object in memory
+        using var stream = new MemoryStream();
+        using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { SkipValidation = true });
+
+        writer.WriteStartObject();
+
+        // Write columns
+        writer.WritePropertyName("columns");
+        writer.WriteStartArray();
+        foreach (var col in columnNames)
+        {
+            writer.WriteStringValue(col);
+        }
+        writer.WriteEndArray();
+
+        // Write rows array - streaming
+        writer.WritePropertyName("rows");
+        writer.WriteStartArray();
+
+        var rowCount = 0;
         var truncated = false;
 
         while (await reader.ReadAsync())
         {
-            if (rows.Count >= maxResultRows)
+            if (rowCount >= maxResultRows)
             {
                 truncated = true;
                 break;
             }
 
-            var row = new Dictionary<string, object?>();
+            writer.WriteStartObject();
             for (int i = 0; i < reader.FieldCount; i++)
             {
-                var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                writer.WritePropertyName(columnNames[i]);
 
-                // Round floating point for cleaner display
-                if (value is double d)
+                if (reader.IsDBNull(i))
                 {
-                    value = d == Math.Floor(d) ? (object)(long)d : Math.Round(d, 2);
+                    writer.WriteNullValue();
                 }
+                else
+                {
+                    var value = reader.GetValue(i);
 
-                row[columnNames[i]] = value;
+                    // Handle different types
+                    if (value is double d)
+                    {
+                        if (double.IsNaN(d) || double.IsInfinity(d))
+                            writer.WriteNullValue();
+                        else if (d == Math.Floor(d) && d >= long.MinValue && d <= long.MaxValue)
+                            writer.WriteNumberValue((long)d);
+                        else
+                            writer.WriteNumberValue(Math.Round(d, 2));
+                    }
+                    else if (value is long l)
+                    {
+                        writer.WriteNumberValue(l);
+                    }
+                    else if (value is int intVal)
+                    {
+                        writer.WriteNumberValue(intVal);
+                    }
+                    else if (value is string strVal)
+                    {
+                        if (strVal.Length > maxCellLength)
+                            writer.WriteStringValue(strVal.Substring(0, maxCellLength) + "...");
+                        else
+                            writer.WriteStringValue(strVal);
+                    }
+                    else
+                    {
+                        var strValue = value?.ToString() ?? "";
+                        if (strValue.Length > maxCellLength)
+                            writer.WriteStringValue(strValue.Substring(0, maxCellLength) + "...");
+                        else
+                            writer.WriteStringValue(strValue);
+                    }
+                }
             }
-            rows.Add(row);
+            writer.WriteEndObject();
+            rowCount++;
+
+            // Flush periodically to avoid huge buffers
+            if (rowCount % 10000 == 0)
+            {
+                await writer.FlushAsync();
+            }
         }
+
+        writer.WriteEndArray();
 
         stopwatch.Stop();
 
-        var result = new Dictionary<string, object?>
-        {
-            ["columns"] = columnNames,
-            ["rows"] = rows,
-            ["rowCount"] = rows.Count,
-            ["executionTimeMs"] = stopwatch.ElapsedMilliseconds
-        };
+        // Write metadata
+        writer.WriteNumber("rowCount", rowCount);
+        writer.WriteNumber("executionTimeMs", stopwatch.ElapsedMilliseconds);
 
         if (truncated)
         {
-            result["truncated"] = true;
-            result["maxRows"] = maxResultRows;
+            writer.WriteBoolean("truncated", true);
+            writer.WriteNumber("maxRows", maxResultRows);
         }
 
-        return JsonSerializer.Serialize(result);
+        writer.WriteEndObject();
+        await writer.FlushAsync();
+
+        return Encoding.UTF8.GetString(stream.ToArray());
     }
 
     private static string MapToSqliteType(string dataType)
