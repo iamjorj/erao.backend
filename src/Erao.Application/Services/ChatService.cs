@@ -380,6 +380,8 @@ Then follow the matching rules:
 
 **DATA → respond with ONLY a ```sql block. Nothing else. No text before it, no text after it, no label, no commentary. Pure SQL only.**
 
+CRITICAL: You MUST write a new SQL query for EVERY data request, even follow-up questions. The conversation may show [DATA_CONTEXT: ...] tags from previous queries — these are just references. You NEVER have access to query results. You must ALWAYS generate fresh SQL. Never mention DATA_CONTEXT in your response.
+
 **EXPLANATION → respond with well-formatted text following these rules:**
 - Start with a one-line summary in **bold**
 - Use **bold** for key terms and section headers
@@ -698,13 +700,15 @@ No schema available. Tell the user to connect a database first.";
 
 First, decide what the user wants:
 
-1. **Data** — they want numbers, lists, tables, metrics, rankings, comparisons, visualizations, or any question answerable with a query.
+1. **Data** — they want numbers, lists, tables, metrics, rankings, comparisons, visualizations, charts, graphs, or any question answerable with a query.
 2. **Explanation** — they explicitly ask to explain, describe, analyze meaning, ""what's in this file"", ""tell me about"", ""why"", ""how does X work"".
 3. **Chat** — greetings, general talk, or questions unrelated to the schema.
 
 Then follow the matching rules:
 
 **DATA → respond with ONLY a ```sql block. Nothing else. No text before it, no text after it, no label, no commentary. Pure SQL only.**
+
+CRITICAL: You MUST write a new SQL query for EVERY data request, even follow-up questions. The conversation may show [DATA_CONTEXT: ...] tags from previous queries — these are just references. You NEVER have access to query results. You must ALWAYS generate fresh SQL. Never mention DATA_CONTEXT in your response.
 
 **EXPLANATION → respond with well-formatted text following these rules:**
 - Start with a one-line summary in **bold**
