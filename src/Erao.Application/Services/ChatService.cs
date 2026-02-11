@@ -372,7 +372,7 @@ public class ChatService : IChatService
 
 First, decide what the user wants:
 
-1. **Data** — they want numbers, lists, tables, metrics, rankings, comparisons, or any question answerable with a query.
+1. **Data** — they want numbers, lists, tables, metrics, rankings, comparisons, visualizations, or any question answerable with a query.
 2. **Explanation** — they explicitly ask to explain, describe, analyze meaning, ""what is this database"", ""tell me about"", ""why"", ""how does X work"".
 3. **Chat** — greetings, general talk, or questions unrelated to the schema.
 
@@ -400,7 +400,26 @@ SQL rules:
 - COALESCE on aggregations to avoid NULL. Clean column aliases.
 - Use {dateFunc} for relative dates — never hardcode years.
 - You never see query results — the system executes SQL after your response and shows a table to the user.
-- Think smart: ""revenue"" might mean SUM on amount/price/total. ""my""/""our"" means all data. If a previous query returned empty (check [DATA_CONTEXT]), rethink your approach.
+- Think smart: ""revenue"" might mean SUM on amount/price/total. ""my""/""our"" means all data.
+
+NULL and empty value handling (CRITICAL):
+- For rankings (""top"", ""highest"", ""lowest"", ""best"", ""worst""), ALWAYS filter out NULL values: WHERE ""Column"" IS NOT NULL
+- When ORDER BY, use NULLS LAST (or filter NULLs) to avoid NULLs appearing first in results.
+- Empty strings should also be excluded from rankings: AND ""Column"" != ''
+
+Integer enums:
+- Columns like Status, Type, Tier, Role often store integers representing enum values.
+- Return them as numbers — the user knows what they mean. Don't try to decode them.
+- If grouping by enum column, just GROUP BY the integer and let user interpret.
+
+Ambiguous queries:
+- ""Top X"" without a metric? Pick the most reasonable column (revenue, sales, count). Just run the query — don't ask.
+- ""Give me insights""? Write a useful query with aggregations. DO it, don't explain what COULD be done.
+
+Visualizations:
+- The frontend CAN render charts (pie, bar, line) from your query results.
+- For charts: return a category/label column + a value/count column.
+- When user asks for ""chart"", ""graph"", ""pie"", ""bar"" — write chart-ready data.
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
@@ -679,7 +698,7 @@ No schema available. Tell the user to connect a database first.";
 
 First, decide what the user wants:
 
-1. **Data** — they want numbers, lists, tables, metrics, rankings, comparisons, or any question answerable with a query.
+1. **Data** — they want numbers, lists, tables, metrics, rankings, comparisons, visualizations, or any question answerable with a query.
 2. **Explanation** — they explicitly ask to explain, describe, analyze meaning, ""what's in this file"", ""tell me about"", ""why"", ""how does X work"".
 3. **Chat** — greetings, general talk, or questions unrelated to the schema.
 
@@ -707,7 +726,26 @@ SQL rules:
 - SELECT only. LIMIT 50 for broad queries. COALESCE on aggregations to avoid NULL. Clean column aliases.
 - Date columns may be strings — use DATE(), STRFTIME(), or SUBSTR() to parse. Use DATE('now') for relative dates — never hardcode years.
 - You never see query results — the system executes SQL after your response and shows a table to the user.
-- Think smart: map user language to columns creatively (""revenue"" → amount/price/total, ""name"" → customer/client/user). ""my""/""our"" means all data. If a previous query returned empty (check [DATA_CONTEXT]), rethink your approach.
+- Think smart: map user language to columns creatively (""revenue"" → amount/price/total, ""name"" → customer/client/user). ""my""/""our"" means all data.
+
+NULL and empty value handling (CRITICAL):
+- For rankings (""top"", ""highest"", ""lowest"", ""best"", ""worst""), ALWAYS filter out NULL and empty values: WHERE ""Column"" IS NOT NULL AND ""Column"" != '' AND ""Column"" NOT IN ('Not Mentioned', 'N/A', '-', 'null')
+- When ORDER BY on a column, use NULLS LAST or filter NULLs out to avoid them appearing first.
+- Strings like ""Not Mentioned"", ""N/A"", """", ""-"" should be treated as empty/missing — exclude them from rankings and aggregations.
+
+String-to-number conversion:
+- If a column looks numeric but has commas (e.g., ""2,500,000""), use: CAST(REPLACE(""Column"", ',', '') AS REAL)
+- Always clean numeric strings before comparing or sorting numerically.
+
+Ambiguous queries:
+- ""Top X"" without a metric? Pick the most reasonable column (e.g., for startups: valuation, investment, revenue). Just run the query — don't ask.
+- ""Give me insights"" or ""analyze this""? Write a useful query that shows interesting aggregations (counts by category, totals, averages). DO it, don't explain what COULD be done.
+
+Visualizations:
+- The frontend CAN render charts (pie, bar, line) from your query results.
+- For pie charts: return a category column + a value/count column.
+- For bar charts: return a label column + a numeric column.
+- When user asks for ""chart"", ""graph"", ""visualization"", ""pie"", ""bar"" — write a query that returns chart-ready data.
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
