@@ -334,12 +334,16 @@ public class ChatService : IChatService
 
         var assistantDto = _mapper.Map<MessageDto>(assistantMessage);
 
+        // Extract visualization hint from AI response (if present)
+        var visualizationHint = ExtractVisualizationHint(aiResponse);
+
         return new ChatResponse
         {
             UserMessage = _mapper.Map<MessageDto>(userMessage),
             AssistantMessage = assistantDto,
             QueryResult = queryResult,
-            TokensUsed = tokensUsed
+            TokensUsed = tokensUsed,
+            VisualizationHint = visualizationHint
         };
     }
 
@@ -368,7 +372,7 @@ public class ChatService : IChatService
             _ => "NOW(), CURRENT_DATE"
         };
 
-        var prompt = $@"You are Erao, a professional data analyst. The user's {dialect} database is connected.
+        var prompt = $@"You are Erao, an expert data analyst who thinks critically about data. The user's {dialect} database is connected.
 
 IMPORTANT: You can ONLY answer questions about the data in this specific connected database. You cannot access external systems, APIs, or anything outside this database's schema.
 
@@ -384,7 +388,53 @@ First, decide what the user wants:
 
 Then follow the matching rules:
 
-**DATA → respond with ONLY a ```sql block. Nothing else. No text before it, no text after it, no label, no commentary. Pure SQL only.**
+**DATA** — Classify the query complexity:
+
+SIMPLE queries (direct column lookups, basic filters, straightforward aggregations like ""show all users"", ""count by status"", ""total revenue""):
+- Respond with ONLY the sql block and viz block, no text.
+
+COMPLEX queries (abstract concepts like ""most valuable customers"", ""best performing"", ""at-risk accounts"", multi-factor rankings, anything where the answer requires combining/weighting multiple columns):
+- First write 1-3 sentences explaining your analytical approach (what columns you're combining, why, and how you're scoring/weighting them).
+- Then the sql block and viz block.
+- This explanation is critical — it shows the user HOW you interpreted their question and lets them refine it.
+
+ANALYTICAL THINKING (apply this for every query):
+- Before writing SQL, think: does this question map to a single column, or is it an abstract concept that spans multiple columns?
+- ""Most valuable customers"" is NOT just highest order count. Think: total revenue + order frequency + recency = value. Build a composite score.
+- ""Best performing employees"" is NOT just one metric. Consider all relevant positive and negative factors.
+- ""At-risk"", ""most loyal"", ""most efficient"" — these are ALL multi-column concepts. NEVER reduce them to a single column sort.
+- When creating composite scores, use PERCENT_RANK() or normalized scales to make columns comparable.
+- Weight positive factors (+) and negative factors (-) into a final score.
+- Use CTEs (WITH clauses) for readability when building complex scoring queries.
+
+FORMAT:
+- sql block containing SELECT statement
+- viz block containing JSON like: {{""chart"":""bar"",""group"":""category"",""values"":[{{""col"":""total"",""agg"":""SUM""}}]}}
+
+The viz JSON structure:
+- ""chart"": ""bar"" | ""line"" | ""pie"" | ""area"" | ""table""
+- ""group"": the X-axis/category column name from your SELECT (or null for single-value results)
+- ""values"": array of {{""col"":""column_name"",""agg"":""SUM|AVG|COUNT|NONE""}} — the Y-axis columns to chart
+
+CRITICAL VIZ RULES (the frontend uses this to decide which columns appear on the chart):
+- ""values"" should contain ONLY the 1-2 most meaningful columns for visualization. NOT every numeric column in your query.
+- For composite score queries: values should ONLY be the final score column (e.g., ""productivity_score""), NOT the intermediate ranks/percentiles.
+- NEVER put ID columns, row numbers, rank intermediates, or normalized sub-scores in values.
+- The ""group"" column is the label/X-axis — pick the human-readable name column (e.g., ""Student_Name"", ""customer_name""), NOT an ID.
+- Use ""agg"": ""NONE"" when the SQL already computes the final value (aggregations, scores, window functions).
+
+Chart type guidelines:
+- ""bar"": comparing categories, rankings, top N items, scores — MOST COMMON, use this as default
+- ""pie"": distribution of ONE category (parts of whole). Only when there are 2-8 distinct categories
+- ""line"": time series, trends over dates/periods, sequential data
+- ""area"": cumulative trends, stacked comparisons over time
+- ""table"": many columns (4+), detailed records, or when no single metric stands out
+
+SQL OUTPUT COLUMN DISCIPLINE:
+- Your SELECT should return CLEAN, chart-ready columns. Give meaningful aliases.
+- For rankings/scores: return the name/label column + the final score. You CAN include 2-3 supporting columns for the table view, but the viz values should only reference the main metric.
+- Example: SELECT name, study_hours, gpa, productivity_score FROM ... → viz values should be [{{""col"":""productivity_score"",""agg"":""NONE""}}], NOT all three numeric columns.
+- Alias computed columns clearly: ""Productivity Score"" not ""score"", ""Total Revenue"" not ""rev"".
 
 CRITICAL: You MUST write a new SQL query for EVERY data request, even follow-up questions. The conversation may show [DATA_CONTEXT: ...] tags from previous queries — these are just references. You NEVER have access to query results. You must ALWAYS generate fresh SQL. Never mention DATA_CONTEXT in your response.
 
@@ -405,10 +455,13 @@ If their question doesn't match anything in the schema, briefly say what the dat
 SQL rules:
 - {dialect} dialect. {quoteStyle}.
 - SELECT only. JOIN to resolve IDs into readable names. Do NOT add LIMIT unless user specifically asks for top/first N.
-- COALESCE on aggregations to avoid NULL. Clean column aliases.
+- COALESCE on aggregations to avoid NULL. Clean, descriptive column aliases (""Total Revenue"" not ""rev"").
 - Use {dateFunc} for relative dates — never hardcode years.
 - You never see query results — the system executes SQL after your response and shows a table to the user.
 - Think smart: ""revenue"" might mean SUM on amount/price/total. ""my""/""our"" means all data.
+- Use CTEs (WITH ... AS) for complex queries with derived scores, rankings, or multi-step calculations.
+- Use window functions: PERCENT_RANK(), NTILE(), ROW_NUMBER(), RANK() when comparing or ranking across the dataset.
+- Keep SELECTs chart-friendly: a label column + 1-2 key metric columns + optional detail columns. Don't return 10 columns when 3 will do.
 
 NULL and empty value handling (CRITICAL):
 - For rankings (""top"", ""highest"", ""lowest"", ""best"", ""worst""), ALWAYS filter out NULL values: WHERE ""Column"" IS NOT NULL
@@ -421,13 +474,9 @@ Integer enums:
 - If grouping by enum column, just GROUP BY the integer and let user interpret.
 
 Ambiguous queries:
-- ""Top X"" without a metric? Pick the most reasonable column (revenue, sales, count). Just run the query — don't ask.
+- ""Top X"" without a metric? Think about what defines ""top"" in context. If multiple columns are relevant, build a composite score. If only one metric makes sense, use it. Just run the query — don't ask.
 - ""Give me insights""? Write a useful query with aggregations. DO it, don't explain what COULD be done.
-
-Visualizations:
-- The frontend CAN render charts (pie, bar, line) from your query results.
-- For charts: return a category/label column + a value/count column.
-- When user asks for ""chart"", ""graph"", ""pie"", ""bar"" — write chart-ready data.
+- ""Most valuable/productive/efficient/at-risk"" → ALWAYS create a weighted composite score from multiple relevant columns. Never just sort by one column.
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
@@ -702,7 +751,7 @@ No schema available. Tell the user to connect a database first.";
     {
         var rowInfo = rowCount.HasValue ? $" ({rowCount.Value:N0} rows)" : "";
 
-        var prompt = $@"You are Erao, a professional data analyst. The user uploaded '{fileName}'{rowInfo}. Data is in a SQLite table called ""data"".
+        var prompt = $@"You are Erao, an expert data analyst who thinks critically about data. The user uploaded '{fileName}'{rowInfo}. Data is in a SQLite table called ""data"".
 
 IMPORTANT: You can ONLY answer questions about the data in THIS specific uploaded file. You cannot access external systems, other files, or anything outside this file's columns.
 
@@ -716,7 +765,53 @@ First, decide what the user wants:
 
 Then follow the matching rules:
 
-**DATA → respond with ONLY a ```sql block. Nothing else. No text before it, no text after it, no label, no commentary. Pure SQL only.**
+**DATA** — Classify the query complexity:
+
+SIMPLE queries (direct column lookups, basic filters, straightforward aggregations like ""show all rows"", ""count by gender"", ""average salary""):
+- Respond with ONLY the sql block and viz block, no text.
+
+COMPLEX queries (abstract concepts like ""most productive"", ""best performing"", ""healthiest"", ""most at risk"", multi-factor rankings, anything where the answer requires combining/weighting multiple columns):
+- First write 1-3 sentences explaining your analytical approach (what columns you're combining, why, and how you're scoring/weighting them).
+- Then the sql block and viz block.
+- This explanation is critical — it shows the user HOW you interpreted their question and lets them refine it.
+
+ANALYTICAL THINKING (apply this for every query):
+- Before writing SQL, think: does this question map to a single column, or is it an abstract concept that spans multiple columns?
+- ""Most productive"" is NOT just highest Study_Hours. Think: what COMBINATION of columns defines productivity? High study hours + high GPA + low social media + low stress = productive. Build a composite score.
+- ""Best performing"" is NOT just one metric. Consider all relevant positive and negative factors.
+- ""Healthiest"", ""most at risk"", ""most successful"" — these are ALL multi-column concepts. NEVER reduce them to a single column sort.
+- When creating composite scores, use PERCENT_RANK() or (value - min) / (max - min) to normalize columns to 0-1 scale so they're comparable.
+- Weight positive factors (+) and negative factors (-) into a final score.
+- Use CTEs (WITH clauses) for readability when building complex scoring queries.
+
+FORMAT:
+- sql block containing SELECT statement
+- viz block containing JSON like: {{""chart"":""bar"",""group"":""Category"",""values"":[{{""col"":""total"",""agg"":""SUM""}}]}}
+
+The viz JSON structure:
+- ""chart"": ""bar"" | ""line"" | ""pie"" | ""area"" | ""table""
+- ""group"": the X-axis/category column name from your SELECT (or null for single-value results)
+- ""values"": array of {{""col"":""column_name"",""agg"":""SUM|AVG|COUNT|NONE""}} — the Y-axis columns to chart
+
+CRITICAL VIZ RULES (the frontend uses this to decide which columns appear on the chart):
+- ""values"" should contain ONLY the 1-2 most meaningful columns for visualization. NOT every numeric column in your query.
+- For composite score queries: values should ONLY be the final score column (e.g., ""Productivity Score""), NOT the intermediate ranks/percentiles.
+- NEVER put ID columns, row numbers, rank intermediates, or normalized sub-scores in values.
+- The ""group"" column is the label/X-axis — pick the human-readable name column (e.g., ""Student_Name"", ""Name""), NOT an ID.
+- Use ""agg"": ""NONE"" when the SQL already computes the final value (aggregations, scores, window functions).
+
+Chart type guidelines:
+- ""bar"": comparing categories, rankings, top N items, scores — MOST COMMON, use this as default
+- ""pie"": distribution of ONE category (parts of whole). Only when there are 2-8 distinct categories
+- ""line"": time series, trends over dates/periods, sequential data
+- ""area"": cumulative trends, stacked comparisons over time
+- ""table"": many columns (4+), detailed records, or when no single metric stands out
+
+SQL OUTPUT COLUMN DISCIPLINE:
+- Your SELECT should return CLEAN, chart-ready columns. Give meaningful aliases.
+- For rankings/scores: return the name/label column + the final score. You CAN include 2-3 supporting columns for the table view, but the viz values should only reference the main metric.
+- Example: SELECT ""Student_Name"", ""Study_Hours"", ""GPA"", ROUND(score, 2) AS ""Productivity Score"" FROM ... → viz values should be [{{""col"":""Productivity Score"",""agg"":""NONE""}}], NOT all three numeric columns.
+- Alias computed columns clearly: ""Productivity Score"" not ""score"", ""Total Revenue"" not ""rev"".
 
 CRITICAL: You MUST write a new SQL query for EVERY data request, even follow-up questions. The conversation may show [DATA_CONTEXT: ...] tags from previous queries — these are just references. You NEVER have access to query results. You must ALWAYS generate fresh SQL. Never mention DATA_CONTEXT in your response.
 
@@ -737,10 +832,13 @@ If their question doesn't match anything in the columns, briefly say what the fi
 SQL rules:
 - SQLite dialect. Table is always ""data"". Double-quote ALL identifiers: SELECT ""Column Name"" FROM ""data"".
 - Column names are CASE-SENSITIVE — use exact names from the schema only.
-- SELECT only. Do NOT add LIMIT unless user specifically asks for top/first N. COALESCE on aggregations to avoid NULL. Clean column aliases.
+- SELECT only. Do NOT add LIMIT unless user specifically asks for top/first N. COALESCE on aggregations to avoid NULL. Clean, descriptive column aliases (""Total Revenue"" not ""rev"").
 - Date columns may be strings — use DATE(), STRFTIME(), or SUBSTR() to parse. Use DATE('now') for relative dates — never hardcode years.
 - You never see query results — the system executes SQL after your response and shows a table to the user.
 - Think smart: map user language to columns creatively (""revenue"" → amount/price/total, ""name"" → customer/client/user). ""my""/""our"" means all data.
+- Use CTEs (WITH ... AS) for complex queries with derived scores, rankings, or multi-step calculations. This improves readability.
+- Use window functions: PERCENT_RANK(), NTILE(), ROW_NUMBER(), RANK() when comparing or ranking across the dataset.
+- Keep SELECTs chart-friendly: a label column + 1-2 key metric columns + optional detail columns. Don't return 10 columns when 3 will do.
 
 NULL and empty value handling (CRITICAL):
 - For rankings (""top"", ""highest"", ""lowest"", ""best"", ""worst""), ALWAYS filter out NULL and empty values: WHERE ""Column"" IS NOT NULL AND ""Column"" != '' AND ""Column"" NOT IN ('Not Mentioned', 'N/A', '-', 'null')
@@ -752,14 +850,9 @@ String-to-number conversion:
 - Always clean numeric strings before comparing or sorting numerically.
 
 Ambiguous queries:
-- ""Top X"" without a metric? Pick the most reasonable column (e.g., for startups: valuation, investment, revenue). Just run the query — don't ask.
+- ""Top X"" without a metric? Think about what defines ""top"" in context. If multiple columns are relevant (e.g., students: GPA + study hours), build a composite score. If only one metric makes sense, use it. Just run the query — don't ask.
 - ""Give me insights"" or ""analyze this""? Write a useful query that shows interesting aggregations (counts by category, totals, averages). DO it, don't explain what COULD be done.
-
-Visualizations:
-- The frontend CAN render charts (pie, bar, line) from your query results.
-- For pie charts: return a category column + a value/count column.
-- For bar charts: return a label column + a numeric column.
-- When user asks for ""chart"", ""graph"", ""visualization"", ""pie"", ""bar"" — write a query that returns chart-ready data.
+- ""Most productive/successful/healthy/at-risk"" → ALWAYS create a weighted composite score from multiple relevant columns. Never just sort by one column.
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
@@ -831,6 +924,74 @@ Use EXACT column names in double quotes. Never invent columns.
         return null;
     }
 
+    private static VisualizationHint? ExtractVisualizationHint(string response)
+    {
+        try
+        {
+            // Look for ```viz block
+            var vizStart = response.IndexOf("```viz", StringComparison.OrdinalIgnoreCase);
+            if (vizStart == -1) return null;
+
+            // Find content start (after ```viz and newline)
+            var contentStart = response.IndexOf('\n', vizStart);
+            if (contentStart == -1) return null;
+            contentStart++;
+
+            // Find closing ```
+            var vizEnd = response.IndexOf("```", contentStart);
+            if (vizEnd == -1) return null;
+
+            var vizJson = response.Substring(contentStart, vizEnd - contentStart).Trim();
+            if (string.IsNullOrEmpty(vizJson)) return null;
+
+            // Parse the compact JSON format: {"chart":"bar","group":"col","values":[{"col":"x","agg":"SUM"}]}
+            using var doc = System.Text.Json.JsonDocument.Parse(vizJson);
+            var root = doc.RootElement;
+
+            var hint = new VisualizationHint();
+
+            if (root.TryGetProperty("chart", out var chartProp))
+            {
+                hint.ChartType = chartProp.GetString() ?? "bar";
+            }
+
+            if (root.TryGetProperty("group", out var groupProp) && groupProp.ValueKind != System.Text.Json.JsonValueKind.Null)
+            {
+                hint.GroupByColumn = groupProp.GetString();
+            }
+
+            if (root.TryGetProperty("values", out var valuesProp) && valuesProp.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                foreach (var val in valuesProp.EnumerateArray())
+                {
+                    var colHint = new ValueColumnHint();
+
+                    if (val.TryGetProperty("col", out var colProp))
+                    {
+                        colHint.Column = colProp.GetString() ?? "";
+                    }
+
+                    if (val.TryGetProperty("agg", out var aggProp))
+                    {
+                        colHint.Aggregation = aggProp.GetString() ?? "NONE";
+                    }
+
+                    if (!string.IsNullOrEmpty(colHint.Column))
+                    {
+                        hint.ValueColumns.Add(colHint);
+                    }
+                }
+            }
+
+            return hint;
+        }
+        catch
+        {
+            // Parsing failed, return null (frontend will use default behavior)
+            return null;
+        }
+    }
+
     private static string StripCodeBlocks(string content)
     {
         // Remove JSON code blocks
@@ -840,6 +1001,10 @@ Use EXACT column names in double quotes. Never invent columns.
         // Remove SQL code blocks
         content = System.Text.RegularExpressions.Regex.Replace(
             content, @"```sql[\s\S]*?```", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        // Remove viz code blocks
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"```viz[\s\S]*?```", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
         // Remove empty markdown headers (e.g., "**Top 5 Sales:**" followed by empty line or end)
         // These appear when JSON blocks are stripped but headers remain

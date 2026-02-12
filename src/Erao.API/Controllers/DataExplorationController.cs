@@ -238,6 +238,39 @@ public class DataExplorationController : ControllerBase
 
     #endregion
 
+    #region AI-Powered Visualization
+
+    /// <summary>
+    /// Analyze query results and get AI-powered visualization recommendations
+    /// </summary>
+    [HttpPost("analyze-visualization")]
+    public async Task<ActionResult<ApiResponse<VisualizationRecommendationDto>>> AnalyzeForVisualization(
+        [FromBody] AnalyzeVisualizationRequest request)
+    {
+        try
+        {
+            if (request.Columns == null || request.Columns.Count == 0)
+            {
+                return BadRequest(ApiResponse<VisualizationRecommendationDto>.ErrorResponse("Columns are required"));
+            }
+
+            if (request.SampleRows == null || request.SampleRows.Count == 0)
+            {
+                return BadRequest(ApiResponse<VisualizationRecommendationDto>.ErrorResponse("Sample rows are required"));
+            }
+
+            var result = await _explorationService.AnalyzeForVisualizationAsync(request);
+            return Ok(ApiResponse<VisualizationRecommendationDto>.SuccessResponse(result));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error analyzing data for visualization");
+            return StatusCode(500, ApiResponse<VisualizationRecommendationDto>.ErrorResponse("An error occurred while analyzing data"));
+        }
+    }
+
+    #endregion
+
     private Guid GetUserId()
     {
         var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;

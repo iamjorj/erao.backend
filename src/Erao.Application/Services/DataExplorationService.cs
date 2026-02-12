@@ -527,6 +527,437 @@ Return ONLY the JSON array, no other text.";
 
     #endregion
 
+    #region AI-Powered Visualization
+
+    public async Task<VisualizationRecommendationDto> AnalyzeForVisualizationAsync(AnalyzeVisualizationRequest request)
+    {
+        var result = new VisualizationRecommendationDto();
+
+        try
+        {
+            // Step 1: Analyze column metadata locally (fast)
+            var columnMetadata = AnalyzeColumns(request.Columns, request.SampleRows);
+            result.ColumnMetadata = columnMetadata;
+
+            // Step 2: Use AI to get smart recommendations
+            var aiRecommendation = await GetAIVisualizationRecommendationAsync(request, columnMetadata);
+
+            // Merge AI recommendations with local analysis
+            result.RecommendedChartType = aiRecommendation.RecommendedChartType;
+            result.ChartTypeReason = aiRecommendation.ChartTypeReason;
+            result.GroupByColumn = aiRecommendation.GroupByColumn;
+            result.ValueColumns = aiRecommendation.ValueColumns;
+            result.Alternatives = aiRecommendation.Alternatives;
+            result.Insights = aiRecommendation.Insights;
+            result.ShouldAggregate = aiRecommendation.ShouldAggregate;
+            result.SuggestedTitle = aiRecommendation.SuggestedTitle;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "AI visualization analysis failed, using fallback logic");
+            result = GetFallbackRecommendation(request);
+        }
+
+        return result;
+    }
+
+    private List<ColumnMetadata> AnalyzeColumns(List<string> columns, List<Dictionary<string, object?>> sampleRows)
+    {
+        var metadata = new List<ColumnMetadata>();
+
+        foreach (var col in columns)
+        {
+            var values = sampleRows
+                .Select(r => r.TryGetValue(col, out var v) ? v : null)
+                .Where(v => v != null)
+                .ToList();
+
+            var uniqueValues = values.Select(v => v?.ToString() ?? "").Distinct().ToList();
+            var nullCount = sampleRows.Count - values.Count;
+
+            // Detect data type
+            var dataType = DetectDataType(values);
+            var isNumeric = dataType == "number";
+
+            // Detect semantic type
+            var semanticType = DetectSemanticType(col, values, dataType);
+
+            // Is categorical? (few unique values relative to total)
+            var isCategorical = uniqueValues.Count >= 2 &&
+                                uniqueValues.Count <= 30 &&
+                                uniqueValues.Count < sampleRows.Count * 0.5;
+
+            metadata.Add(new ColumnMetadata
+            {
+                Name = col,
+                DataType = dataType,
+                SemanticType = semanticType,
+                UniqueCount = uniqueValues.Count,
+                NullCount = nullCount,
+                IsNumeric = isNumeric,
+                IsCategorical = isCategorical,
+                SampleValues = isCategorical ? uniqueValues.Take(10).ToList() : new List<string>()
+            });
+        }
+
+        return metadata;
+    }
+
+    private string DetectDataType(List<object?> values)
+    {
+        if (!values.Any()) return "string";
+
+        var nonNull = values.Where(v => v != null).ToList();
+        if (!nonNull.Any()) return "string";
+
+        // Check if all values are numeric
+        var allNumeric = nonNull.All(v =>
+        {
+            if (v is int or long or float or double or decimal) return true;
+            return double.TryParse(v?.ToString(), out _);
+        });
+        if (allNumeric) return "number";
+
+        // Check if all values are dates
+        var allDates = nonNull.All(v =>
+        {
+            if (v is DateTime) return true;
+            return DateTime.TryParse(v?.ToString(), out _);
+        });
+        if (allDates) return "datetime";
+
+        // Check if all values are booleans
+        var allBool = nonNull.All(v =>
+        {
+            if (v is bool) return true;
+            var str = v?.ToString()?.ToLower();
+            return str == "true" || str == "false" || str == "yes" || str == "no" || str == "1" || str == "0";
+        });
+        if (allBool) return "boolean";
+
+        return "string";
+    }
+
+    private string DetectSemanticType(string columnName, List<object?> values, string dataType)
+    {
+        var name = columnName.ToLower();
+
+        // ID patterns
+        if (name.EndsWith("_id") || name.EndsWith("id") || name == "id" || name.Contains("identifier"))
+            return "id";
+
+        // Name patterns
+        if (name.Contains("name") || name.Contains("title") || name.Contains("label"))
+            return "name";
+
+        // Category patterns
+        if (name.Contains("category") || name.Contains("type") || name.Contains("status") ||
+            name.Contains("gender") || name.Contains("class") || name.Contains("group") ||
+            name.Contains("department") || name.Contains("region") || name.Contains("country"))
+            return "category";
+
+        // Date patterns
+        if (name.Contains("date") || name.Contains("time") || name.Contains("created") ||
+            name.Contains("updated") || name.Contains("timestamp") || dataType == "datetime")
+            return "datetime";
+
+        // Currency patterns
+        if (name.Contains("price") || name.Contains("cost") || name.Contains("amount") ||
+            name.Contains("salary") || name.Contains("revenue") || name.Contains("total") ||
+            name.Contains("fee") || name.Contains("payment") || name.Contains("money"))
+            return "currency";
+
+        // Percentage patterns
+        if (name.Contains("percent") || name.Contains("rate") || name.Contains("ratio") ||
+            name.Contains("pct") || name.Contains("%"))
+            return "percentage";
+
+        // Count patterns
+        if (name.Contains("count") || name.Contains("quantity") || name.Contains("qty") ||
+            name.Contains("number") || name.Contains("num_"))
+            return "count";
+
+        // If numeric but not categorized above, it's a measure
+        if (dataType == "number")
+            return "measure";
+
+        // Default to dimension for strings
+        return dataType == "string" ? "dimension" : "text";
+    }
+
+    private async Task<VisualizationRecommendationDto> GetAIVisualizationRecommendationAsync(
+        AnalyzeVisualizationRequest request,
+        List<ColumnMetadata> columnMetadata)
+    {
+        // Build a concise prompt for the AI
+        var columnSummary = string.Join("\n", columnMetadata.Select(c =>
+            $"- {c.Name}: {c.SemanticType} ({c.DataType}), {c.UniqueCount} unique values" +
+            (c.IsCategorical ? $", categorical: [{string.Join(", ", c.SampleValues.Take(5))}]" : "")));
+
+        var prompt = $@"Analyze this data for visualization and return a JSON recommendation.
+
+COLUMNS:
+{columnSummary}
+
+DATA INFO:
+- Total rows: {request.TotalRowCount}
+- Sample rows: {request.SampleRows.Count}
+{(request.UserQuestion != null ? $"- User question: {request.UserQuestion}" : "")}
+{(request.SqlQuery != null ? $"- SQL query: {request.SqlQuery}" : "")}
+
+Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
+{{
+  ""recommendedChartType"": ""bar|line|pie|area|table"",
+  ""chartTypeReason"": ""brief reason for chart choice"",
+  ""groupByColumn"": ""column_name or null"",
+  ""shouldAggregate"": true/false,
+  ""suggestedTitle"": ""descriptive title for the chart"",
+  ""valueColumns"": [
+    {{
+      ""column"": ""column_name"",
+      ""aggregation"": ""COUNT|SUM|AVG|MIN|MAX|NONE"",
+      ""reason"": ""why this aggregation"",
+      ""displayName"": ""readable name"",
+      ""formatHint"": ""number|currency|percentage|decimal""
+    }}
+  ],
+  ""alternatives"": [
+    {{
+      ""chartType"": ""type"",
+      ""groupByColumn"": ""column or null"",
+      ""description"": ""what this shows"",
+      ""valueColumns"": [""col1"", ""col2""]
+    }}
+  ],
+  ""insights"": [
+    {{
+      ""type"": ""distribution|trend|outlier|correlation|cardinality|quality"",
+      ""description"": ""insight description"",
+      ""importance"": ""low|medium|high"",
+      ""relatedColumns"": [""col1""]
+    }}
+  ]
+}}
+
+RULES:
+1. For categorical data with few unique values (2-10), prefer pie or bar charts
+2. For time series or ordered data, prefer line or area charts
+3. For comparing multiple measures, prefer bar charts
+4. Use aggregation when grouping makes sense (SUM for amounts, AVG for rates, COUNT for IDs)
+5. Don't aggregate if data is already aggregated or has unique rows
+6. Consider the user's question when choosing visualization
+7. Provide 2-3 meaningful alternative visualizations
+8. Provide 2-3 data insights (patterns, quality issues, etc.)";
+
+        var aiResponse = await _ollamaService.GenerateResponseAsync(prompt,
+            "You are a data visualization expert. Analyze data and recommend optimal chart types and configurations. Return ONLY valid JSON.");
+
+        // Parse the AI response
+        try
+        {
+            // Clean the response (remove markdown code blocks if present)
+            var cleanedResponse = aiResponse
+                .Replace("```json", "")
+                .Replace("```", "")
+                .Trim();
+
+            var parsed = JsonSerializer.Deserialize<JsonElement>(cleanedResponse);
+
+            var result = new VisualizationRecommendationDto
+            {
+                RecommendedChartType = GetStringProperty(parsed, "recommendedChartType", "bar"),
+                ChartTypeReason = GetStringProperty(parsed, "chartTypeReason", ""),
+                GroupByColumn = GetStringProperty(parsed, "groupByColumn", null),
+                ShouldAggregate = GetBoolProperty(parsed, "shouldAggregate", true),
+                SuggestedTitle = GetStringProperty(parsed, "suggestedTitle", null),
+                ColumnMetadata = columnMetadata
+            };
+
+            // Parse value columns
+            if (parsed.TryGetProperty("valueColumns", out var valueColumns))
+            {
+                foreach (var vc in valueColumns.EnumerateArray())
+                {
+                    result.ValueColumns.Add(new ValueColumnRecommendation
+                    {
+                        Column = GetStringProperty(vc, "column", ""),
+                        Aggregation = GetStringProperty(vc, "aggregation", "COUNT"),
+                        Reason = GetStringProperty(vc, "reason", ""),
+                        DisplayName = GetStringProperty(vc, "displayName", ""),
+                        FormatHint = GetStringProperty(vc, "formatHint", "number")
+                    });
+                }
+            }
+
+            // Parse alternatives
+            if (parsed.TryGetProperty("alternatives", out var alternatives))
+            {
+                foreach (var alt in alternatives.EnumerateArray())
+                {
+                    var altVis = new AlternativeVisualization
+                    {
+                        ChartType = GetStringProperty(alt, "chartType", "bar"),
+                        GroupByColumn = GetStringProperty(alt, "groupByColumn", null),
+                        Description = GetStringProperty(alt, "description", "")
+                    };
+
+                    if (alt.TryGetProperty("valueColumns", out var altCols))
+                    {
+                        altVis.ValueColumns = altCols.EnumerateArray()
+                            .Select(c => c.GetString() ?? "")
+                            .Where(s => !string.IsNullOrEmpty(s))
+                            .ToList();
+                    }
+
+                    result.Alternatives.Add(altVis);
+                }
+            }
+
+            // Parse insights
+            if (parsed.TryGetProperty("insights", out var insights))
+            {
+                foreach (var ins in insights.EnumerateArray())
+                {
+                    var insight = new DataInsight
+                    {
+                        Type = GetStringProperty(ins, "type", "pattern"),
+                        Description = GetStringProperty(ins, "description", ""),
+                        Importance = GetStringProperty(ins, "importance", "medium")
+                    };
+
+                    if (ins.TryGetProperty("relatedColumns", out var relCols))
+                    {
+                        insight.RelatedColumns = relCols.EnumerateArray()
+                            .Select(c => c.GetString() ?? "")
+                            .Where(s => !string.IsNullOrEmpty(s))
+                            .ToList();
+                    }
+
+                    result.Insights.Add(insight);
+                }
+            }
+
+            return result;
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Failed to parse AI response: {Response}", aiResponse);
+            throw;
+        }
+    }
+
+    private VisualizationRecommendationDto GetFallbackRecommendation(AnalyzeVisualizationRequest request)
+    {
+        var columnMetadata = AnalyzeColumns(request.Columns, request.SampleRows);
+        var result = new VisualizationRecommendationDto
+        {
+            ColumnMetadata = columnMetadata
+        };
+
+        // Find best grouping column (categorical)
+        var categoryColumn = columnMetadata
+            .FirstOrDefault(c => c.IsCategorical && c.SemanticType == "category") ??
+            columnMetadata.FirstOrDefault(c => c.IsCategorical);
+
+        // Find numeric columns for values
+        var valueColumns = columnMetadata
+            .Where(c => c.IsNumeric && c.SemanticType != "id")
+            .ToList();
+
+        // Find date column
+        var dateColumn = columnMetadata.FirstOrDefault(c => c.SemanticType == "datetime");
+
+        // Determine chart type
+        if (categoryColumn != null && categoryColumn.UniqueCount <= 8)
+        {
+            result.RecommendedChartType = "pie";
+            result.ChartTypeReason = $"'{categoryColumn.Name}' has {categoryColumn.UniqueCount} categories, ideal for pie chart";
+        }
+        else if (dateColumn != null && valueColumns.Any())
+        {
+            result.RecommendedChartType = "line";
+            result.ChartTypeReason = "Time series data detected, showing trend over time";
+            result.GroupByColumn = dateColumn.Name;
+        }
+        else if (categoryColumn != null)
+        {
+            result.RecommendedChartType = "bar";
+            result.ChartTypeReason = $"Comparing values across '{categoryColumn.Name}' categories";
+            result.GroupByColumn = categoryColumn.Name;
+        }
+        else
+        {
+            result.RecommendedChartType = "bar";
+            result.ChartTypeReason = "Default bar chart for data comparison";
+        }
+
+        // Set group by column
+        result.GroupByColumn ??= categoryColumn?.Name ?? columnMetadata.FirstOrDefault()?.Name;
+
+        // Set value columns with smart aggregations
+        foreach (var vc in valueColumns.Take(3))
+        {
+            var agg = vc.SemanticType switch
+            {
+                "currency" or "count" => "SUM",
+                "percentage" or "measure" => "AVG",
+                "id" => "COUNT",
+                _ => "SUM"
+            };
+
+            result.ValueColumns.Add(new ValueColumnRecommendation
+            {
+                Column = vc.Name,
+                Aggregation = agg,
+                Reason = $"{vc.SemanticType} column, using {agg}",
+                DisplayName = $"{agg} of {vc.Name}",
+                FormatHint = vc.SemanticType == "currency" ? "currency" :
+                             vc.SemanticType == "percentage" ? "percentage" : "number"
+            });
+        }
+
+        // If no value columns, use COUNT
+        if (!result.ValueColumns.Any())
+        {
+            result.ValueColumns.Add(new ValueColumnRecommendation
+            {
+                Column = "*",
+                Aggregation = "COUNT",
+                Reason = "Counting records per category",
+                DisplayName = "Count",
+                FormatHint = "number"
+            });
+        }
+
+        result.ShouldAggregate = categoryColumn != null;
+        result.SuggestedTitle = categoryColumn != null
+            ? $"Data by {categoryColumn.Name}"
+            : "Data Overview";
+
+        return result;
+    }
+
+    private static string? GetStringProperty(JsonElement element, string propertyName, string? defaultValue)
+    {
+        if (element.TryGetProperty(propertyName, out var prop) && prop.ValueKind == JsonValueKind.String)
+        {
+            return prop.GetString();
+        }
+        return defaultValue;
+    }
+
+    private static bool GetBoolProperty(JsonElement element, string propertyName, bool defaultValue)
+    {
+        if (element.TryGetProperty(propertyName, out var prop))
+        {
+            if (prop.ValueKind == JsonValueKind.True) return true;
+            if (prop.ValueKind == JsonValueKind.False) return false;
+        }
+        return defaultValue;
+    }
+
+    #endregion
+
     #region Helper Methods
 
     private async Task<Core.Entities.DatabaseConnection> GetDatabaseConnectionAsync(Guid databaseId, Guid userId)

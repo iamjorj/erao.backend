@@ -20,4 +20,7 @@ public interface IDataExplorationService
     // Smart Features - Insights
     Task<List<InsightDto>> GetDatabaseInsightsAsync(Guid databaseId, Guid userId, string tableName);
     Task<List<InsightDto>> GetFileInsightsAsync(Guid fileId, Guid userId);
+
+    // AI-Powered Visualization Recommendation
+    Task<VisualizationRecommendationDto> AnalyzeForVisualizationAsync(AnalyzeVisualizationRequest request);
 }
