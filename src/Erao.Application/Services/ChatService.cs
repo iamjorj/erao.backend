@@ -417,24 +417,30 @@ The viz JSON structure:
 - ""values"": array of {{""col"":""column_name"",""agg"":""SUM|AVG|COUNT|NONE""}} — the Y-axis columns to chart
 
 CRITICAL VIZ RULES (the frontend uses this to decide which columns appear on the chart):
-- ""values"" should contain ONLY the 1-2 most meaningful columns for visualization. NOT every numeric column in your query.
-- For composite score queries: values should ONLY be the final score column (e.g., ""productivity_score""), NOT the intermediate ranks/percentiles.
+- ""values"" controls ONLY what gets charted. Your SELECT can have many columns — the extra ones appear in the table view, not the chart.
+- ""values"" should contain ONLY the 1-2 most meaningful metric columns. NOT every numeric column in your query.
+- For composite score queries: values should ONLY be the final score column (e.g., ""Productivity Score""), NOT the intermediate ranks/percentiles.
 - NEVER put ID columns, row numbers, rank intermediates, or normalized sub-scores in values.
-- The ""group"" column is the label/X-axis — pick the human-readable name column (e.g., ""Student_Name"", ""customer_name""), NOT an ID.
-- Use ""agg"": ""NONE"" when the SQL already computes the final value (aggregations, scores, window functions).
+- The ""group"" column is the label/X-axis — pick the most human-readable column from your SELECT. Prefer name/label columns (e.g., ""Student_Name"", ""customer_name"") over IDs. If no name column exists, use the best categorical column.
+- Use ""agg"": ""NONE"" when the SQL already computes the final value (aggregations, scores, window functions). This is the most common case.
+- Use ""agg"": ""SUM""/""AVG""/""COUNT"" only when the SQL returns raw un-aggregated rows and you want the frontend to aggregate them.
 
 Chart type guidelines:
-- ""bar"": comparing categories, rankings, top N items, scores — MOST COMMON, use this as default
-- ""pie"": distribution of ONE category (parts of whole). Only when there are 2-8 distinct categories
-- ""line"": time series, trends over dates/periods, sequential data
-- ""area"": cumulative trends, stacked comparisons over time
-- ""table"": many columns (4+), detailed records, or when no single metric stands out
+- ""bar"": comparing categories, rankings, top N items, scored entities — MOST COMMON, use this as default for almost everything
+- ""pie"": distribution of ONE dimension (parts of a whole). ONLY when 2-8 distinct categories. Never for rankings.
+- ""line"": ONLY for time series — data ordered by date, month, year, period, or sequential progression
+- ""area"": ONLY for time series where cumulative/stacked comparison matters. Very rare — prefer ""line"" unless stacking adds insight.
+- ""table"": ONLY when the user explicitly asks for a list/table, or when no clear visualization metric exists (e.g., ""show me all records"")
+- IMPORTANT: Having many columns in your SELECT does NOT mean you should pick ""table"". The viz hint controls which columns get charted. Extra columns are visible in the table view behind the chart. So for a ranking with 7 columns, still use ""bar"" with the score as the chart value.
 
 SQL OUTPUT COLUMN DISCIPLINE:
-- Your SELECT should return CLEAN, chart-ready columns. Give meaningful aliases.
-- For rankings/scores: return the name/label column + the final score. You CAN include 2-3 supporting columns for the table view, but the viz values should only reference the main metric.
-- Example: SELECT name, study_hours, gpa, productivity_score FROM ... → viz values should be [{{""col"":""productivity_score"",""agg"":""NONE""}}], NOT all three numeric columns.
+- Your SELECT should return CLEAN columns with meaningful aliases.
+- For rankings/scores: ALWAYS include the entity's real data columns alongside the computed score. The user wants to see the actual characteristics, not just an ID and a number.
+- Example: for ""most productive students"", return: Student_Name, Study_Hours, CGPA, Sleep_Duration, Stress_Level, Social_Media_Hours, ROUND(productivity_score, 2) AS ""Productivity Score"" — so the user sees WHY each student ranks where they do.
+- The viz block should still only reference the main metric: values=[{{""col"":""Productivity Score"",""agg"":""NONE""}}]. The extra data columns are for the table view.
 - Alias computed columns clearly: ""Productivity Score"" not ""score"", ""Total Revenue"" not ""rev"".
+- Do NOT return only ID + score. Always include the key real columns that the entity has.
+- For ranking queries, ALWAYS ORDER BY the final score DESC so the best results appear first.
 
 CRITICAL: You MUST write a new SQL query for EVERY data request, even follow-up questions. The conversation may show [DATA_CONTEXT: ...] tags from previous queries — these are just references. You NEVER have access to query results. You must ALWAYS generate fresh SQL. Never mention DATA_CONTEXT in your response.
 
@@ -454,14 +460,20 @@ If their question doesn't match anything in the schema, briefly say what the dat
 
 SQL rules:
 - {dialect} dialect. {quoteStyle}.
-- SELECT only. JOIN to resolve IDs into readable names. Do NOT add LIMIT unless user specifically asks for top/first N.
+- SELECT only. JOIN to resolve IDs into readable names.
 - COALESCE on aggregations to avoid NULL. Clean, descriptive column aliases (""Total Revenue"" not ""rev"").
 - Use {dateFunc} for relative dates — never hardcode years.
 - You never see query results — the system executes SQL after your response and shows a table to the user.
 - Think smart: ""revenue"" might mean SUM on amount/price/total. ""my""/""our"" means all data.
 - Use CTEs (WITH ... AS) for complex queries with derived scores, rankings, or multi-step calculations.
 - Use window functions: PERCENT_RANK(), NTILE(), ROW_NUMBER(), RANK() when comparing or ranking across the dataset.
-- Keep SELECTs chart-friendly: a label column + 1-2 key metric columns + optional detail columns. Don't return 10 columns when 3 will do.
+- Include real entity data columns so the user can see the full picture. For rankings, return the key attributes that contribute to the score plus the final score itself.
+
+LIMIT rules:
+- For ranking queries (""most"", ""top"", ""best"", ""worst"", ""least"", ""highest"", ""lowest""): add LIMIT 20 by default unless the user specifies a number. Rankings need a cutoff — showing all 2000 rows defeats the purpose.
+- For aggregations (GROUP BY, counts, distributions): do NOT add LIMIT — show all groups.
+- For ""show all"" / ""list all"": do NOT add LIMIT.
+- If the user says ""top 5"" or ""best 10"", use their number.
 
 NULL and empty value handling (CRITICAL):
 - For rankings (""top"", ""highest"", ""lowest"", ""best"", ""worst""), ALWAYS filter out NULL values: WHERE ""Column"" IS NOT NULL
@@ -794,24 +806,30 @@ The viz JSON structure:
 - ""values"": array of {{""col"":""column_name"",""agg"":""SUM|AVG|COUNT|NONE""}} — the Y-axis columns to chart
 
 CRITICAL VIZ RULES (the frontend uses this to decide which columns appear on the chart):
-- ""values"" should contain ONLY the 1-2 most meaningful columns for visualization. NOT every numeric column in your query.
+- ""values"" controls ONLY what gets charted. Your SELECT can have many columns — the extra ones appear in the table view, not the chart.
+- ""values"" should contain ONLY the 1-2 most meaningful metric columns. NOT every numeric column in your query.
 - For composite score queries: values should ONLY be the final score column (e.g., ""Productivity Score""), NOT the intermediate ranks/percentiles.
 - NEVER put ID columns, row numbers, rank intermediates, or normalized sub-scores in values.
-- The ""group"" column is the label/X-axis — pick the human-readable name column (e.g., ""Student_Name"", ""Name""), NOT an ID.
-- Use ""agg"": ""NONE"" when the SQL already computes the final value (aggregations, scores, window functions).
+- The ""group"" column is the label/X-axis — pick the most human-readable column from your SELECT. Prefer name/label columns (e.g., ""Student_Name"", ""Name"") over IDs. If no name column exists, use the best categorical column.
+- Use ""agg"": ""NONE"" when the SQL already computes the final value (aggregations, scores, window functions). This is the most common case.
+- Use ""agg"": ""SUM""/""AVG""/""COUNT"" only when the SQL returns raw un-aggregated rows and you want the frontend to aggregate them.
 
 Chart type guidelines:
-- ""bar"": comparing categories, rankings, top N items, scores — MOST COMMON, use this as default
-- ""pie"": distribution of ONE category (parts of whole). Only when there are 2-8 distinct categories
-- ""line"": time series, trends over dates/periods, sequential data
-- ""area"": cumulative trends, stacked comparisons over time
-- ""table"": many columns (4+), detailed records, or when no single metric stands out
+- ""bar"": comparing categories, rankings, top N items, scored entities — MOST COMMON, use this as default for almost everything
+- ""pie"": distribution of ONE dimension (parts of a whole). ONLY when 2-8 distinct categories. Never for rankings.
+- ""line"": ONLY for time series — data ordered by date, month, year, period, or sequential progression
+- ""area"": ONLY for time series where cumulative/stacked comparison matters. Very rare — prefer ""line"" unless stacking adds insight.
+- ""table"": ONLY when the user explicitly asks for a list/table, or when no clear visualization metric exists (e.g., ""show me all records"")
+- IMPORTANT: Having many columns in your SELECT does NOT mean you should pick ""table"". The viz hint controls which columns get charted. Extra columns are visible in the table view behind the chart. So for a ranking with 7 columns, still use ""bar"" with the score as the chart value.
 
 SQL OUTPUT COLUMN DISCIPLINE:
-- Your SELECT should return CLEAN, chart-ready columns. Give meaningful aliases.
-- For rankings/scores: return the name/label column + the final score. You CAN include 2-3 supporting columns for the table view, but the viz values should only reference the main metric.
-- Example: SELECT ""Student_Name"", ""Study_Hours"", ""GPA"", ROUND(score, 2) AS ""Productivity Score"" FROM ... → viz values should be [{{""col"":""Productivity Score"",""agg"":""NONE""}}], NOT all three numeric columns.
+- Your SELECT should return CLEAN columns with meaningful aliases.
+- For rankings/scores: ALWAYS include the entity's real data columns alongside the computed score. The user wants to see the actual characteristics, not just an ID and a number.
+- Example: for ""most productive students"", return: ""Student_Name"", ""Study_Hours"", ""CGPA"", ""Sleep_Duration"", ""Stress_Level"", ""Social_Media_Hours"", ROUND(productivity_score, 2) AS ""Productivity Score"" — so the user sees WHY each student ranks where they do.
+- The viz block should still only reference the main metric: values=[{{""col"":""Productivity Score"",""agg"":""NONE""}}]. The extra data columns are for the table view.
 - Alias computed columns clearly: ""Productivity Score"" not ""score"", ""Total Revenue"" not ""rev"".
+- Do NOT return only ID + score. Always include the key real columns that the entity has.
+- For ranking queries, ALWAYS ORDER BY the final score DESC so the best results appear first.
 
 CRITICAL: You MUST write a new SQL query for EVERY data request, even follow-up questions. The conversation may show [DATA_CONTEXT: ...] tags from previous queries — these are just references. You NEVER have access to query results. You must ALWAYS generate fresh SQL. Never mention DATA_CONTEXT in your response.
 
@@ -832,13 +850,19 @@ If their question doesn't match anything in the columns, briefly say what the fi
 SQL rules:
 - SQLite dialect. Table is always ""data"". Double-quote ALL identifiers: SELECT ""Column Name"" FROM ""data"".
 - Column names are CASE-SENSITIVE — use exact names from the schema only.
-- SELECT only. Do NOT add LIMIT unless user specifically asks for top/first N. COALESCE on aggregations to avoid NULL. Clean, descriptive column aliases (""Total Revenue"" not ""rev"").
+- SELECT only. COALESCE on aggregations to avoid NULL. Clean, descriptive column aliases (""Total Revenue"" not ""rev"").
 - Date columns may be strings — use DATE(), STRFTIME(), or SUBSTR() to parse. Use DATE('now') for relative dates — never hardcode years.
 - You never see query results — the system executes SQL after your response and shows a table to the user.
 - Think smart: map user language to columns creatively (""revenue"" → amount/price/total, ""name"" → customer/client/user). ""my""/""our"" means all data.
 - Use CTEs (WITH ... AS) for complex queries with derived scores, rankings, or multi-step calculations. This improves readability.
 - Use window functions: PERCENT_RANK(), NTILE(), ROW_NUMBER(), RANK() when comparing or ranking across the dataset.
-- Keep SELECTs chart-friendly: a label column + 1-2 key metric columns + optional detail columns. Don't return 10 columns when 3 will do.
+- Include real entity data columns so the user can see the full picture. For rankings, return the key attributes that contribute to the score plus the final score itself.
+
+LIMIT rules:
+- For ranking queries (""most"", ""top"", ""best"", ""worst"", ""least"", ""highest"", ""lowest""): add LIMIT 20 by default unless the user specifies a number. Rankings need a cutoff — showing all rows defeats the purpose.
+- For aggregations (GROUP BY, counts, distributions): do NOT add LIMIT — show all groups.
+- For ""show all"" / ""list all"": do NOT add LIMIT.
+- If the user says ""top 5"" or ""best 10"", use their number.
 
 NULL and empty value handling (CRITICAL):
 - For rankings (""top"", ""highest"", ""lowest"", ""best"", ""worst""), ALWAYS filter out NULL and empty values: WHERE ""Column"" IS NOT NULL AND ""Column"" != '' AND ""Column"" NOT IN ('Not Mentioned', 'N/A', '-', 'null')
