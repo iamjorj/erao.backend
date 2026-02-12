@@ -40,8 +40,28 @@ public class CsvFileParser : IFileParser
 
             var delimiter = DetectDelimiter(firstLine);
 
-            // Parse header
+            // Smart header detection: skip title rows that have fewer fields than data rows
             var headers = ParseCsvLine(firstLine, delimiter);
+
+            // If first line has only 1 field, it might be a title row — peek at next lines
+            if (headers.Count <= 1)
+            {
+                var nextLine = await reader.ReadLineAsync(cancellationToken);
+                if (!string.IsNullOrEmpty(nextLine))
+                {
+                    var nextDelimiter = DetectDelimiter(nextLine);
+                    var nextHeaders = ParseCsvLine(nextLine, nextDelimiter);
+
+                    if (nextHeaders.Count > headers.Count)
+                    {
+                        // Next line has more columns — it's the real header, first line was a title
+                        _logger.LogInformation("Skipping title row: \"{TitleRow}\", using row 2 as headers", firstLine);
+                        headers = nextHeaders;
+                        delimiter = nextDelimiter;
+                    }
+                }
+            }
+
             var columnNames = new List<string>();
 
             for (int i = 0; i < headers.Count; i++)

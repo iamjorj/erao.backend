@@ -26,11 +26,19 @@ public class ExcelFileParser : IFileParser
         try
         {
             using var workbook = new XLWorkbook(fileStream);
-            var worksheet = workbook.Worksheets.First();
 
-            // Get the used range
-            var usedRange = worksheet.RangeUsed();
-            if (usedRange == null)
+            // Pick the worksheet with the most data (not just the first one — it could be a cover page)
+            var worksheet = workbook.Worksheets.OrderByDescending(ws =>
+            {
+                var r = ws.RangeUsed();
+                return r != null ? r.RowCount() * r.ColumnCount() : 0;
+            }).First();
+
+            // Use worksheet-level boundaries (more reliable than RangeUsed with merged cells)
+            var lastRowUsed = worksheet.LastRowUsed();
+            var lastColUsed = worksheet.LastColumnUsed();
+
+            if (lastRowUsed == null || lastColUsed == null)
             {
                 result.Success = true;
                 result.RowCount = 0;
@@ -39,18 +47,58 @@ public class ExcelFileParser : IFileParser
                 return result;
             }
 
-            var firstRow = usedRange.FirstRow();
-            var lastRow = usedRange.LastRow();
-            var firstColumn = usedRange.FirstColumn();
-            var lastColumn = usedRange.LastColumn();
+            var lastRowNum = lastRowUsed.RowNumber();
+            var lastColNum = lastColUsed.ColumnNumber();
+            var firstColNum = 1;
 
-            // Extract column headers (first row)
+            // Smart header row detection: find the row with the most unique non-empty values
+            // This skips title rows (merged cells report as 1 unique value) and metadata rows
+            var headerRowNumber = 1;
+            var bestUniqueCount = 0;
+
+            for (int row = 1; row <= Math.Min(10, lastRowNum); row++)
+            {
+                var uniqueValues = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (int col = 1; col <= lastColNum; col++)
+                {
+                    var cell = worksheet.Cell(row, col);
+                    if (!cell.IsEmpty())
+                    {
+                        var val = cell.GetString().Trim();
+                        if (!string.IsNullOrWhiteSpace(val))
+                            uniqueValues.Add(val);
+                    }
+                }
+
+                // Header row = row with the most unique string values (at least 2)
+                if (uniqueValues.Count > bestUniqueCount && uniqueValues.Count >= 2)
+                {
+                    bestUniqueCount = uniqueValues.Count;
+                    headerRowNumber = row;
+                }
+            }
+
+            // Determine actual column range from the header row
+            var headerFirstCol = lastColNum;
+            var headerLastCol = 1;
+            for (int col = 1; col <= lastColNum; col++)
+            {
+                if (!worksheet.Cell(headerRowNumber, col).IsEmpty())
+                {
+                    if (col < headerFirstCol) headerFirstCol = col;
+                    if (col > headerLastCol) headerLastCol = col;
+                }
+            }
+            firstColNum = headerFirstCol;
+            lastColNum = headerLastCol;
+
+            // Extract column headers from detected header row
             var columns = new List<ColumnInfo>();
             var columnNames = new List<string>();
 
-            for (int col = firstColumn.ColumnNumber(); col <= lastColumn.ColumnNumber(); col++)
+            for (int col = firstColNum; col <= lastColNum; col++)
             {
-                var cell = worksheet.Cell(firstRow.RowNumber(), col);
+                var cell = worksheet.Cell(headerRowNumber, col);
                 var columnName = cell.GetString();
 
                 if (string.IsNullOrWhiteSpace(columnName))
@@ -78,9 +126,9 @@ public class ExcelFileParser : IFileParser
             // Extract data rows
             var data = new List<Dictionary<string, object?>>();
             var rowCount = 0;
-            var startDataRow = firstRow.RowNumber() + 1; // Skip header row
+            var startDataRow = headerRowNumber + 1; // Skip header row
 
-            for (int row = startDataRow; row <= lastRow.RowNumber() && rowCount < MaxRowsToProcess; row++)
+            for (int row = startDataRow; row <= lastRowNum && rowCount < MaxRowsToProcess; row++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -89,7 +137,7 @@ public class ExcelFileParser : IFileParser
 
                 for (int col = 0; col < columnNames.Count; col++)
                 {
-                    var cell = worksheet.Cell(row, firstColumn.ColumnNumber() + col);
+                    var cell = worksheet.Cell(row, firstColNum + col);
                     var value = GetCellValue(cell);
                     rowData[columnNames[col]] = value;
 
