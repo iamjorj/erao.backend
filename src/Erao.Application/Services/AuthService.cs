@@ -5,6 +5,7 @@ using Erao.Core.Entities;
 using Erao.Core.Enums;
 using Erao.Core.Helpers;
 using Erao.Core.Interfaces;
+using Google.Apis.Auth;
 using Microsoft.Extensions.Configuration;
 
 namespace Erao.Application.Services;
@@ -21,6 +22,7 @@ public interface IAuthService
     Task ResendOtpAsync(string email);
     Task<AuthResponse> VerifyEmailAsync(VerifyOtpRequest request);
     Task ResendEmailVerificationOtpAsync(string email);
+    Task<AuthResponse> GoogleLoginAsync(string idToken);
 }
 
 public class AuthService : IAuthService
@@ -30,6 +32,7 @@ public class AuthService : IAuthService
     private readonly IEmailService _emailService;
     private readonly IMapper _mapper;
     private readonly int _refreshTokenExpirationDays;
+    private readonly string _googleClientId;
     private const int OtpExpirationMinutes = 15;
 
     public AuthService(
@@ -44,6 +47,7 @@ public class AuthService : IAuthService
         _emailService = emailService;
         _mapper = mapper;
         _refreshTokenExpirationDays = int.Parse(configuration["Jwt:RefreshTokenExpirationDays"] ?? "7");
+        _googleClientId = configuration["Google:ClientId"] ?? string.Empty;
     }
 
     public async Task<RegisterResponse> RegisterAsync(RegisterRequest request)
@@ -346,6 +350,64 @@ public class AuthService : IAuthService
             // Log OTP for development testing when email fails
             Console.WriteLine($"[DEV] Email verification OTP for {user.Email}: {otp}");
         }
+    }
+
+    public async Task<AuthResponse> GoogleLoginAsync(string idToken)
+    {
+        GoogleJsonWebSignature.Payload payload;
+        try
+        {
+            var settings = new GoogleJsonWebSignature.ValidationSettings
+            {
+                Audience = new[] { _googleClientId }
+            };
+            payload = await GoogleJsonWebSignature.ValidateAsync(idToken, settings);
+        }
+        catch (InvalidJwtException)
+        {
+            throw new UnauthorizedAccessException("Invalid Google token");
+        }
+
+        var email = payload.Email.ToLower();
+        var user = await _unitOfWork.Users.GetByEmailAsync(email);
+
+        if (user == null)
+        {
+            // Create new user — no password needed, email already verified by Google
+            user = new User
+            {
+                Email = email,
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword(Guid.NewGuid().ToString()),
+                FirstName = payload.GivenName ?? "",
+                LastName = payload.FamilyName ?? "",
+                SubscriptionTier = SubscriptionTier.Starter,
+                QueryLimitPerMonth = GetQueryLimitForTier(SubscriptionTier.Starter),
+                BillingCycleReset = DateTime.UtcNow.AddMonths(1),
+                IsEmailVerified = true
+            };
+            await _unitOfWork.Users.AddAsync(user);
+        }
+        else if (!user.IsEmailVerified)
+        {
+            // Existing user who hadn't verified email — Google verifies it for us
+            user.IsEmailVerified = true;
+        }
+
+        user.RefreshToken = _tokenService.GenerateRefreshToken();
+        user.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(_refreshTokenExpirationDays);
+
+        await _unitOfWork.Users.UpdateAsync(user);
+        await _unitOfWork.SaveChangesAsync();
+
+        var accessToken = _tokenService.GenerateAccessToken(user);
+
+        return new AuthResponse
+        {
+            AccessToken = accessToken,
+            RefreshToken = user.RefreshToken,
+            ExpiresAt = DateTime.UtcNow.AddMinutes(15),
+            User = _mapper.Map<UserDto>(user)
+        };
     }
 
     private static string GenerateOtp()

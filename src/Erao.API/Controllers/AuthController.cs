@@ -65,6 +65,26 @@ public class AuthController : ControllerBase
         }
     }
 
+    [HttpPost("google")]
+    [AllowAnonymous]
+    public async Task<ActionResult<ApiResponse<AuthResponse>>> GoogleLogin([FromBody] GoogleLoginRequest request)
+    {
+        try
+        {
+            var result = await _authService.GoogleLoginAsync(request.IdToken);
+            return Ok(ApiResponse<AuthResponse>.SuccessResponse(result, "Login successful"));
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Unauthorized(ApiResponse<AuthResponse>.ErrorResponse(ex.Message));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during Google login");
+            return StatusCode(500, ApiResponse<AuthResponse>.ErrorResponse("An error occurred during Google login"));
+        }
+    }
+
     [HttpPost("refresh")]
     [AllowAnonymous]
     public async Task<ActionResult<ApiResponse<AuthResponse>>> RefreshToken([FromBody] RefreshTokenRequest request)
