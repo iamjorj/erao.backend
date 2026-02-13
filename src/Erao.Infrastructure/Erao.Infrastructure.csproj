@@ -32,6 +32,11 @@
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.3" />
     <PackageReference Include="System.Data.SqlClient" Version="4.9.0" />
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.3.0" />
+    <PackageReference Include="Oracle.ManagedDataAccess.Core" Version="23.7.0" />
+    <PackageReference Include="ClickHouse.Client" Version="7.8.0" />
+    <PackageReference Include="FirebirdSql.Data.FirebirdClient" Version="10.3.1" />
+    <PackageReference Include="DuckDB.NET.Data" Version="1.2.1" />
+    <PackageReference Include="Snowflake.Data" Version="4.3.0" />
   </ItemGroup>
 
 </Project>

@@ -417,32 +417,60 @@ public class ChatService : IChatService
             DatabaseType.MySQL => "MySQL",
             DatabaseType.SQLServer => "SQL Server",
             DatabaseType.MongoDB => "MongoDB",
+            DatabaseType.Oracle => "Oracle",
+            DatabaseType.SQLite => "SQLite",
+            DatabaseType.MariaDB => "MariaDB",
+            DatabaseType.CockroachDB => "CockroachDB",
+            DatabaseType.Redshift => "Amazon Redshift",
+            DatabaseType.ClickHouse => "ClickHouse",
+            DatabaseType.Firebird => "Firebird",
+            DatabaseType.DuckDB => "DuckDB",
+            DatabaseType.TimescaleDB => "TimescaleDB",
+            DatabaseType.YugabyteDB => "YugabyteDB",
+            DatabaseType.Snowflake => "Snowflake",
             _ => "PostgreSQL"
         };
 
         var quoteStyle = dbType switch
         {
-            DatabaseType.MySQL => "backtick-quote identifiers: `TableName`, `ColumnName`",
-            DatabaseType.SQLServer => "bracket-quote identifiers: [TableName], [ColumnName]",
+            DatabaseType.MySQL or DatabaseType.MariaDB
+                => "backtick-quote identifiers: `TableName`, `ColumnName`",
+            DatabaseType.SQLServer
+                => "bracket-quote identifiers: [TableName], [ColumnName]",
+            DatabaseType.ClickHouse
+                => "backtick-quote identifiers: `TableName`, `ColumnName`",
             _ => "double-quote identifiers: \"TableName\", \"ColumnName\""
         };
 
         var dateFunc = dbType switch
         {
-            DatabaseType.MySQL => "NOW(), CURDATE()",
+            DatabaseType.MySQL or DatabaseType.MariaDB => "NOW(), CURDATE()",
             DatabaseType.SQLServer => "GETDATE(), CURRENT_TIMESTAMP",
+            DatabaseType.Oracle => "SYSDATE, CURRENT_TIMESTAMP",
+            DatabaseType.SQLite or DatabaseType.DuckDB => "DATE('now'), DATETIME('now')",
+            DatabaseType.ClickHouse => "now(), today()",
+            DatabaseType.Firebird => "CURRENT_TIMESTAMP, CURRENT_DATE",
+            DatabaseType.Snowflake => "CURRENT_TIMESTAMP(), CURRENT_DATE()",
             _ => "NOW(), CURRENT_DATE"
         };
 
         var dialectNotes = dbType switch
         {
-            DatabaseType.PostgreSQL => @"
+            DatabaseType.PostgreSQL or DatabaseType.CockroachDB or DatabaseType.TimescaleDB
+                or DatabaseType.YugabyteDB => @"
 PostgreSQL-specific rules (CRITICAL — violating these causes runtime errors):
 - ROUND(double precision, N) does NOT exist. You MUST cast to numeric first: ROUND(value::numeric, N). This applies to ANY expression with floating point results (divisions, AVG, PERCENT_RANK, etc.).
 - String concatenation uses || operator, not CONCAT (though CONCAT also works).
 - Boolean values: use TRUE/FALSE, not 1/0.
 - ILIKE for case-insensitive LIKE.",
-            DatabaseType.MySQL => @"
+            DatabaseType.Redshift => @"
+Amazon Redshift-specific rules (PostgreSQL-based):
+- ROUND(double precision, N) does NOT exist. You MUST cast to numeric first: ROUND(value::numeric, N).
+- String concatenation uses || operator.
+- Boolean values: use TRUE/FALSE, not 1/0.
+- ILIKE for case-insensitive LIKE.
+- No LATERAL joins. Use window functions instead of correlated subqueries where possible.",
+            DatabaseType.MySQL or DatabaseType.MariaDB => @"
 MySQL-specific rules:
 - Use ROUND(value, N) directly — works on all numeric types.
 - Use IFNULL() instead of COALESCE if only 2 args.
@@ -453,6 +481,47 @@ SQL Server-specific rules:
 - Use TOP N instead of LIMIT N: SELECT TOP 20 ... ORDER BY ...
 - Use ISNULL() or COALESCE() for null handling.
 - No BOOLEAN type — use BIT (1/0).",
+            DatabaseType.Oracle => @"
+Oracle-specific rules:
+- Use ROUND(value, N) directly.
+- Use FETCH FIRST N ROWS ONLY instead of LIMIT N (Oracle 12c+). Example: SELECT ... ORDER BY x FETCH FIRST 20 ROWS ONLY.
+- Use NVL() or COALESCE() for null handling.
+- String concatenation uses || operator.
+- No BOOLEAN type in SQL — use NUMBER(1) with 0/1.",
+            DatabaseType.SQLite => @"
+SQLite-specific rules:
+- Double-quote all identifiers: ""TableName"", ""ColumnName"".
+- Use ROUND(value, N) directly.
+- Date functions: DATE('now'), STRFTIME(), JULIANDAY().
+- No RIGHT JOIN or FULL OUTER JOIN — rewrite using LEFT JOIN.",
+            DatabaseType.ClickHouse => @"
+ClickHouse-specific rules:
+- Use ROUND(value, N) directly.
+- Use LIMIT N (standard SQL syntax).
+- Use ifNull() or coalesce() for null handling.
+- String functions: lower(), upper(), like (case-sensitive), ilike (case-insensitive).
+- ClickHouse is columnar — avoid SELECT * on large tables.",
+            DatabaseType.Firebird => @"
+Firebird-specific rules:
+- Use ROUND(value, N) directly.
+- Use FIRST N or ROWS N instead of LIMIT N: SELECT FIRST 20 ... FROM ...
+- String concatenation uses || operator.
+- Use COALESCE() for null handling.",
+            DatabaseType.DuckDB => @"
+DuckDB-specific rules:
+- PostgreSQL-compatible syntax. Double-quote identifiers.
+- Use ROUND(value, N) directly — works on all numeric types.
+- ILIKE for case-insensitive matching.
+- String concatenation uses || operator.
+- Supports LIMIT N.",
+            DatabaseType.Snowflake => @"
+Snowflake-specific rules:
+- Use ROUND(value, N) directly.
+- Use LIMIT N (standard SQL syntax).
+- Identifiers are case-insensitive by default; use double-quotes to preserve case.
+- Use NVL() or COALESCE() for null handling.
+- ILIKE for case-insensitive matching.
+- String concatenation uses || operator.",
             _ => ""
         };
 
@@ -467,8 +536,9 @@ Only refuse if the question is clearly about something NOT represented in any ta
 First, decide what the user wants:
 
 1. **Data** — they want numbers, lists, tables, metrics, rankings, comparisons, visualizations, or any question answerable with a query FROM THIS DATABASE.
-2. **Explanation** — they explicitly ask to explain, describe, analyze meaning, ""what is this database"", ""tell me about"", ""why"", ""how does X work"" — ONLY about this database's data and schema.
-3. **Off-topic** — greetings, general knowledge, questions unrelated to this database, questions about other systems/platforms.
+2. **Show SQL** — they explicitly ask to ""show the SQL"", ""show me the query"", ""what query would"", ""write a query for"", ""explain the SQL"", ""how would you query"". They want to SEE the SQL code, not just data.
+3. **Explanation** — they explicitly ask to explain, describe, analyze meaning, ""what is this database"", ""tell me about"", ""why"", ""how does X work"" — ONLY about this database's data and schema.
+4. **Off-topic** — greetings, general knowledge, questions unrelated to this database, questions about other systems/platforms.
 
 Then follow the matching rules:
 
@@ -527,6 +597,11 @@ SQL OUTPUT COLUMN DISCIPLINE:
 - For ranking queries, ALWAYS ORDER BY the final score DESC so the best results appear first.
 
 CRITICAL: You MUST write a new SQL query for EVERY data request, even follow-up questions. The conversation may show [DATA_CONTEXT: ...] tags from previous queries — these are just references. You NEVER have access to query results. You must ALWAYS generate fresh SQL. Never mention DATA_CONTEXT in your response.
+
+**SHOW SQL → the user wants to see the actual SQL query.**
+- Write a clear explanation of the query logic.
+- Show the SQL inside a ```text code block (NOT ```sql). This is critical — ```sql blocks are auto-executed and hidden. Use ```text so the SQL is displayed to the user.
+- If the user ALSO wants the data, include a separate ```sql block AND ```viz block after the ```text explanation. If they only want to see/understand the query, just use ```text.
 
 **EXPLANATION → respond with well-formatted text following these rules:**
 - Start with a one-line summary in **bold**
@@ -601,6 +676,17 @@ No schema available. Tell the user to connect a database first.";
             DatabaseType.PostgreSQL => "PostgreSQL",
             DatabaseType.MySQL => "MySQL",
             DatabaseType.SQLServer => "SQL Server",
+            DatabaseType.Oracle => "Oracle",
+            DatabaseType.SQLite => "SQLite",
+            DatabaseType.MariaDB => "MariaDB",
+            DatabaseType.CockroachDB => "CockroachDB",
+            DatabaseType.Redshift => "Amazon Redshift",
+            DatabaseType.ClickHouse => "ClickHouse",
+            DatabaseType.Firebird => "Firebird",
+            DatabaseType.DuckDB => "DuckDB",
+            DatabaseType.TimescaleDB => "TimescaleDB",
+            DatabaseType.YugabyteDB => "YugabyteDB",
+            DatabaseType.Snowflake => "Snowflake",
             _ => "PostgreSQL"
         };
 
@@ -629,13 +715,19 @@ RULES:
         {
             var dialectHints = dbType switch
             {
-                DatabaseType.PostgreSQL => @"
+                DatabaseType.PostgreSQL or DatabaseType.CockroachDB or DatabaseType.TimescaleDB
+                    or DatabaseType.YugabyteDB => @"
 - PostgreSQL: ROUND() requires numeric type — use ROUND(value::numeric, N).
 - Use double-quote identifiers: ""TableName"".
 - ILIKE for case-insensitive matching.
 - Boolean: TRUE/FALSE not 1/0.
 - String concat: || operator.",
-                DatabaseType.MySQL => @"
+                DatabaseType.Redshift => @"
+- Redshift (PostgreSQL-based): ROUND() requires numeric type — use ROUND(value::numeric, N).
+- Use double-quote identifiers: ""TableName"".
+- ILIKE for case-insensitive matching.
+- No LATERAL joins.",
+                DatabaseType.MySQL or DatabaseType.MariaDB => @"
 - MySQL: backtick identifiers: `TableName`.
 - ROUND(value, N) works directly.
 - IFNULL() for 2-arg null handling.",
@@ -643,6 +735,25 @@ RULES:
 - SQL Server: bracket identifiers: [TableName].
 - TOP N instead of LIMIT N.
 - BIT type instead of BOOLEAN.",
+                DatabaseType.Oracle => @"
+- Oracle: double-quote identifiers: ""TableName"".
+- FETCH FIRST N ROWS ONLY instead of LIMIT N.
+- NVL() for null handling. String concat: || operator.",
+                DatabaseType.SQLite => @"
+- SQLite: double-quote identifiers: ""TableName"".
+- No RIGHT/FULL OUTER JOIN. Use DATE('now') for dates.",
+                DatabaseType.ClickHouse => @"
+- ClickHouse: backtick identifiers: `TableName`.
+- ifNull() for null handling. Columnar engine.",
+                DatabaseType.Firebird => @"
+- Firebird: double-quote identifiers: ""TableName"".
+- FIRST N instead of LIMIT N. String concat: || operator.",
+                DatabaseType.DuckDB => @"
+- DuckDB: double-quote identifiers: ""TableName"".
+- PostgreSQL-compatible syntax. ILIKE for case-insensitive.",
+                DatabaseType.Snowflake => @"
+- Snowflake: double-quote identifiers for case-sensitive.
+- NVL() or COALESCE(). ILIKE for case-insensitive.",
                 _ => ""
             };
             prompt += dialectHints;
@@ -922,8 +1033,9 @@ If the user asks about something that matches a column in the file, ALWAYS query
 First, decide what the user wants:
 
 1. **Data** — they want numbers, lists, tables, metrics, rankings, comparisons, visualizations, charts, graphs, or any question answerable with a query FROM THIS FILE.
-2. **Explanation** — they explicitly ask to explain, describe, analyze meaning, ""what's in this file"", ""tell me about"", ""why"", ""how does X work"" — ONLY about this file's data and columns.
-3. **Off-topic** — greetings, general knowledge, questions unrelated to this file, questions about other systems/platforms.
+2. **Show SQL** — they explicitly ask to ""show the SQL"", ""show me the query"", ""what query would"", ""write a query for"", ""explain the SQL"", ""how would you query"". They want to SEE the SQL code.
+3. **Explanation** — they explicitly ask to explain, describe, analyze meaning, ""what's in this file"", ""tell me about"", ""why"", ""how does X work"" — ONLY about this file's data and columns.
+4. **Off-topic** — greetings, general knowledge, questions unrelated to this file, questions about other systems/platforms.
 
 Then follow the matching rules:
 
@@ -982,6 +1094,11 @@ SQL OUTPUT COLUMN DISCIPLINE:
 - For ranking queries, ALWAYS ORDER BY the final score DESC so the best results appear first.
 
 CRITICAL: You MUST write a new SQL query for EVERY data request, even follow-up questions. The conversation may show [DATA_CONTEXT: ...] tags from previous queries — these are just references. You NEVER have access to query results. You must ALWAYS generate fresh SQL. Never mention DATA_CONTEXT in your response.
+
+**SHOW SQL → the user wants to see the actual SQL query.**
+- Write a clear explanation of the query logic.
+- Show the SQL inside a ```text code block (NOT ```sql). This is critical — ```sql blocks are auto-executed and hidden. Use ```text so the SQL is displayed to the user.
+- If the user ALSO wants the data, include a separate ```sql block AND ```viz block after the ```text explanation. If they only want to see/understand the query, just use ```text.
 
 **EXPLANATION → respond with well-formatted text following these rules:**
 - Start with a one-line summary in **bold**

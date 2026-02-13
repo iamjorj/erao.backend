@@ -10,6 +10,12 @@ using MongoDB.Driver;
 using MySql.Data.MySqlClient;
 using Npgsql;
 using System.Data.SqlClient;
+using Microsoft.Data.Sqlite;
+using Oracle.ManagedDataAccess.Client;
+using ClickHouse.Client.ADO;
+using FirebirdSql.Data.FirebirdClient;
+using DuckDB.NET.Data;
+using Snowflake.Data.Client;
 
 namespace Erao.Infrastructure.Services;
 
@@ -29,13 +35,30 @@ public class DatabaseQueryService : IDatabaseQueryService
             switch (dbType)
             {
                 case DatabaseType.PostgreSQL:
+                case DatabaseType.CockroachDB:
+                case DatabaseType.Redshift:
+                case DatabaseType.TimescaleDB:
+                case DatabaseType.YugabyteDB:
                     return await TestPostgreSqlConnectionAsync(host, port, database, username, password);
                 case DatabaseType.MySQL:
+                case DatabaseType.MariaDB:
                     return await TestMySqlConnectionAsync(host, port, database, username, password);
                 case DatabaseType.SQLServer:
                     return await TestSqlServerConnectionAsync(host, port, database, username, password);
                 case DatabaseType.MongoDB:
                     return await TestMongoDbConnectionAsync(host, port, database, username, password);
+                case DatabaseType.Oracle:
+                    return await TestOracleConnectionAsync(host, port, database, username, password);
+                case DatabaseType.SQLite:
+                    return await TestSqliteConnectionAsync(host, port, database, username, password);
+                case DatabaseType.ClickHouse:
+                    return await TestClickHouseConnectionAsync(host, port, database, username, password);
+                case DatabaseType.Firebird:
+                    return await TestFirebirdConnectionAsync(host, port, database, username, password);
+                case DatabaseType.DuckDB:
+                    return await TestDuckDbConnectionAsync(host, port, database, username, password);
+                case DatabaseType.Snowflake:
+                    return await TestSnowflakeConnectionAsync(host, port, database, username, password);
                 default:
                     throw new NotSupportedException($"Database type {dbType} is not supported");
             }
@@ -53,10 +76,19 @@ public class DatabaseQueryService : IDatabaseQueryService
         {
             return dbType switch
             {
-                DatabaseType.PostgreSQL => await GetPostgreSqlSchemaAsync(host, port, database, username, password),
-                DatabaseType.MySQL => await GetMySqlSchemaAsync(host, port, database, username, password),
+                DatabaseType.PostgreSQL or DatabaseType.CockroachDB or DatabaseType.Redshift
+                    or DatabaseType.TimescaleDB or DatabaseType.YugabyteDB
+                    => await GetPostgreSqlSchemaAsync(host, port, database, username, password),
+                DatabaseType.MySQL or DatabaseType.MariaDB
+                    => await GetMySqlSchemaAsync(host, port, database, username, password),
                 DatabaseType.SQLServer => await GetSqlServerSchemaAsync(host, port, database, username, password),
                 DatabaseType.MongoDB => await GetMongoDbSchemaAsync(host, port, database, username, password),
+                DatabaseType.Oracle => await GetOracleSchemaAsync(host, port, database, username, password),
+                DatabaseType.SQLite => await GetSqliteSchemaAsync(host, port, database, username, password),
+                DatabaseType.ClickHouse => await GetClickHouseSchemaAsync(host, port, database, username, password),
+                DatabaseType.Firebird => await GetFirebirdSchemaAsync(host, port, database, username, password),
+                DatabaseType.DuckDB => await GetDuckDbSchemaAsync(host, port, database, username, password),
+                DatabaseType.Snowflake => await GetSnowflakeSchemaAsync(host, port, database, username, password),
                 _ => throw new NotSupportedException($"Database type {dbType} is not supported")
             };
         }
@@ -73,10 +105,19 @@ public class DatabaseQueryService : IDatabaseQueryService
         {
             return dbType switch
             {
-                DatabaseType.PostgreSQL => await GetPostgreSqlStructuredSchemaAsync(host, port, database, username, password),
-                DatabaseType.MySQL => await GetMySqlStructuredSchemaAsync(host, port, database, username, password),
+                DatabaseType.PostgreSQL or DatabaseType.CockroachDB or DatabaseType.Redshift
+                    or DatabaseType.TimescaleDB or DatabaseType.YugabyteDB
+                    => await GetPostgreSqlStructuredSchemaAsync(host, port, database, username, password),
+                DatabaseType.MySQL or DatabaseType.MariaDB
+                    => await GetMySqlStructuredSchemaAsync(host, port, database, username, password),
                 DatabaseType.SQLServer => await GetSqlServerStructuredSchemaAsync(host, port, database, username, password),
                 DatabaseType.MongoDB => await GetMongoDbStructuredSchemaAsync(host, port, database, username, password),
+                DatabaseType.Oracle => await GetOracleStructuredSchemaAsync(host, port, database, username, password),
+                DatabaseType.SQLite => await GetSqliteStructuredSchemaAsync(host, port, database, username, password),
+                DatabaseType.ClickHouse => await GetClickHouseStructuredSchemaAsync(host, port, database, username, password),
+                DatabaseType.Firebird => await GetFirebirdStructuredSchemaAsync(host, port, database, username, password),
+                DatabaseType.DuckDB => await GetDuckDbStructuredSchemaAsync(host, port, database, username, password),
+                DatabaseType.Snowflake => await GetSnowflakeStructuredSchemaAsync(host, port, database, username, password),
                 _ => throw new NotSupportedException($"Database type {dbType} is not supported")
             };
         }
@@ -93,10 +134,19 @@ public class DatabaseQueryService : IDatabaseQueryService
         {
             return dbType switch
             {
-                DatabaseType.PostgreSQL => await ExecutePostgreSqlQueryAsync(host, port, database, username, password, query),
-                DatabaseType.MySQL => await ExecuteMySqlQueryAsync(host, port, database, username, password, query),
+                DatabaseType.PostgreSQL or DatabaseType.CockroachDB or DatabaseType.Redshift
+                    or DatabaseType.TimescaleDB or DatabaseType.YugabyteDB
+                    => await ExecutePostgreSqlQueryAsync(host, port, database, username, password, query),
+                DatabaseType.MySQL or DatabaseType.MariaDB
+                    => await ExecuteMySqlQueryAsync(host, port, database, username, password, query),
                 DatabaseType.SQLServer => await ExecuteSqlServerQueryAsync(host, port, database, username, password, query),
                 DatabaseType.MongoDB => await ExecuteMongoDbQueryAsync(host, port, database, username, password, query),
+                DatabaseType.Oracle => await ExecuteOracleQueryAsync(host, port, database, username, password, query),
+                DatabaseType.SQLite => await ExecuteSqliteQueryAsync(host, port, database, username, password, query),
+                DatabaseType.ClickHouse => await ExecuteClickHouseQueryAsync(host, port, database, username, password, query),
+                DatabaseType.Firebird => await ExecuteFirebirdQueryAsync(host, port, database, username, password, query),
+                DatabaseType.DuckDB => await ExecuteDuckDbQueryAsync(host, port, database, username, password, query),
+                DatabaseType.Snowflake => await ExecuteSnowflakeQueryAsync(host, port, database, username, password, query),
                 _ => throw new NotSupportedException($"Database type {dbType} is not supported")
             };
         }
@@ -113,9 +163,18 @@ public class DatabaseQueryService : IDatabaseQueryService
         {
             return dbType switch
             {
-                DatabaseType.PostgreSQL => await ExecutePostgreSqlQueriesAsync(host, port, database, username, password, queries),
-                DatabaseType.MySQL => await ExecuteMySqlQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.PostgreSQL or DatabaseType.CockroachDB or DatabaseType.Redshift
+                    or DatabaseType.TimescaleDB or DatabaseType.YugabyteDB
+                    => await ExecutePostgreSqlQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.MySQL or DatabaseType.MariaDB
+                    => await ExecuteMySqlQueriesAsync(host, port, database, username, password, queries),
                 DatabaseType.SQLServer => await ExecuteSqlServerQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.Oracle => await ExecuteOracleQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.SQLite => await ExecuteSqliteQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.ClickHouse => await ExecuteClickHouseQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.Firebird => await ExecuteFirebirdQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.DuckDB => await ExecuteDuckDbQueriesAsync(host, port, database, username, password, queries),
+                DatabaseType.Snowflake => await ExecuteSnowflakeQueriesAsync(host, port, database, username, password, queries),
                 // MongoDB doesn't support multiple SQL queries
                 _ => throw new NotSupportedException($"Batch queries not supported for {dbType}")
             };
@@ -1201,6 +1260,876 @@ public class DatabaseQueryService : IDatabaseQueryService
         }
 
         return tables;
+    }
+
+    #endregion
+
+    #region Oracle
+
+    private static string BuildOracleConnectionString(string host, int port, string database, string username, string password)
+        => $"Data Source=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT={port}))(CONNECT_DATA=(SERVICE_NAME={database})));User Id={username};Password={password};Connection Timeout=30";
+
+    private async Task<bool> TestOracleConnectionAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new OracleConnection(BuildOracleConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        return true;
+    }
+
+    private async Task<string> GetOracleSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new OracleConnection(BuildOracleConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var schema = new StringBuilder();
+        schema.AppendLine("-- Oracle Database Schema");
+        schema.AppendLine();
+
+        await using var tableCmd = new OracleCommand("SELECT table_name FROM user_tables ORDER BY table_name", connection);
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tables = new List<string>();
+        while (await tableReader.ReadAsync()) tables.Add(tableReader.GetString(0));
+        await tableReader.CloseAsync();
+
+        foreach (var table in tables)
+        {
+            schema.AppendLine($"CREATE TABLE \"{table}\" (");
+            await using var colCmd = new OracleCommand(
+                $"SELECT column_name, data_type, nullable FROM user_tab_columns WHERE table_name = '{table}' ORDER BY column_id", connection);
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+
+            var cols = new List<string>();
+            while (await colReader.ReadAsync())
+            {
+                var colName = colReader.GetString(0);
+                var dataType = colReader.GetString(1);
+                var nullable = colReader.GetString(2) == "Y" ? "NULL" : "NOT NULL";
+                cols.Add($"    \"{colName}\" {dataType} {nullable}");
+            }
+            await colReader.CloseAsync();
+
+            schema.AppendLine(string.Join(",\n", cols));
+            schema.AppendLine(");");
+            schema.AppendLine();
+        }
+
+        return schema.ToString();
+    }
+
+    private async Task<List<TableSchema>> GetOracleStructuredSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new OracleConnection(BuildOracleConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var tables = new List<TableSchema>();
+
+        await using var tableCmd = new OracleCommand("SELECT table_name FROM user_tables ORDER BY table_name", connection);
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0));
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            var table = new TableSchema { Name = tableName, Schema = username.ToUpperInvariant() };
+
+            // Columns
+            await using var colCmd = new OracleCommand(
+                $"SELECT column_name, data_type, nullable, data_default, char_length, data_precision, data_scale FROM user_tab_columns WHERE table_name = '{tableName}' ORDER BY column_id", connection);
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+            while (await colReader.ReadAsync())
+            {
+                table.Columns.Add(new ColumnSchema
+                {
+                    Name = colReader.GetString(0),
+                    DataType = colReader.GetString(1),
+                    IsNullable = colReader.GetString(2) == "Y",
+                    DefaultValue = colReader.IsDBNull(3) ? null : colReader.GetString(3),
+                    MaxLength = colReader.IsDBNull(4) ? null : colReader.GetInt32(4),
+                    Precision = colReader.IsDBNull(5) ? null : colReader.GetInt32(5),
+                    Scale = colReader.IsDBNull(6) ? null : colReader.GetInt32(6)
+                });
+            }
+            await colReader.CloseAsync();
+
+            // Primary keys
+            await using var pkCmd = new OracleCommand(
+                $"SELECT cols.constraint_name, cols.column_name FROM user_cons_columns cols JOIN user_constraints cons ON cols.constraint_name = cons.constraint_name WHERE cons.constraint_type = 'P' AND cons.table_name = '{tableName}' ORDER BY cols.position", connection);
+            await using var pkReader = await pkCmd.ExecuteReaderAsync();
+            var pkDict = new Dictionary<string, List<string>>();
+            while (await pkReader.ReadAsync())
+            {
+                var pkName = pkReader.GetString(0);
+                var colName = pkReader.GetString(1);
+                if (!pkDict.ContainsKey(pkName)) pkDict[pkName] = new List<string>();
+                pkDict[pkName].Add(colName);
+                var col = table.Columns.FirstOrDefault(c => c.Name == colName);
+                if (col != null) col.IsPrimaryKey = true;
+            }
+            await pkReader.CloseAsync();
+            foreach (var pk in pkDict)
+                table.PrimaryKeys.Add(new PrimaryKeyInfo { Name = pk.Key, Columns = pk.Value });
+
+            // Foreign keys
+            await using var fkCmd = new OracleCommand(
+                $@"SELECT a.constraint_name, a.column_name, c_pk.table_name, b.column_name
+                   FROM user_cons_columns a
+                   JOIN user_constraints c ON a.constraint_name = c.constraint_name
+                   JOIN user_constraints c_pk ON c.r_constraint_name = c_pk.constraint_name
+                   JOIN user_cons_columns b ON c_pk.constraint_name = b.constraint_name AND a.position = b.position
+                   WHERE c.constraint_type = 'R' AND c.table_name = '{tableName}'", connection);
+            await using var fkReader = await fkCmd.ExecuteReaderAsync();
+            while (await fkReader.ReadAsync())
+            {
+                var colName = fkReader.GetString(1);
+                table.ForeignKeys.Add(new ForeignKeyInfo
+                {
+                    Name = fkReader.GetString(0),
+                    Column = colName,
+                    ReferencedTable = fkReader.GetString(2),
+                    ReferencedColumn = fkReader.GetString(3)
+                });
+                var col = table.Columns.FirstOrDefault(c => c.Name == colName);
+                if (col != null) col.IsForeignKey = true;
+            }
+            await fkReader.CloseAsync();
+
+            // Row count
+            await using var countCmd = new OracleCommand($"SELECT num_rows FROM user_tables WHERE table_name = '{tableName}'", connection);
+            var rowCount = await countCmd.ExecuteScalarAsync();
+            table.RowCount = rowCount != null && rowCount != DBNull.Value ? Convert.ToInt64(rowCount) : null;
+
+            tables.Add(table);
+        }
+
+        return tables;
+    }
+
+    private async Task<string> ExecuteOracleQueryAsync(string host, int port, string database, string username, string password, string query)
+    {
+        await using var connection = new OracleConnection(BuildOracleConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        await using var command = new OracleCommand(query, connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        return await DataReaderToJsonAsync(reader);
+    }
+
+    private async Task<List<string>> ExecuteOracleQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
+    {
+        await using var connection = new OracleConnection(BuildOracleConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                await using var command = new OracleCommand(query, connection);
+                await using var reader = await command.ExecuteReaderAsync();
+                results.Add(await DataReaderToJsonAsync(reader));
+            }
+            catch (Exception ex)
+            {
+                results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+        return results;
+    }
+
+    #endregion
+
+    #region SQLite
+
+    private static string BuildSqliteConnectionString(string host, int port, string database, string username, string password)
+    {
+        // For SQLite, host is treated as the file path. If password is provided, use it.
+        var builder = new SqliteConnectionStringBuilder { DataSource = string.IsNullOrEmpty(host) ? database : host };
+        if (!string.IsNullOrEmpty(password)) builder.Password = password;
+        return builder.ConnectionString;
+    }
+
+    private async Task<bool> TestSqliteConnectionAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new SqliteConnection(BuildSqliteConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        return true;
+    }
+
+    private async Task<string> GetSqliteSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new SqliteConnection(BuildSqliteConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var schema = new StringBuilder();
+        schema.AppendLine("-- SQLite Database Schema");
+        schema.AppendLine();
+
+        await using var tableCmd = new SqliteCommand("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", connection);
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        while (await tableReader.ReadAsync())
+        {
+            var tableName = tableReader.GetString(0);
+            var createSql = tableReader.IsDBNull(1) ? "" : tableReader.GetString(1);
+            schema.AppendLine($"-- Table: {tableName}");
+            schema.AppendLine(createSql + ";");
+            schema.AppendLine();
+        }
+
+        return schema.ToString();
+    }
+
+    private async Task<List<TableSchema>> GetSqliteStructuredSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new SqliteConnection(BuildSqliteConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var tables = new List<TableSchema>();
+
+        await using var tableCmd = new SqliteCommand("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", connection);
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0));
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            var table = new TableSchema { Name = tableName, Schema = "main" };
+
+            await using var colCmd = new SqliteCommand($"PRAGMA table_info(\"{tableName}\")", connection);
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+            while (await colReader.ReadAsync())
+            {
+                var colName = colReader.GetString(1);
+                var isPk = colReader.GetInt32(5) > 0;
+                table.Columns.Add(new ColumnSchema
+                {
+                    Name = colName,
+                    DataType = colReader.GetString(2),
+                    IsNullable = colReader.GetInt32(3) == 0,
+                    DefaultValue = colReader.IsDBNull(4) ? null : colReader.GetString(4),
+                    IsPrimaryKey = isPk
+                });
+                if (isPk)
+                {
+                    table.PrimaryKeys.Add(new PrimaryKeyInfo { Name = "pk_" + colName, Columns = new List<string> { colName } });
+                }
+            }
+            await colReader.CloseAsync();
+
+            // Foreign keys
+            await using var fkCmd = new SqliteCommand($"PRAGMA foreign_key_list(\"{tableName}\")", connection);
+            await using var fkReader = await fkCmd.ExecuteReaderAsync();
+            while (await fkReader.ReadAsync())
+            {
+                var colName = fkReader.GetString(3);
+                table.ForeignKeys.Add(new ForeignKeyInfo
+                {
+                    Name = $"fk_{tableName}_{colName}",
+                    Column = colName,
+                    ReferencedTable = fkReader.GetString(2),
+                    ReferencedColumn = fkReader.GetString(4)
+                });
+                var col = table.Columns.FirstOrDefault(c => c.Name == colName);
+                if (col != null) col.IsForeignKey = true;
+            }
+            await fkReader.CloseAsync();
+
+            // Row count
+            await using var countCmd = new SqliteCommand($"SELECT COUNT(*) FROM \"{tableName}\"", connection);
+            var rowCount = await countCmd.ExecuteScalarAsync();
+            table.RowCount = rowCount != null ? Convert.ToInt64(rowCount) : null;
+
+            tables.Add(table);
+        }
+
+        return tables;
+    }
+
+    private async Task<string> ExecuteSqliteQueryAsync(string host, int port, string database, string username, string password, string query)
+    {
+        await using var connection = new SqliteConnection(BuildSqliteConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        await using var command = new SqliteCommand(query, connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        return await DataReaderToJsonAsync(reader);
+    }
+
+    private async Task<List<string>> ExecuteSqliteQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
+    {
+        await using var connection = new SqliteConnection(BuildSqliteConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                await using var command = new SqliteCommand(query, connection);
+                await using var reader = await command.ExecuteReaderAsync();
+                results.Add(await DataReaderToJsonAsync(reader));
+            }
+            catch (Exception ex)
+            {
+                results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+        return results;
+    }
+
+    #endregion
+
+    #region ClickHouse
+
+    private static string BuildClickHouseConnectionString(string host, int port, string database, string username, string password)
+        => $"Host={host};Port={port};Database={database};Username={username};Password={password}";
+
+    private async Task<bool> TestClickHouseConnectionAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new ClickHouseConnection(BuildClickHouseConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        return true;
+    }
+
+    private async Task<string> GetClickHouseSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new ClickHouseConnection(BuildClickHouseConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var schema = new StringBuilder();
+        schema.AppendLine("-- ClickHouse Database Schema");
+        schema.AppendLine();
+
+        await using var tableCmd = connection.CreateCommand();
+        tableCmd.CommandText = $"SELECT name FROM system.tables WHERE database = '{database}' ORDER BY name";
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0));
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            schema.AppendLine($"CREATE TABLE \"{tableName}\" (");
+            await using var colCmd = connection.CreateCommand();
+            colCmd.CommandText = $"SELECT name, type FROM system.columns WHERE database = '{database}' AND table = '{tableName}' ORDER BY position";
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+
+            var cols = new List<string>();
+            while (await colReader.ReadAsync())
+                cols.Add($"    \"{colReader.GetString(0)}\" {colReader.GetString(1)}");
+            await colReader.CloseAsync();
+
+            schema.AppendLine(string.Join(",\n", cols));
+            schema.AppendLine(");");
+            schema.AppendLine();
+        }
+
+        return schema.ToString();
+    }
+
+    private async Task<List<TableSchema>> GetClickHouseStructuredSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new ClickHouseConnection(BuildClickHouseConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var tables = new List<TableSchema>();
+
+        await using var tableCmd = connection.CreateCommand();
+        tableCmd.CommandText = $"SELECT name FROM system.tables WHERE database = '{database}' ORDER BY name";
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0));
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            var table = new TableSchema { Name = tableName, Schema = database };
+
+            await using var colCmd = connection.CreateCommand();
+            colCmd.CommandText = $"SELECT name, type, is_in_primary_key FROM system.columns WHERE database = '{database}' AND table = '{tableName}' ORDER BY position";
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+            while (await colReader.ReadAsync())
+            {
+                var typeStr = colReader.GetString(1);
+                var isPk = colReader.GetFieldValue<byte>(2) == 1;
+                var colName = colReader.GetString(0);
+                table.Columns.Add(new ColumnSchema
+                {
+                    Name = colName,
+                    DataType = typeStr,
+                    IsNullable = typeStr.StartsWith("Nullable("),
+                    IsPrimaryKey = isPk
+                });
+                if (isPk)
+                    table.PrimaryKeys.Add(new PrimaryKeyInfo { Name = "pk_" + colName, Columns = new List<string> { colName } });
+            }
+            await colReader.CloseAsync();
+
+            // Row count
+            await using var countCmd = connection.CreateCommand();
+            countCmd.CommandText = $"SELECT count() FROM \"{database}\".\"{tableName}\"";
+            var rowCount = await countCmd.ExecuteScalarAsync();
+            table.RowCount = rowCount != null ? Convert.ToInt64(rowCount) : null;
+
+            tables.Add(table);
+        }
+
+        return tables;
+    }
+
+    private async Task<string> ExecuteClickHouseQueryAsync(string host, int port, string database, string username, string password, string query)
+    {
+        await using var connection = new ClickHouseConnection(BuildClickHouseConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = query;
+        await using var reader = await command.ExecuteReaderAsync();
+        return await DataReaderToJsonAsync(reader);
+    }
+
+    private async Task<List<string>> ExecuteClickHouseQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
+    {
+        await using var connection = new ClickHouseConnection(BuildClickHouseConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                await using var command = connection.CreateCommand();
+                command.CommandText = query;
+                await using var reader = await command.ExecuteReaderAsync();
+                results.Add(await DataReaderToJsonAsync(reader));
+            }
+            catch (Exception ex)
+            {
+                results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+        return results;
+    }
+
+    #endregion
+
+    #region Firebird
+
+    private static string BuildFirebirdConnectionString(string host, int port, string database, string username, string password)
+        => $"Server={host};Port={port};Database={database};User={username};Password={password};Connection Timeout=30";
+
+    private async Task<bool> TestFirebirdConnectionAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new FbConnection(BuildFirebirdConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        return true;
+    }
+
+    private async Task<string> GetFirebirdSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new FbConnection(BuildFirebirdConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var schema = new StringBuilder();
+        schema.AppendLine("-- Firebird Database Schema");
+        schema.AppendLine();
+
+        await using var tableCmd = new FbCommand(
+            "SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0 AND RDB$VIEW_BLR IS NULL ORDER BY RDB$RELATION_NAME", connection);
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0).Trim());
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            schema.AppendLine($"CREATE TABLE \"{tableName}\" (");
+            await using var colCmd = new FbCommand(
+                $@"SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, rf.RDB$NULL_FLAG
+                   FROM RDB$RELATION_FIELDS rf
+                   JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                   WHERE rf.RDB$RELATION_NAME = '{tableName}'
+                   ORDER BY rf.RDB$FIELD_POSITION", connection);
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+
+            var cols = new List<string>();
+            while (await colReader.ReadAsync())
+            {
+                var colName = colReader.GetString(0).Trim();
+                var dataType = MapFirebirdType(colReader.GetInt16(1));
+                var nullable = colReader.IsDBNull(2) ? "NULL" : "NOT NULL";
+                cols.Add($"    \"{colName}\" {dataType} {nullable}");
+            }
+            await colReader.CloseAsync();
+
+            schema.AppendLine(string.Join(",\n", cols));
+            schema.AppendLine(");");
+            schema.AppendLine();
+        }
+
+        return schema.ToString();
+    }
+
+    private static string MapFirebirdType(short typeCode) => typeCode switch
+    {
+        7 => "SMALLINT", 8 => "INTEGER", 10 => "FLOAT", 12 => "DATE", 13 => "TIME",
+        14 => "CHAR", 16 => "BIGINT", 27 => "DOUBLE PRECISION", 35 => "TIMESTAMP",
+        37 => "VARCHAR", 261 => "BLOB", _ => $"TYPE_{typeCode}"
+    };
+
+    private async Task<List<TableSchema>> GetFirebirdStructuredSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new FbConnection(BuildFirebirdConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var tables = new List<TableSchema>();
+
+        await using var tableCmd = new FbCommand(
+            "SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0 AND RDB$VIEW_BLR IS NULL ORDER BY RDB$RELATION_NAME", connection);
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0).Trim());
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            var table = new TableSchema { Name = tableName, Schema = "DEFAULT" };
+
+            await using var colCmd = new FbCommand(
+                $@"SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, rf.RDB$NULL_FLAG, f.RDB$FIELD_LENGTH, f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE
+                   FROM RDB$RELATION_FIELDS rf
+                   JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
+                   WHERE rf.RDB$RELATION_NAME = '{tableName}'
+                   ORDER BY rf.RDB$FIELD_POSITION", connection);
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+            while (await colReader.ReadAsync())
+            {
+                table.Columns.Add(new ColumnSchema
+                {
+                    Name = colReader.GetString(0).Trim(),
+                    DataType = MapFirebirdType(colReader.GetInt16(1)),
+                    IsNullable = colReader.IsDBNull(2),
+                    MaxLength = colReader.IsDBNull(3) ? null : colReader.GetInt32(3),
+                    Precision = colReader.IsDBNull(4) ? null : colReader.GetInt32(4),
+                    Scale = colReader.IsDBNull(5) ? null : Math.Abs(colReader.GetInt32(5))
+                });
+            }
+            await colReader.CloseAsync();
+
+            tables.Add(table);
+        }
+
+        return tables;
+    }
+
+    private async Task<string> ExecuteFirebirdQueryAsync(string host, int port, string database, string username, string password, string query)
+    {
+        await using var connection = new FbConnection(BuildFirebirdConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        await using var command = new FbCommand(query, connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        return await DataReaderToJsonAsync(reader);
+    }
+
+    private async Task<List<string>> ExecuteFirebirdQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
+    {
+        await using var connection = new FbConnection(BuildFirebirdConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                await using var command = new FbCommand(query, connection);
+                await using var reader = await command.ExecuteReaderAsync();
+                results.Add(await DataReaderToJsonAsync(reader));
+            }
+            catch (Exception ex)
+            {
+                results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+        return results;
+    }
+
+    #endregion
+
+    #region DuckDB
+
+    private static string BuildDuckDbConnectionString(string host, int port, string database, string username, string password)
+    {
+        // DuckDB uses file path as the data source. Host is treated as file path.
+        var path = string.IsNullOrEmpty(host) ? database : host;
+        return $"Data Source={path}";
+    }
+
+    private async Task<bool> TestDuckDbConnectionAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new DuckDBConnection(BuildDuckDbConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        return true;
+    }
+
+    private async Task<string> GetDuckDbSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new DuckDBConnection(BuildDuckDbConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var schema = new StringBuilder();
+        schema.AppendLine("-- DuckDB Database Schema");
+        schema.AppendLine();
+
+        await using var tableCmd = new DuckDBCommand("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name", connection);
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0));
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            schema.AppendLine($"CREATE TABLE \"{tableName}\" (");
+            await using var colCmd = new DuckDBCommand(
+                $"SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'main' AND table_name = '{tableName}' ORDER BY ordinal_position", connection);
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+
+            var cols = new List<string>();
+            while (await colReader.ReadAsync())
+            {
+                var colName = colReader.GetString(0);
+                var dataType = colReader.GetString(1);
+                var nullable = colReader.GetString(2) == "YES" ? "NULL" : "NOT NULL";
+                cols.Add($"    \"{colName}\" {dataType} {nullable}");
+            }
+            await colReader.CloseAsync();
+
+            schema.AppendLine(string.Join(",\n", cols));
+            schema.AppendLine(");");
+            schema.AppendLine();
+        }
+
+        return schema.ToString();
+    }
+
+    private async Task<List<TableSchema>> GetDuckDbStructuredSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new DuckDBConnection(BuildDuckDbConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var tables = new List<TableSchema>();
+
+        await using var tableCmd = new DuckDBCommand("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name", connection);
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0));
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            var table = new TableSchema { Name = tableName, Schema = "main" };
+
+            await using var colCmd = new DuckDBCommand(
+                $"SELECT column_name, data_type, is_nullable, column_default, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_schema = 'main' AND table_name = '{tableName}' ORDER BY ordinal_position", connection);
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+            while (await colReader.ReadAsync())
+            {
+                table.Columns.Add(new ColumnSchema
+                {
+                    Name = colReader.GetString(0),
+                    DataType = colReader.GetString(1),
+                    IsNullable = colReader.GetString(2) == "YES",
+                    DefaultValue = colReader.IsDBNull(3) ? null : colReader.GetString(3),
+                    Precision = colReader.IsDBNull(4) ? null : colReader.GetInt32(4),
+                    Scale = colReader.IsDBNull(5) ? null : colReader.GetInt32(5)
+                });
+            }
+            await colReader.CloseAsync();
+
+            // Row count
+            await using var countCmd = new DuckDBCommand($"SELECT COUNT(*) FROM \"{tableName}\"", connection);
+            var rowCount = await countCmd.ExecuteScalarAsync();
+            table.RowCount = rowCount != null ? Convert.ToInt64(rowCount) : null;
+
+            tables.Add(table);
+        }
+
+        return tables;
+    }
+
+    private async Task<string> ExecuteDuckDbQueryAsync(string host, int port, string database, string username, string password, string query)
+    {
+        await using var connection = new DuckDBConnection(BuildDuckDbConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+        await using var command = new DuckDBCommand(query, connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        return await DataReaderToJsonAsync(reader);
+    }
+
+    private async Task<List<string>> ExecuteDuckDbQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
+    {
+        await using var connection = new DuckDBConnection(BuildDuckDbConnectionString(host, port, database, username, password));
+        await connection.OpenAsync();
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                await using var command = new DuckDBCommand(query, connection);
+                await using var reader = await command.ExecuteReaderAsync();
+                results.Add(await DataReaderToJsonAsync(reader));
+            }
+            catch (Exception ex)
+            {
+                results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+        return results;
+    }
+
+    #endregion
+
+    #region Snowflake
+
+    private static string BuildSnowflakeConnectionString(string host, int port, string database, string username, string password)
+        => $"account={host};user={username};password={password};db={database};scheme=https;port={port}";
+
+    private async Task<bool> TestSnowflakeConnectionAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new SnowflakeDbConnection { ConnectionString = BuildSnowflakeConnectionString(host, port, database, username, password) };
+        await connection.OpenAsync();
+        return true;
+    }
+
+    private async Task<string> GetSnowflakeSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new SnowflakeDbConnection { ConnectionString = BuildSnowflakeConnectionString(host, port, database, username, password) };
+        await connection.OpenAsync();
+
+        var schema = new StringBuilder();
+        schema.AppendLine("-- Snowflake Database Schema");
+        schema.AppendLine();
+
+        var tableCmd = connection.CreateCommand();
+        tableCmd.CommandText = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'PUBLIC' AND table_type = 'BASE TABLE' ORDER BY table_name";
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0));
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            schema.AppendLine($"CREATE TABLE \"{tableName}\" (");
+            var colCmd = connection.CreateCommand();
+            colCmd.CommandText = $"SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'PUBLIC' AND table_name = '{tableName}' ORDER BY ordinal_position";
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+
+            var cols = new List<string>();
+            while (await colReader.ReadAsync())
+            {
+                var colName = colReader.GetString(0);
+                var dataType = colReader.GetString(1);
+                var nullable = colReader.GetString(2) == "YES" ? "NULL" : "NOT NULL";
+                cols.Add($"    \"{colName}\" {dataType} {nullable}");
+            }
+            await colReader.CloseAsync();
+
+            schema.AppendLine(string.Join(",\n", cols));
+            schema.AppendLine(");");
+            schema.AppendLine();
+        }
+
+        return schema.ToString();
+    }
+
+    private async Task<List<TableSchema>> GetSnowflakeStructuredSchemaAsync(string host, int port, string database, string username, string password)
+    {
+        await using var connection = new SnowflakeDbConnection { ConnectionString = BuildSnowflakeConnectionString(host, port, database, username, password) };
+        await connection.OpenAsync();
+
+        var tables = new List<TableSchema>();
+
+        var tableCmd = connection.CreateCommand();
+        tableCmd.CommandText = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'PUBLIC' AND table_type = 'BASE TABLE' ORDER BY table_name";
+        await using var tableReader = await tableCmd.ExecuteReaderAsync();
+
+        var tableNames = new List<string>();
+        while (await tableReader.ReadAsync()) tableNames.Add(tableReader.GetString(0));
+        await tableReader.CloseAsync();
+
+        foreach (var tableName in tableNames)
+        {
+            var table = new TableSchema { Name = tableName, Schema = "PUBLIC" };
+
+            var colCmd = connection.CreateCommand();
+            colCmd.CommandText = $"SELECT column_name, data_type, is_nullable, column_default, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_schema = 'PUBLIC' AND table_name = '{tableName}' ORDER BY ordinal_position";
+            await using var colReader = await colCmd.ExecuteReaderAsync();
+            while (await colReader.ReadAsync())
+            {
+                table.Columns.Add(new ColumnSchema
+                {
+                    Name = colReader.GetString(0),
+                    DataType = colReader.GetString(1),
+                    IsNullable = colReader.GetString(2) == "YES",
+                    DefaultValue = colReader.IsDBNull(3) ? null : colReader.GetString(3),
+                    Precision = colReader.IsDBNull(4) ? null : colReader.GetInt32(4),
+                    Scale = colReader.IsDBNull(5) ? null : colReader.GetInt32(5)
+                });
+            }
+            await colReader.CloseAsync();
+
+            // Row count
+            var countCmd = connection.CreateCommand();
+            countCmd.CommandText = $"SELECT row_count FROM information_schema.tables WHERE table_schema = 'PUBLIC' AND table_name = '{tableName}'";
+            var rowCount = await countCmd.ExecuteScalarAsync();
+            table.RowCount = rowCount != null && rowCount != DBNull.Value ? Convert.ToInt64(rowCount) : null;
+
+            tables.Add(table);
+        }
+
+        return tables;
+    }
+
+    private async Task<string> ExecuteSnowflakeQueryAsync(string host, int port, string database, string username, string password, string query)
+    {
+        await using var connection = new SnowflakeDbConnection { ConnectionString = BuildSnowflakeConnectionString(host, port, database, username, password) };
+        await connection.OpenAsync();
+        var command = connection.CreateCommand();
+        command.CommandText = query;
+        await using var reader = await command.ExecuteReaderAsync();
+        return await DataReaderToJsonAsync(reader);
+    }
+
+    private async Task<List<string>> ExecuteSnowflakeQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
+    {
+        await using var connection = new SnowflakeDbConnection { ConnectionString = BuildSnowflakeConnectionString(host, port, database, username, password) };
+        await connection.OpenAsync();
+
+        var results = new List<string>();
+        foreach (var query in queries)
+        {
+            try
+            {
+                var command = connection.CreateCommand();
+                command.CommandText = query;
+                await using var reader = await command.ExecuteReaderAsync();
+                results.Add(await DataReaderToJsonAsync(reader));
+            }
+            catch (Exception ex)
+            {
+                results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+        }
+        return results;
     }
 
     #endregion
