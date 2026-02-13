@@ -209,33 +209,65 @@ public class ChatService : IChatService
             {
                 sqlQuery = string.Join("\n\n-- Next Query --\n\n", sqlQueries);
 
-                try
+                // Try executing with auto-retry on failure
+                const int maxRetries = 2;
+                for (var attempt = 0; attempt <= maxRetries; attempt++)
                 {
-                    if (sqlQueries.Count == 1)
+                    try
                     {
-                        queryResult = await _databaseQueryService.ExecuteQueryAsync(
-                            dbConnection.DatabaseType, dbHost!, dbPort, dbDatabase!, dbUsername!, dbPassword!, sqlQueries[0]);
-                    }
-                    else
-                    {
-                        // Single connection, all queries — no repeated TCP handshakes
-                        var results = await _databaseQueryService.ExecuteQueriesAsync(
-                            dbConnection.DatabaseType, dbHost!, dbPort, dbDatabase!, dbUsername!, dbPassword!, sqlQueries);
-                        var allResults = new List<object>();
-                        foreach (var result in results)
+                        if (sqlQueries.Count == 1)
                         {
-                            if (!string.IsNullOrEmpty(result))
+                            queryResult = await _databaseQueryService.ExecuteQueryAsync(
+                                dbConnection.DatabaseType, dbHost!, dbPort, dbDatabase!, dbUsername!, dbPassword!, sqlQueries[0]);
+                        }
+                        else
+                        {
+                            var results = await _databaseQueryService.ExecuteQueriesAsync(
+                                dbConnection.DatabaseType, dbHost!, dbPort, dbDatabase!, dbUsername!, dbPassword!, sqlQueries);
+                            var allResults = new List<object>();
+                            foreach (var result in results)
                             {
-                                var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
-                                allResults.Add(parsed!);
+                                if (!string.IsNullOrEmpty(result))
+                                {
+                                    var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
+                                    allResults.Add(parsed!);
+                                }
+                            }
+                            queryResult = System.Text.Json.JsonSerializer.Serialize(new { tables = allResults });
+                        }
+                        break; // Success — exit retry loop
+                    }
+                    catch (Exception ex)
+                    {
+                        if (attempt < maxRetries)
+                        {
+                            // Ask AI to fix the SQL
+                            var failedSql = string.Join("\n\n", sqlQueries);
+                            var retryPrompt = BuildSqlRetryPrompt(failedSql, ex.Message, schemaContext, dbConnection.DatabaseType);
+                            var (retryResponse, retryTokens) = await _ollamaService.ChatAsync(
+                                $"Fix this SQL error: {ex.Message}", new List<(string role, string content)>(), retryPrompt);
+                            tokensUsed += retryTokens;
+
+                            var retrySqlQueries = ExtractAllSqlFromResponse(retryResponse);
+                            if (retrySqlQueries.Count > 0)
+                            {
+                                sqlQueries = retrySqlQueries;
+                                sqlQuery = string.Join("\n\n-- Next Query --\n\n", sqlQueries);
+                                // Also update the AI response so viz hints and cleaned content use the retry
+                                aiResponse = retryResponse;
+                            }
+                            else
+                            {
+                                // AI didn't return SQL in retry — give up
+                                queryResult = $"Error executing query: {ex.Message}";
+                                break;
                             }
                         }
-                        queryResult = System.Text.Json.JsonSerializer.Serialize(new { tables = allResults });
+                        else
+                        {
+                            queryResult = $"Error executing query: {ex.Message}";
+                        }
                     }
-                }
-                catch (Exception ex)
-                {
-                    queryResult = $"Error executing query: {ex.Message}";
                 }
             }
             else
@@ -252,33 +284,63 @@ public class ChatService : IChatService
             {
                 sqlQuery = string.Join("\n\n-- Next Query --\n\n", sqlQueries);
 
-                try
+                // Try executing with auto-retry on failure
+                const int maxRetries = 2;
+                for (var attempt = 0; attempt <= maxRetries; attempt++)
                 {
-                    if (sqlQueries.Count == 1)
+                    try
                     {
-                        queryResult = await _fileQueryService.ExecuteQueryAsync(
-                            fileDocument.ParsedContent, fileDocument.SchemaInfo, sqlQueries[0]);
-                    }
-                    else
-                    {
-                        // Load data once, run all queries on same SQLite connection
-                        var results = await _fileQueryService.ExecuteQueriesAsync(
-                            fileDocument.ParsedContent, fileDocument.SchemaInfo, sqlQueries);
-                        var allResults = new List<object>();
-                        foreach (var result in results)
+                        if (sqlQueries.Count == 1)
                         {
-                            if (!string.IsNullOrEmpty(result))
+                            queryResult = await _fileQueryService.ExecuteQueryAsync(
+                                fileDocument.ParsedContent, fileDocument.SchemaInfo, sqlQueries[0]);
+                        }
+                        else
+                        {
+                            var results = await _fileQueryService.ExecuteQueriesAsync(
+                                fileDocument.ParsedContent, fileDocument.SchemaInfo, sqlQueries);
+                            var allResults = new List<object>();
+                            foreach (var result in results)
                             {
-                                var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
-                                allResults.Add(parsed!);
+                                if (!string.IsNullOrEmpty(result))
+                                {
+                                    var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
+                                    allResults.Add(parsed!);
+                                }
+                            }
+                            queryResult = System.Text.Json.JsonSerializer.Serialize(new { tables = allResults });
+                        }
+                        break; // Success — exit retry loop
+                    }
+                    catch (Exception ex)
+                    {
+                        if (attempt < maxRetries)
+                        {
+                            // Ask AI to fix the SQL
+                            var failedSql = string.Join("\n\n", sqlQueries);
+                            var retryPrompt = BuildSqlRetryPrompt(failedSql, ex.Message, schemaContext, null, true);
+                            var (retryResponse, retryTokens) = await _ollamaService.ChatAsync(
+                                $"Fix this SQL error: {ex.Message}", new List<(string role, string content)>(), retryPrompt);
+                            tokensUsed += retryTokens;
+
+                            var retrySqlQueries = ExtractAllSqlFromResponse(retryResponse);
+                            if (retrySqlQueries.Count > 0)
+                            {
+                                sqlQueries = retrySqlQueries;
+                                sqlQuery = string.Join("\n\n-- Next Query --\n\n", sqlQueries);
+                                aiResponse = retryResponse;
+                            }
+                            else
+                            {
+                                queryResult = $"Error executing query: {ex.Message}";
+                                break;
                             }
                         }
-                        queryResult = System.Text.Json.JsonSerializer.Serialize(new { tables = allResults });
+                        else
+                        {
+                            queryResult = $"Error executing query: {ex.Message}";
+                        }
                     }
-                }
-                catch (Exception ex)
-                {
-                    queryResult = $"Error executing query: {ex.Message}";
                 }
             }
             else
@@ -372,6 +434,28 @@ public class ChatService : IChatService
             _ => "NOW(), CURRENT_DATE"
         };
 
+        var dialectNotes = dbType switch
+        {
+            DatabaseType.PostgreSQL => @"
+PostgreSQL-specific rules (CRITICAL — violating these causes runtime errors):
+- ROUND(double precision, N) does NOT exist. You MUST cast to numeric first: ROUND(value::numeric, N). This applies to ANY expression with floating point results (divisions, AVG, PERCENT_RANK, etc.).
+- String concatenation uses || operator, not CONCAT (though CONCAT also works).
+- Boolean values: use TRUE/FALSE, not 1/0.
+- ILIKE for case-insensitive LIKE.",
+            DatabaseType.MySQL => @"
+MySQL-specific rules:
+- Use ROUND(value, N) directly — works on all numeric types.
+- Use IFNULL() instead of COALESCE if only 2 args.
+- String comparison is case-insensitive by default.",
+            DatabaseType.SQLServer => @"
+SQL Server-specific rules:
+- Use ROUND(value, N) directly — works on all numeric types.
+- Use TOP N instead of LIMIT N: SELECT TOP 20 ... ORDER BY ...
+- Use ISNULL() or COALESCE() for null handling.
+- No BOOLEAN type — use BIT (1/0).",
+            _ => ""
+        };
+
         var prompt = $@"You are Erao, an expert data analyst who thinks critically about data. The user's {dialect} database is connected.
 
 IMPORTANT: You can ONLY answer questions about the data in this specific connected database. You cannot access external systems, APIs, or anything outside this database's schema.
@@ -463,6 +547,7 @@ SQL rules:
 - SELECT only. JOIN to resolve IDs into readable names.
 - COALESCE on aggregations to avoid NULL. Clean, descriptive column aliases (""Total Revenue"" not ""rev"").
 - Use {dateFunc} for relative dates — never hardcode years.
+{dialectNotes}
 - You never see query results — the system executes SQL after your response and shows a table to the user.
 - Think smart: ""revenue"" might mean SUM on amount/price/total. ""my""/""our"" means all data.
 - Use CTEs (WITH ... AS) for complex queries with derived scores, rankings, or multi-step calculations.
@@ -504,6 +589,71 @@ Use EXACT names, properly quoted. Never invent tables or columns.
             prompt += @"
 
 No schema available. Tell the user to connect a database first.";
+        }
+
+        return prompt;
+    }
+
+    private static string BuildSqlRetryPrompt(string failedSql, string errorMessage, string? schemaContext, DatabaseType? dbType, bool isFile = false)
+    {
+        var dialect = isFile ? "SQLite" : dbType switch
+        {
+            DatabaseType.PostgreSQL => "PostgreSQL",
+            DatabaseType.MySQL => "MySQL",
+            DatabaseType.SQLServer => "SQL Server",
+            _ => "PostgreSQL"
+        };
+
+        var prompt = $@"You are a SQL expert. A {dialect} query failed with an error. Fix the SQL and return ONLY the corrected query in a ```sql code block. No explanation needed.
+
+FAILED SQL:
+```sql
+{failedSql}
+```
+
+ERROR:
+{errorMessage}
+
+RULES:
+- Return ONLY the fixed SQL in a ```sql code block.
+- Keep the same intent/logic — just fix the syntax or dialect issue.
+- SELECT queries only.
+- Also include the original ```viz block if the query had visualization intent.";
+
+        if (isFile)
+        {
+            prompt += @"
+- SQLite dialect. Table is ""data"". Double-quote all identifiers.";
+        }
+        else
+        {
+            var dialectHints = dbType switch
+            {
+                DatabaseType.PostgreSQL => @"
+- PostgreSQL: ROUND() requires numeric type — use ROUND(value::numeric, N).
+- Use double-quote identifiers: ""TableName"".
+- ILIKE for case-insensitive matching.
+- Boolean: TRUE/FALSE not 1/0.
+- String concat: || operator.",
+                DatabaseType.MySQL => @"
+- MySQL: backtick identifiers: `TableName`.
+- ROUND(value, N) works directly.
+- IFNULL() for 2-arg null handling.",
+                DatabaseType.SQLServer => @"
+- SQL Server: bracket identifiers: [TableName].
+- TOP N instead of LIMIT N.
+- BIT type instead of BOOLEAN.",
+                _ => ""
+            };
+            prompt += dialectHints;
+        }
+
+        if (!string.IsNullOrEmpty(schemaContext))
+        {
+            prompt += $@"
+
+SCHEMA:
+{schemaContext}";
         }
 
         return prompt;
