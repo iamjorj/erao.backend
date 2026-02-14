@@ -363,9 +363,13 @@ public class AuthService : IAuthService
             };
             payload = await GoogleJsonWebSignature.ValidateAsync(idToken, settings);
         }
-        catch (InvalidJwtException)
+        catch (InvalidJwtException ex)
         {
-            throw new UnauthorizedAccessException("Invalid Google token");
+            throw new UnauthorizedAccessException($"Invalid Google token: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            throw new UnauthorizedAccessException($"Google token validation failed: {ex.Message}");
         }
 
         var email = payload.Email.ToLower();
