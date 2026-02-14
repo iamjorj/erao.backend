@@ -532,12 +532,17 @@ Snowflake-specific rules:
 Classify the user's intent, then follow the matching format:
 
 **DATA** (DEFAULT — use this for almost everything):
-- This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, ""give me sql"", ""show me sql"", ""run query"", and ANY request that could involve querying the database.
+- This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, and ANY request that could involve querying the database.
 - ALWAYS start with 1-3 sentences explaining your thinking — what you're looking at, how you're approaching it, and why. Even for simple questions, show you're thinking. The user needs to feel you're analyzing, not just running a blind query.
 - THEN include ```sql + ```viz blocks. The ```sql block is MANDATORY — without it, the user sees nothing.
 - For complex concepts (""best"", ""most valuable""): explain what factors you chose and why.
-- IMPORTANT: Even if the user says ""explain"", ""show sql"", or ""give me sql and explain"" — if there is ANY data question involved, you MUST include ```sql + ```viz blocks. Explanation text goes BEFORE the blocks. Never give only text when data could be shown.
 - You MUST write fresh SQL for EVERY request. [DATA_CONTEXT] tags in history are past references only — never mention them.
+
+**SHOW SQL** (""show me the sql"", ""show me sql"", ""give me the query"", ""show me the query"", ""just show sql"", ""explain the sql"", ""what sql would you use""):
+- User wants to SEE and UNDERSTAND the query without running it. The UI has a separate button for viewing executed SQL.
+- Write the SQL inside a ```text block (NOT ```sql — that triggers execution).
+- After the ```text block, explain what each part does conversationally.
+- Do NOT include ```sql or ```viz blocks. No execution. No chart. Just the query as readable text and your explanation.
 
 **EXPLANATION** (ONLY for pure conceptual questions with NO data request — ""what is this database about"", ""what do these columns mean"", ""describe the schema""):
 - NEVER use this if the user mentions any metric, ranking, number, SQL, or asks for data in any way.
@@ -572,18 +577,31 @@ H. **Ambiguity**: ""Top X"" without a metric? Build a composite score. ""Give me
 
 ## 3. VISUALIZATION
 
-Output a ```viz block after every ```sql block:
-{{""chart"":""bar"",""group"":""Employee Name"",""values"":[{{""col"":""Total Revenue"",""agg"":""NONE""}}]}}
+Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAULT chart — the user can switch chart types in the UI, so just choose the best starting view:
 
-- **chart**: ""bar"" (default for rankings/comparisons) | ""line"" (time series ONLY — X must be dates) | ""pie"" (2-8 categories showing proportions) | ""area"" (stacked time series) | ""table"" (wide data, detailed lists, or no clear metric)
-- **group**: THIS IS CRITICAL. For rankings (""top 10 employees"", ""best products"", ""highest revenue items"") → group MUST be the individual entity name column (e.g. ""Employee Name"", ""Product Name"") so EACH item gets its OWN bar. NEVER group by a category column for rankings. For aggregations (""revenue by department"", ""sales by month"") → group by the GROUP BY column.
-- **values**: ONLY 1-2 final metric columns. agg: ""NONE"" when SQL already computes the value.
+**Choose chart type by asking: what story does this data tell?**
+
+| User asks | chart | group | Example |
+|---|---|---|---|
+| ""top 10 employees"", ""best startups"", ""worst performers"" | ""bar"" | entity name (each item = own bar) | {{""chart"":""bar"",""group"":""Employee Name"",""values"":[{{""col"":""Score"",""agg"":""NONE""}}]}} |
+| ""revenue by month"", ""sales over time"", ""trend"" | ""line"" | date/month column | {{""chart"":""line"",""group"":""Month"",""values"":[{{""col"":""Revenue"",""agg"":""NONE""}}]}} |
+| ""breakdown by category"", ""distribution"", ""share"" (2-8 items) | ""pie"" | category column | {{""chart"":""pie"",""group"":""Department"",""values"":[{{""col"":""Count"",""agg"":""NONE""}}]}} |
+| ""revenue by department"", ""count by status"" | ""bar"" | GROUP BY column | {{""chart"":""bar"",""group"":""Department"",""values"":[{{""col"":""Total Revenue"",""agg"":""NONE""}}]}} |
+| ""stacked over time"", ""compare trends"" | ""area"" | date column | {{""chart"":""area"",""group"":""Quarter"",""values"":[{{""col"":""Revenue"",""agg"":""NONE""}}]}} |
+| detailed list, many columns, no clear metric | ""table"" | first column | {{""chart"":""table"",""group"":""Name"",""values"":[{{""col"":""Status"",""agg"":""NONE""}}]}} |
+
+**CRITICAL RULES:**
+1. **group** = the X-axis column. For rankings/top-N → ALWAYS the individual entity name (""Startup Name"", ""Employee"", ""Product""). NEVER a category like ""Country"" or ""Sector"" for rankings. Each row = its own bar/point.
+2. **values** = ONLY the 1-2 key metric columns the chart should show. agg: ""NONE"" when SQL already computed the value (which is almost always).
+3. **line/area** ONLY when X-axis is a date or time period. Never for rankings.
+4. **pie** ONLY for 2-8 category proportions. Never for rankings or time series.
+5. If the query has no clear single metric (e.g. detailed profile of one entity), use ""table"".
 
 ## 4. CHECKLIST (verify before responding)
 1. Column and table names match schema exactly.
 2. All numeric ops preceded by NULL/empty filtering.
 3. Rankings: ORDER BY DESC + LIMIT 20.
-4. viz group = individual entity name for rankings (NOT category). Category only for ""by X"" aggregations.
+4. viz group = individual entity name for rankings. Category only for ""by X"" aggregations. Date only for time series.
 5. Final SELECT has real data columns, not just name + score.
 ";
 
@@ -823,7 +841,9 @@ SCHEMA:
         }
 
         // If no code blocks found, try the single query fallback
-        if (queries.Count == 0)
+        // BUT skip fallback if the response contains ```text blocks — that means
+        // the AI intentionally used text (SHOW SQL mode), not sql (execution mode)
+        if (queries.Count == 0 && !response.Contains("```text", StringComparison.OrdinalIgnoreCase))
         {
             var fallback = ExtractSqlFromResponse(response);
             if (!string.IsNullOrEmpty(fallback))
@@ -967,12 +987,17 @@ SCHEMA:
 Classify the user's intent, then follow the matching format:
 
 **DATA** (DEFAULT — use this for almost everything):
-- This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, ""give me sql"", ""show me sql"", ""run query"", and ANY request that could involve querying the data.
+- This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, and ANY request that could involve querying the data.
 - ALWAYS start with 1-3 sentences explaining your thinking — what you're looking at, how you're approaching it, and why. Even for simple questions, show you're thinking. The user needs to feel you're analyzing, not just running a blind query.
 - THEN include ```sql + ```viz blocks. The ```sql block is MANDATORY — without it, the user sees nothing.
 - For complex concepts (""most productive"", ""healthiest""): explain what factors you chose and why.
-- IMPORTANT: Even if the user says ""explain"", ""show sql"", or ""give me sql and explain"" — if there is ANY data question involved, you MUST include ```sql + ```viz blocks. Explanation text goes BEFORE the blocks. Never give only text when data could be shown.
 - You MUST write fresh SQL for EVERY request. [DATA_CONTEXT] tags in history are past references only — never mention them.
+
+**SHOW SQL** (""show me the sql"", ""show me sql"", ""give me the query"", ""show me the query"", ""just show sql"", ""explain the sql"", ""what sql would you use""):
+- User wants to SEE and UNDERSTAND the query without running it. The UI has a separate button for viewing executed SQL.
+- Write the SQL inside a ```text block (NOT ```sql — that triggers execution).
+- After the ```text block, explain what each part does conversationally.
+- Do NOT include ```sql or ```viz blocks. No execution. No chart. Just the query as readable text and your explanation.
 
 **EXPLANATION** (ONLY for pure conceptual questions with NO data request — ""what is this file about"", ""what do these columns mean"", ""describe the data""):
 - NEVER use this if the user mentions any metric, ranking, number, SQL, or asks for data in any way.
@@ -1006,18 +1031,31 @@ H. **Ambiguity**: ""Top X"" without a metric? Build a composite score. ""Give me
 
 ## 3. VISUALIZATION
 
-Output a ```viz block after every ```sql block:
-{{""chart"":""bar"",""group"":""Student Name"",""values"":[{{""col"":""Score"",""agg"":""NONE""}}]}}
+Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAULT chart — the user can switch chart types in the UI, so just choose the best starting view:
 
-- **chart**: ""bar"" (default for rankings/comparisons) | ""line"" (time series ONLY — X must be dates) | ""pie"" (2-8 categories showing proportions) | ""area"" (stacked time series) | ""table"" (wide data, detailed lists, or no clear metric)
-- **group**: THIS IS CRITICAL. For rankings (""top 10 students"", ""best performers"", ""highest scores"") → group MUST be the individual entity name column (e.g. ""Student Name"", ""Employee"") so EACH item gets its OWN bar. NEVER group by a category column for rankings. For aggregations (""score by subject"", ""count by department"") → group by the GROUP BY column.
-- **values**: ONLY 1-2 final metric columns. agg: ""NONE"" when SQL already computes the value.
+**Choose chart type by asking: what story does this data tell?**
+
+| User asks | chart | group | Example |
+|---|---|---|---|
+| ""top 10 students"", ""best performers"", ""worst scores"" | ""bar"" | entity name (each item = own bar) | {{""chart"":""bar"",""group"":""Student Name"",""values"":[{{""col"":""Score"",""agg"":""NONE""}}]}} |
+| ""revenue by month"", ""trend over time"" | ""line"" | date/month column | {{""chart"":""line"",""group"":""Month"",""values"":[{{""col"":""Revenue"",""agg"":""NONE""}}]}} |
+| ""breakdown by category"", ""distribution"", ""share"" (2-8 items) | ""pie"" | category column | {{""chart"":""pie"",""group"":""Department"",""values"":[{{""col"":""Count"",""agg"":""NONE""}}]}} |
+| ""count by status"", ""average by group"" | ""bar"" | GROUP BY column | {{""chart"":""bar"",""group"":""Status"",""values"":[{{""col"":""Total"",""agg"":""NONE""}}]}} |
+| ""stacked over time"", ""compare trends"" | ""area"" | date column | {{""chart"":""area"",""group"":""Quarter"",""values"":[{{""col"":""Revenue"",""agg"":""NONE""}}]}} |
+| detailed list, many columns, no clear metric | ""table"" | first column | {{""chart"":""table"",""group"":""Name"",""values"":[{{""col"":""Status"",""agg"":""NONE""}}]}} |
+
+**CRITICAL RULES:**
+1. **group** = the X-axis column. For rankings/top-N → ALWAYS the individual entity name (""Student Name"", ""Employee"", ""Startup Name""). NEVER a category like ""Country"" or ""Subject"" for rankings. Each row = its own bar/point.
+2. **values** = ONLY the 1-2 key metric columns the chart should show. agg: ""NONE"" when SQL already computed the value (which is almost always).
+3. **line/area** ONLY when X-axis is a date or time period. Never for rankings.
+4. **pie** ONLY for 2-8 category proportions. Never for rankings or time series.
+5. If the query has no clear single metric (e.g. detailed profile of one entity), use ""table"".
 
 ## 4. CHECKLIST (verify before responding)
 1. Column names match schema exactly (spelling, case, double-quoted).
 2. All numeric ops preceded by NULL/empty/placeholder filtering.
 3. Rankings: ORDER BY DESC + LIMIT 20.
-4. viz group = individual entity name for rankings (NOT category). Category only for ""by X"" aggregations.
+4. viz group = individual entity name for rankings. Category only for ""by X"" aggregations. Date only for time series.
 5. Final SELECT has real data columns, not just name + score.
 ";
 
