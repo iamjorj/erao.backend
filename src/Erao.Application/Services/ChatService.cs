@@ -578,7 +578,8 @@ Build a multi-column composite score. Adapt ALL names from the actual schema —
 
 WITH clean AS (
   SELECT *,
-    -- Text columns storing numbers:
+    -- Text columns storing numbers: 1) remove commas 2) remove dollar signs 3) CAST
+    -- Pattern: CAST(REPLACE(REPLACE(col, ',', ''), '$', '') AS NUMERIC)
     CASE WHEN <col> IS NOT NULL AND <col> NOT IN ('N/A','','-','null','Not Mentioned')
          THEN CAST(REPLACE(REPLACE(<col>, ',', ''), '$', '') AS NUMERIC) ELSE NULL END AS <x>_num,
     -- Yes/no text columns:
@@ -1067,7 +1068,9 @@ Build a multi-column composite score. All file columns are stored as text — pa
 WITH clean AS (
   -- All file columns are text — parse to numbers/booleans. Keep ALL rows.
   SELECT *,
-    -- For each numeric column (strip commas and $ before casting):
+    -- For each numeric column: 1) remove commas 2) remove dollar signs 3) CAST to REAL
+    -- Pattern: CAST(REPLACE(REPLACE(col, ',', ''), '$', '') AS REAL)
+    -- Concrete example: CAST(REPLACE(REPLACE(""Revenue"", ',', ''), '$', '') AS REAL)
     CASE WHEN ""<Col>"" IS NOT NULL AND ""<Col>"" NOT IN ('Not Mentioned','N/A','','-','null')
          THEN CAST(REPLACE(REPLACE(""<Col>"", ',', ''), '$', '') AS REAL) ELSE NULL END AS <x>_num,
     -- For each yes/no column:
@@ -1085,7 +1088,9 @@ SELECT ""<Entity Name>"", ""<Data Col 1>"", ""<Data Col 2>"", ""<Data Col 3>"",
 FROM scored ORDER BY score DESC LIMIT 20;
 
 **How to build the scoring expression — think step-by-step:**
-1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias. CRITICAL: apply the EXACT SAME cleaning pattern to EVERY numeric column — never skip REPLACE or the NOT IN filter for any column. If one column gets REPLACE and NOT IN, they ALL must.
+1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias. CRITICAL: apply the EXACT SAME cleaning to EVERY numeric column using this exact pattern:
+   CAST(REPLACE(REPLACE(""<Col>"", ',', ''), '$', '') AS REAL)
+   Never skip the two REPLACEs (commas then dollar signs) or the NOT IN filter for ANY column.
    - If no single name/label column exists: concatenate fields or use the most human-readable identifier available.
 2. For each numeric and boolean column, decide its role:
    OUTCOME — directly measures success or output (revenue, score, sales, count) → 0.30-0.40 weight, ORDER BY ASC (higher value = better = gets 1.0)
@@ -1119,7 +1124,7 @@ For ALL queries:
 
 For composite rankings ONLY — also verify:
 □ Triggered correctly? User asked for an abstract/subjective concept, not ""top X by [specific metric]""?
-□ Every numeric column has BOTH: REPLACE for commas/$ AND NOT IN ('Not Mentioned','N/A','','-','null')? Same cleaning pattern for ALL — never skip any column?
+□ Every numeric column uses CAST(REPLACE(REPLACE(col, ',', ''), '$', '') AS REAL) with NOT IN ('Not Mentioned','N/A','','-','null')? Same exact pattern for ALL columns — never skip any?
 □ CASE WHEN col_num IS NOT NULL wraps EVERY PERCENT_RANK expression?
 □ Weights sum to approximately 1.0? OUTCOME columns >= 0.30 weight? BOOLEAN columns <= 0.10 weight?
 □ Final SELECT has entity name + 3+ real data columns + score?
