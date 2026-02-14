@@ -124,10 +124,11 @@ public class FileQueryService : IFileQueryService
 
     public string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount, string? parsedContentJson)
     {
-        var baseDescription = BuildSchemaDescription(schemaInfoJson, tableName, rowCount);
+        var columns = ParseSchema(schemaInfoJson);
+        if (columns.Count == 0) return "No schema available.";
 
         if (string.IsNullOrEmpty(parsedContentJson))
-            return baseDescription;
+            return BuildSchemaDescription(schemaInfoJson, tableName, rowCount);
 
         try
         {
@@ -135,13 +136,85 @@ public class FileQueryService : IFileQueryService
             var root = doc.RootElement;
 
             if (root.ValueKind != JsonValueKind.Array || root.GetArrayLength() == 0)
-                return baseDescription;
+                return BuildSchemaDescription(schemaInfoJson, tableName, rowCount);
 
-            var columns = ParseSchema(schemaInfoJson);
-            var sb = new StringBuilder(baseDescription);
+            var placeholderValues = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { "not mentioned", "n/a", "na", "-", "null", "none", "tbd", "unknown", "not available", "not applicable" };
+            var booleanValues = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { "yes", "no", "true", "false", "1", "0" };
+
+            // Analyze ALL columns by scanning actual data
+            var maxScan = Math.Min(100, root.GetArrayLength());
+            var colInfo = new Dictionary<string, (int numericCount, int boolCount, int placeholderCount, int totalNonNull, HashSet<string> distinct, HashSet<string> placeholders)>();
+
+            foreach (var col in columns)
+            {
+                colInfo[col.Name] = (0, 0, 0, 0, new HashSet<string>(), new HashSet<string>());
+            }
+
+            for (var i = 0; i < maxScan; i++)
+            {
+                var row = root[i];
+                foreach (var col in columns)
+                {
+                    if (!row.TryGetProperty(col.Name, out var prop)) continue;
+                    if (prop.ValueKind == JsonValueKind.Null) continue;
+
+                    var info = colInfo[col.Name];
+                    info.totalNonNull++;
+
+                    var val = prop.ValueKind == JsonValueKind.String ? prop.GetString() : prop.ToString();
+                    if (string.IsNullOrWhiteSpace(val)) continue;
+
+                    if (info.distinct.Count < 20)
+                        info.distinct.Add(val);
+
+                    if (prop.ValueKind == JsonValueKind.Number)
+                    {
+                        info.numericCount++;
+                    }
+                    else if (prop.ValueKind == JsonValueKind.String)
+                    {
+                        var trimmed = val.Trim();
+                        var cleaned = trimmed.Replace(",", "").Replace("$", "").Replace("€", "").Replace("£", "");
+                        if (double.TryParse(cleaned, out _))
+                        {
+                            info.numericCount++;
+                        }
+                        else if (booleanValues.Contains(trimmed))
+                        {
+                            info.boolCount++;
+                        }
+                        else if (placeholderValues.Contains(trimmed))
+                        {
+                            info.placeholderCount++;
+                            info.placeholders.Add(trimmed);
+                        }
+                    }
+                    else if (prop.ValueKind == JsonValueKind.True || prop.ValueKind == JsonValueKind.False)
+                    {
+                        info.boolCount++;
+                    }
+
+                    colInfo[col.Name] = info;
+                }
+            }
+
+            // Build schema with inline type tags
+            var sb = new StringBuilder();
+            sb.AppendLine($"Table: \"data\" ({(rowCount.HasValue ? $"{rowCount.Value:N0} rows" : "unknown rows")})");
+            sb.AppendLine("Columns:");
+
+            foreach (var col in columns)
+            {
+                var info = colInfo[col.Name];
+                var tag = ClassifyColumn(col.Name, info, columns.Count);
+                sb.AppendLine($"  - \"{col.Name}\" {tag}");
+            }
+
+            // Sample data
             sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine("Sample data (first 3 rows — use this to understand actual values, NOT to hardcode in CASE statements):");
+            sb.AppendLine("Sample data (first 3 rows — understand values, do NOT hardcode in CASE):");
 
             var sampleCount = Math.Min(3, root.GetArrayLength());
             for (var i = 0; i < sampleCount; i++)
@@ -160,90 +233,107 @@ public class FileQueryService : IFileQueryService
                 sb.AppendLine($"  Row {i + 1}: {string.Join(", ", values)}");
             }
 
-            // Analyze text columns: detect categories and mixed-type columns
-            var colAnalysis = new Dictionary<string, (HashSet<string> distinct, int numericCount, int textPlaceholderCount, HashSet<string> placeholders)>();
-            var placeholderValues = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                { "not mentioned", "n/a", "na", "-", "null", "none", "tbd", "unknown", "not available", "not applicable" };
+            // Add scoring summary — concentrated list so AI can't miss scoreable columns
+            var numericCols = new List<string>();
+            var booleanCols = new List<string>();
+            var mixedCols = new List<string>();
+            var categoryCols = new List<string>();
+            var identifierCols = new List<string>();
 
             foreach (var col in columns)
             {
-                if (MapToSqliteType(col.DataType) == "TEXT")
-                    colAnalysis[col.Name] = (new HashSet<string>(), 0, 0, new HashSet<string>());
-            }
+                var info = colInfo[col.Name];
+                var total = info.totalNonNull;
+                if (total == 0) continue;
 
-            if (colAnalysis.Count > 0)
-            {
-                var maxScan = Math.Min(100, root.GetArrayLength());
-                for (var i = 0; i < maxScan; i++)
+                var nonPlaceholder = total - info.placeholderCount;
+                if (nonPlaceholder == 0) continue;
+
+                // Check identifier first — ID/name columns should never be scored even if numeric
+                var nameLower = col.Name.ToLowerInvariant();
+                if (nameLower.Contains("id") || nameLower.Contains("name") || nameLower.Contains("email"))
                 {
-                    var row = root[i];
-                    foreach (var colName in colAnalysis.Keys.ToList())
-                    {
-                        if (row.TryGetProperty(colName, out var prop) && prop.ValueKind == JsonValueKind.String)
-                        {
-                            var v = prop.GetString();
-                            if (string.IsNullOrEmpty(v)) continue;
-
-                            var analysis = colAnalysis[colName];
-                            if (analysis.distinct.Count < 15)
-                                analysis.distinct.Add(v);
-
-                            // Check if value is numeric (possibly with commas)
-                            var cleaned = v.Replace(",", "").Trim();
-                            if (double.TryParse(cleaned, out _))
-                            {
-                                analysis.numericCount++;
-                            }
-                            else if (placeholderValues.Contains(v.Trim()))
-                            {
-                                analysis.textPlaceholderCount++;
-                                analysis.placeholders.Add(v);
-                            }
-
-                            colAnalysis[colName] = analysis;
-                        }
-                    }
+                    identifierCols.Add($"\"{col.Name}\"");
                 }
-
-                // Output column analysis
-                var hasOutput = false;
-                foreach (var kvp in colAnalysis)
+                else if (info.numericCount > nonPlaceholder * 0.7)
                 {
-                    var (distinct, numericCount, placeholderCount, foundPlaceholders) = kvp.Value;
-                    if (distinct.Count == 0) continue;
-
-                    if (!hasOutput)
-                    {
-                        sb.AppendLine();
-                        sb.AppendLine("Column analysis (from first 100 rows):");
-                        hasOutput = true;
-                    }
-
-                    // Mixed column: has both numbers and text placeholders
-                    if (numericCount > 0 && placeholderCount > 0)
-                    {
-                        sb.AppendLine($"  \"{kvp.Key}\": MIXED COLUMN — contains numeric values ({numericCount} rows) AND text placeholders ({string.Join(", ", foundPlaceholders.Select(p => $"\"{p}\""))}). " +
-                            $"⚠ MUST filter out placeholders and CAST(REPLACE(col, ',', '') AS REAL) before any ranking/aggregation.");
-                    }
-                    else if (distinct.Count <= 10)
-                    {
-                        // Low cardinality = categorical
-                        sb.AppendLine($"  \"{kvp.Key}\": {string.Join(", ", distinct.Select(v => $"\"{v}\""))}");
-                    }
+                    if (info.placeholderCount > 0)
+                        mixedCols.Add($"\"{col.Name}\"");
                     else
-                    {
-                        sb.AppendLine($"  \"{kvp.Key}\": {distinct.Count}+ distinct values (high cardinality)");
-                    }
+                        numericCols.Add($"\"{col.Name}\"");
+                }
+                else if (info.boolCount > nonPlaceholder * 0.7)
+                {
+                    booleanCols.Add($"\"{col.Name}\"");
+                }
+                else
+                {
+                    if (info.distinct.Count >= 15)
+                        identifierCols.Add($"\"{col.Name}\"");
+                    else
+                        categoryCols.Add($"\"{col.Name}\"");
                 }
             }
+
+            sb.AppendLine();
+            if (numericCols.Count > 0)
+                sb.AppendLine($"Scoreable NUMERIC: {string.Join(", ", numericCols)}");
+            if (mixedCols.Count > 0)
+                sb.AppendLine($"Scoreable MIXED (has placeholders): {string.Join(", ", mixedCols)}");
+            if (booleanCols.Count > 0)
+                sb.AppendLine($"Scoreable BOOLEAN: {string.Join(", ", booleanCols)}");
+            if (identifierCols.Count > 0)
+                sb.AppendLine($"IDENTIFIER (not for scoring): {string.Join(", ", identifierCols)}");
+            if (categoryCols.Count > 0)
+                sb.AppendLine($"CATEGORY (group by only): {string.Join(", ", categoryCols)}");
 
             return sb.ToString();
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to add sample data to schema description");
-            return baseDescription;
+            _logger.LogWarning(ex, "Failed to build enhanced schema description");
+            return BuildSchemaDescription(schemaInfoJson, tableName, rowCount);
         }
+    }
+
+    private static string ClassifyColumn(string colName, (int numericCount, int boolCount, int placeholderCount, int totalNonNull, HashSet<string> distinct, HashSet<string> placeholders) info, int totalColumns)
+    {
+        var total = info.totalNonNull;
+        if (total == 0) return "(EMPTY)";
+
+        var nonPlaceholder = total - info.placeholderCount;
+        if (nonPlaceholder == 0) return "(ALL PLACEHOLDERS — skip)";
+
+        // Mostly numeric values (with possible placeholders)
+        if (info.numericCount > nonPlaceholder * 0.7)
+        {
+            if (info.placeholderCount > 0)
+            {
+                return $"(NUMERIC with placeholders: {string.Join(", ", info.placeholders.Select(p => $"\"{p}\""))} — filter placeholders, CAST(REPLACE(col, ',', '') AS REAL), use in scoring)";
+            }
+            return "(NUMERIC — use in scoring)";
+        }
+
+        // Mostly boolean values
+        if (info.boolCount > nonPlaceholder * 0.7)
+        {
+            return "(BOOLEAN — use as flag in scoring)";
+        }
+
+        // Check if it looks like an identifier (high cardinality, likely unique, or has id/name in the column name)
+        var nameLower = colName.ToLowerInvariant();
+        if (nameLower.Contains("id") || nameLower.Contains("name") || nameLower.Contains("email") || info.distinct.Count >= 15)
+        {
+            return "(IDENTIFIER — not for scoring, use in SELECT)";
+        }
+
+        // Low cardinality text = category
+        if (info.distinct.Count <= 10)
+        {
+            return $"(CATEGORY: {string.Join(", ", info.distinct.Take(8).Select(v => $"\"{v}\""))} — group by only, not for scoring)";
+        }
+
+        return $"(TEXT — {info.distinct.Count}+ distinct values)";
     }
 
     private List<ColumnDef> ParseSchema(string schemaInfoJson)

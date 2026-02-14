@@ -127,6 +127,15 @@ If the question cannot be answered with the given schema, respond with: ERROR: [
         return (assistantMessage, tokensUsed);
     }
 
+    private static bool IsReasoningModel(string model)
+    {
+        // o1, o3, o4, gpt-5.x (thinking variants) are reasoning models
+        // They don't support temperature or max_tokens — use max_completion_tokens instead
+        var m = model.ToLowerInvariant();
+        return m.StartsWith("o1") || m.StartsWith("o3") || m.StartsWith("o4")
+            || (m.StartsWith("gpt-5") && !m.Contains("chat"));
+    }
+
     private async Task<(string response, int tokensUsed)> ChatOpenAIAsync(
         string userMessage,
         IEnumerable<(string role, string content)> history,
@@ -134,13 +143,26 @@ If the question cannot be answered with the given schema, respond with: ERROR: [
     {
         var messages = BuildMessages(userMessage, history, schemaContext);
 
-        var request = new
+        object request;
+        if (IsReasoningModel(_model))
         {
-            model = _model,
-            messages,
-            temperature = 0.1,
-            max_tokens = 16384
-        };
+            request = new
+            {
+                model = _model,
+                messages,
+                max_completion_tokens = 16384
+            };
+        }
+        else
+        {
+            request = new
+            {
+                model = _model,
+                messages,
+                temperature = 0.1,
+                max_tokens = 16384
+            };
+        }
 
         var response = await _httpClient.PostAsJsonAsync("/v1/chat/completions", request);
         response.EnsureSuccessStatusCode();
