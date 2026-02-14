@@ -81,7 +81,10 @@ public class AuthController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error during Google login");
-            return StatusCode(500, ApiResponse<AuthResponse>.ErrorResponse("An error occurred during Google login"));
+            var errorMsg = $"Google login failed: {ex.Message}";
+            if (ex.InnerException != null)
+                errorMsg += $" | Inner: {ex.InnerException.Message}";
+            return StatusCode(500, ApiResponse<AuthResponse>.ErrorResponse(errorMsg));
         }
     }
 

@@ -357,19 +357,36 @@ public class AuthService : IAuthService
         GoogleJsonWebSignature.Payload payload;
         try
         {
+            // First try as ID token (from GoogleLogin component)
             var settings = new GoogleJsonWebSignature.ValidationSettings
             {
                 Audience = new[] { _googleClientId }
             };
             payload = await GoogleJsonWebSignature.ValidateAsync(idToken, settings);
         }
-        catch (InvalidJwtException ex)
+        catch
         {
-            throw new UnauthorizedAccessException($"Invalid Google token: {ex.Message}");
-        }
-        catch (Exception ex)
-        {
-            throw new UnauthorizedAccessException($"Google token validation failed: {ex.Message}");
+            // Fallback: treat as access token (from custom useGoogleLogin button)
+            try
+            {
+                using var httpClient = new HttpClient();
+                httpClient.DefaultRequestHeaders.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", idToken);
+                var response = await httpClient.GetAsync("https://www.googleapis.com/oauth2/v3/userinfo");
+                response.EnsureSuccessStatusCode();
+                var json = await response.Content.ReadAsStringAsync();
+                var userInfo = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(json);
+                payload = new GoogleJsonWebSignature.Payload
+                {
+                    Email = userInfo.GetProperty("email").GetString() ?? "",
+                    GivenName = userInfo.TryGetProperty("given_name", out var gn) ? gn.GetString() : "",
+                    FamilyName = userInfo.TryGetProperty("family_name", out var fn) ? fn.GetString() : ""
+                };
+            }
+            catch (Exception ex)
+            {
+                throw new UnauthorizedAccessException($"Google token validation failed: {ex.Message}");
+            }
         }
 
         var email = payload.Email.ToLower();
@@ -387,21 +404,26 @@ public class AuthService : IAuthService
                 SubscriptionTier = SubscriptionTier.Starter,
                 QueryLimitPerMonth = GetQueryLimitForTier(SubscriptionTier.Starter),
                 BillingCycleReset = DateTime.UtcNow.AddMonths(1),
-                IsEmailVerified = true
+                IsEmailVerified = true,
+                RefreshToken = _tokenService.GenerateRefreshToken(),
+                RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(_refreshTokenExpirationDays)
             };
             await _unitOfWork.Users.AddAsync(user);
+            await _unitOfWork.SaveChangesAsync();
         }
-        else if (!user.IsEmailVerified)
+        else
         {
-            // Existing user who hadn't verified email — Google verifies it for us
-            user.IsEmailVerified = true;
+            if (!user.IsEmailVerified)
+            {
+                user.IsEmailVerified = true;
+            }
+
+            user.RefreshToken = _tokenService.GenerateRefreshToken();
+            user.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(_refreshTokenExpirationDays);
+
+            await _unitOfWork.Users.UpdateAsync(user);
+            await _unitOfWork.SaveChangesAsync();
         }
-
-        user.RefreshToken = _tokenService.GenerateRefreshToken();
-        user.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(_refreshTokenExpirationDays);
-
-        await _unitOfWork.Users.UpdateAsync(user);
-        await _unitOfWork.SaveChangesAsync();
 
         var accessToken = _tokenService.GenerateAccessToken(user);
 
