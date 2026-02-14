@@ -559,14 +559,16 @@ WITH clean AS (
   FROM <table>
 ),
 scored AS (
+  -- ONLY use _num/_flag aliases from clean — NEVER raw text columns in PERCENT_RANK
   SELECT *, ( <weighted scoring expression> ) AS score
   FROM clean
 )
-SELECT <entity_name>, <key_data_cols>, ROUND(score, 2) AS ""Score""
+-- MUST include 3+ real data columns so user sees WHY (never just name + score)
+SELECT <entity_name>, <data_col_1>, <data_col_2>, <data_col_3>, ROUND(score, 2) AS ""Score""
 FROM scored ORDER BY score DESC LIMIT 20;
 
 **How to build the scoring expression — think step-by-step:**
-1. Read the schema. Identify ALL columns relevant to the user's concept.
+1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias.
 2. For each column, ask: does a HIGH value help or hurt the entity?
    Help (e.g. revenue, profit, rating) → ORDER BY col_num ASC
    Hurt (e.g. cost, risk, complaints) → ORDER BY col_num DESC
@@ -575,17 +577,17 @@ FROM scored ORDER BY score DESC LIMIT 20;
    Efficiency ratios (output ÷ input): 0.15-0.25
    Secondary/input metrics: 0.10-0.20
    Booleans (low if most rows share same value): 0.05-0.10
-4. Score each column:
+4. Score using ONLY _num/_flag aliases (never raw column names):
    CASE WHEN col_num IS NOT NULL THEN PERCENT_RANK() OVER (ORDER BY col_num <ASC|DESC>) ELSE <penalty> END * <weight>
    Primary metrics: penalty = -0.15. Others: penalty = 0.
 5. NULLIF(x, 0) in every division. ROUND final score.
-6. Final SELECT: entity name + key data columns + score — user must see WHY.
+6. Final SELECT: entity name + 3-5 real data columns + score — user MUST see the actual values behind the ranking.
 
 **PERCENT_RANK() direction — get this wrong = ALL rankings inverted:**
 0.0 → FIRST row, 1.0 → LAST row.
 ""Higher is better"" → ORDER BY ASC → highest is LAST → gets 1.0 ✓
 ""Lower is better"" → ORDER BY DESC → lowest is LAST → gets 1.0 ✓
-PERCENT_RANK never returns NULL. Use CASE WHEN IS NOT NULL ... ELSE penalty END.
+PERCENT_RANK on raw text is MEANINGLESS — always convert to numeric first in clean CTE.
 
 Additional rules:
 - Rankings: LIMIT 20 default. GROUP BY: no LIMIT.
@@ -1007,15 +1009,17 @@ WITH clean AS (
   FROM ""data""
 ),
 scored AS (
+  -- ONLY use _num/_flag aliases from clean — NEVER raw text columns in PERCENT_RANK
   SELECT *, ( <weighted scoring expression> ) AS score
   FROM clean
 )
-SELECT ""<Entity Name>"", ""<Key Col 1>"", ""<Key Col 2>"",
+-- MUST include 3+ real data columns so user sees WHY (never just name + score)
+SELECT ""<Entity Name>"", ""<Data Col 1>"", ""<Data Col 2>"", ""<Data Col 3>"",
   ROUND(score, 2) AS ""Score""
 FROM scored ORDER BY score DESC LIMIT 20;
 
 **How to build the scoring expression — think step-by-step:**
-1. Read the schema. Identify ALL columns relevant to the user's concept.
+1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias.
 2. For each column, ask: does a HIGH value help or hurt the entity?
    Help (e.g. revenue, profit, rating) → ORDER BY col_num ASC
    Hurt (e.g. cost, risk, complaints) → ORDER BY col_num DESC
@@ -1024,18 +1028,18 @@ FROM scored ORDER BY score DESC LIMIT 20;
    Efficiency ratios (output ÷ input): 0.15-0.25
    Secondary/input metrics: 0.10-0.20
    Booleans (low if most rows share same value): 0.05-0.10
-4. Score each column:
+4. Score using ONLY _num/_flag aliases (never raw column names):
    CASE WHEN col_num IS NOT NULL THEN PERCENT_RANK() OVER (ORDER BY col_num <ASC|DESC>) ELSE <penalty> END * <weight>
    Primary metrics: penalty = -0.15. Others: penalty = 0.
 5. NULLIF(x, 0) in every division. ROUND final score.
 6. Strip non-numeric characters (commas, $, €, £) before CAST to REAL.
-7. Final SELECT: entity name + key data columns + score — user must see WHY.
+7. Final SELECT: entity name + 3-5 real data columns + score — user MUST see the actual values behind the ranking.
 
 **PERCENT_RANK() direction — get this wrong = ALL rankings inverted:**
 0.0 → FIRST row, 1.0 → LAST row.
 ""Higher is better"" → ORDER BY ASC → highest is LAST → gets 1.0 ✓
 ""Lower is better"" → ORDER BY DESC → lowest is LAST → gets 1.0 ✓
-PERCENT_RANK never returns NULL. Use CASE WHEN IS NOT NULL ... ELSE penalty END.
+PERCENT_RANK on raw text is MEANINGLESS — always convert to numeric first in clean CTE.
 
 Additional rules:
 - Rankings: LIMIT 20 default. GROUP BY: no LIMIT.
