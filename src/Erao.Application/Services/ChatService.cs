@@ -569,14 +569,13 @@ FROM scored ORDER BY score DESC LIMIT 20;
 
 **How to build the scoring expression — think step-by-step:**
 1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias.
-2. For each column, ask: does a HIGH value help or hurt the entity?
-   Help (e.g. revenue, profit, rating) → ORDER BY col_num ASC
-   Hurt (e.g. cost, risk, complaints) → ORDER BY col_num DESC
-3. Assign weights by importance (must sum ≈ 1.0):
-   Primary output metrics: 0.30-0.40 (the key differentiator)
-   Efficiency ratios (output ÷ input): 0.15-0.25
-   Secondary/input metrics: 0.10-0.20
-   Booleans (low if most rows share same value): 0.05-0.10
+2. List EVERY numeric and boolean column. For each, decide its role:
+   OUTCOME — directly measures success or output → 0.30-0.40 weight, ORDER BY ASC
+   EFFICIENCY — ratio you compute: outcome ÷ cost → 0.15-0.25 weight, ORDER BY ASC
+   COST/INPUT — resources consumed or invested → 0.10-0.20 weight, ORDER BY DESC (lower = better)
+   BOOLEAN — binary yes/no indicator → 0.05-0.10 weight max
+   DESCRIPTIVE — describes what the entity IS, not how it performs → DO NOT score, show in SELECT only
+3. Weights of scored columns must sum ≈ 1.0. Use 4+ scored columns minimum.
 4. Score using ONLY _num/_flag aliases (never raw column names):
    CASE WHEN col_num IS NOT NULL THEN PERCENT_RANK() OVER (ORDER BY col_num <ASC|DESC>) ELSE <penalty> END * <weight>
    Primary metrics: penalty = -0.15. Others: penalty = 0.
@@ -600,6 +599,14 @@ Additional rules:
 
 chart: ""bar"" default | ""line"" time-series | ""pie"" 2-8 categories | ""table"" lists
 group: most readable column (name > category > ID). values: ONLY 1-2 final metrics. agg: ""NONE"" if SQL already computed.
+
+## VERIFY BEFORE RESPONDING (composite rankings only)
+□ Used 4+ columns? Include EVERY numeric and boolean column from schema that relates to the concept.
+□ Every scored column cleaned to _num/_flag in clean CTE? No raw text in PERCENT_RANK?
+□ CASE WHEN col_num IS NOT NULL wraps EVERY PERCENT_RANK expression?
+□ Booleans ≤ 0.10 weight? Outcome metrics ≥ 0.30?
+□ Final SELECT has entity name + 3+ data columns + score?
+□ Direction correct? ASC = higher-is-better, DESC = lower-is-better?
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
@@ -1020,14 +1027,13 @@ FROM scored ORDER BY score DESC LIMIT 20;
 
 **How to build the scoring expression — think step-by-step:**
 1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias.
-2. For each column, ask: does a HIGH value help or hurt the entity?
-   Help (e.g. revenue, profit, rating) → ORDER BY col_num ASC
-   Hurt (e.g. cost, risk, complaints) → ORDER BY col_num DESC
-3. Assign weights by importance (must sum ≈ 1.0):
-   Primary output metrics: 0.30-0.40 (the key differentiator)
-   Efficiency ratios (output ÷ input): 0.15-0.25
-   Secondary/input metrics: 0.10-0.20
-   Booleans (low if most rows share same value): 0.05-0.10
+2. List EVERY numeric and boolean column. For each, decide its role:
+   OUTCOME — directly measures success or output → 0.30-0.40 weight, ORDER BY ASC
+   EFFICIENCY — ratio you compute: outcome ÷ cost → 0.15-0.25 weight, ORDER BY ASC
+   COST/INPUT — resources consumed or invested → 0.10-0.20 weight, ORDER BY DESC (lower = better)
+   BOOLEAN — binary yes/no indicator → 0.05-0.10 weight max
+   DESCRIPTIVE — describes what the entity IS, not how it performs → DO NOT score, show in SELECT only
+3. Weights of scored columns must sum ≈ 1.0. Use 4+ scored columns minimum.
 4. Score using ONLY _num/_flag aliases (never raw column names):
    CASE WHEN col_num IS NOT NULL THEN PERCENT_RANK() OVER (ORDER BY col_num <ASC|DESC>) ELSE <penalty> END * <weight>
    Primary metrics: penalty = -0.15. Others: penalty = 0.
@@ -1052,6 +1058,14 @@ Additional rules:
 
 chart: ""bar"" default | ""line"" time-series | ""pie"" 2-8 categories | ""table"" lists
 group: most readable column (name > category > ID). values: ONLY 1-2 final metrics. agg: ""NONE"" if SQL already computed.
+
+## VERIFY BEFORE RESPONDING (composite rankings only)
+□ Used 4+ columns? Include EVERY numeric and boolean column from schema that relates to the concept.
+□ Every scored column cleaned to _num/_flag in clean CTE? No raw text in PERCENT_RANK?
+□ CASE WHEN col_num IS NOT NULL wraps EVERY PERCENT_RANK expression?
+□ Booleans ≤ 0.10 weight? Outcome metrics ≥ 0.30?
+□ Final SELECT has entity name + 3+ data columns + score?
+□ Direction correct? ASC = higher-is-better, DESC = lower-is-better?
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
