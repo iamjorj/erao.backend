@@ -553,16 +553,19 @@ WITH clean AS (
     CASE WHEN UPPER(""HasMVP"") = 'YES' THEN 1 ELSE 0 END AS mvp_flag
   FROM ""TableName""
 ),
--- CTE 2: SCORE. Think: what makes this ""good""? Use ALL relevant columns.
--- DESC = higher is better (revenue, MRR). ASC = lower is better (cost, risk).
--- Missing data: YOU DECIDE the COALESCE value. 0 = neutral, negative = penalty, positive = bonus.
--- Example: no MRR → probably no revenue → COALESCE(..., -0.1). No cost data → unknown → COALESCE(..., 0).
+-- CTE 2: SCORE. Use ALL relevant columns. Assign weights by PRIORITY (must sum to ~1.0):
+--   PRIORITY 1 (0.30-0.40): Output metrics — revenue, MRR, sales amount, profit. THE key differentiator.
+--   PRIORITY 2 (0.15-0.25): Efficiency ratios — revenue/cost, MRR/investment. Rewards doing more with less.
+--   PRIORITY 3 (0.10-0.20): Input/cost metrics — investment, expenses. Lower = better (ASC).
+--   PRIORITY 4 (0.05-0.10): Booleans — YES/NO flags. If most rows share the same value, weight VERY low (0.05).
+-- DESC = higher is better. ASC = lower is better.
+-- Missing data: COALESCE to negative (penalty) for important columns, 0 (neutral) for less important ones.
 scored AS (
   SELECT *,
-    COALESCE(PERCENT_RANK() OVER (ORDER BY revenue_num DESC), -0.1) * 0.30
-    + COALESCE(PERCENT_RANK() OVER (ORDER BY cost_num ASC), 0) * 0.20
-    + COALESCE(PERCENT_RANK() OVER (ORDER BY revenue_num / NULLIF(cost_num, 0) DESC), 0) * 0.15
-    + mvp_flag * 0.20
+    COALESCE(PERCENT_RANK() OVER (ORDER BY revenue_num DESC), -0.15) * 0.35  -- P1: revenue
+    + COALESCE(PERCENT_RANK() OVER (ORDER BY revenue_num / NULLIF(cost_num, 0) DESC), 0) * 0.25  -- P2: efficiency
+    + COALESCE(PERCENT_RANK() OVER (ORDER BY cost_num ASC), 0) * 0.15  -- P3: cost
+    + mvp_flag * 0.05  -- P4: boolean (low weight if most rows = YES)
     AS score
   FROM clean
 )
@@ -573,13 +576,16 @@ FROM scored ORDER BY score DESC LIMIT 20;
 
 ## SCORING RULES
 
-- Use ALL relevant numeric columns, not just 1-2. Abstract concepts (""best"", ""top"", ""at-risk"") ALWAYS need multiple columns.
+DO NOT copy the example weights above literally. Instead follow this PRIORITY system:
+- PRIORITY 1 (weight 0.30-0.40): Output/revenue metrics (MRR, revenue, profit, sales amount). This is THE most important factor. Missing data here = penalty (COALESCE to -0.15).
+- PRIORITY 2 (weight 0.15-0.25): Efficiency ratios (MRR/investment, revenue/cost). Rewards doing more with less.
+- PRIORITY 3 (weight 0.10-0.20): Input/cost metrics (investment ask, expenses). Lower is usually better (ORDER BY ASC).
+- PRIORITY 4 (weight 0.05-0.10): Booleans (has_sales, has_mvp). If nearly all rows have YES, weight 0.05 — it barely differentiates.
+- Weights must sum to approximately 1.0.
 - PERCENT_RANK(ORDER BY col DESC) = higher is better. PERCENT_RANK(ORDER BY col ASC) = lower is better.
-- Include ratio columns when both input/output exist (e.g., revenue/cost, MRR/investment).
-- Booleans (YES/NO): convert to 1/0, weight directly into score.
-- NEVER hardcode CASE WHEN for unknown category values. Use DENSE_RANK() or exclude from score.
-- NULLIF(x, 0) in EVERY division. COALESCE every score.
-- Rankings: ORDER BY score DESC, LIMIT 20 (unless user says otherwise). GROUP BY queries: no LIMIT.
+- NULLIF(x, 0) in EVERY division. COALESCE every PERCENT_RANK.
+- NEVER hardcode CASE WHEN for unknown category values. Use DENSE_RANK() or exclude.
+- Rankings: ORDER BY score DESC, LIMIT 20. GROUP BY queries: no LIMIT.
 - Final SELECT: always include name + key data columns + score. Never just name + score.
 - ""revenue"" might mean SUM(amount/price/total). ""my""/""our"" = all data. Enums as numbers.
 - Simple queries (COUNT, SUM, basic filter): just write direct SQL, no scoring template needed.
@@ -994,17 +1000,20 @@ WITH clean AS (
     CASE WHEN UPPER(""MVP"") = 'YES' THEN 1 ELSE 0 END AS has_mvp
   FROM ""data""
 ),
--- CTE 2: SCORE. Think: what makes this ""good""? Use ALL relevant columns.
--- DESC = higher is better (revenue, MRR). ASC = lower is better (cost, risk).
--- Missing data: YOU DECIDE the COALESCE value. 0 = neutral, negative = penalty, positive = bonus.
--- Example: no MRR → probably no revenue → COALESCE(..., -0.1). No cost data → unknown → COALESCE(..., 0).
+-- CTE 2: SCORE. Use ALL relevant columns. Assign weights by PRIORITY (must sum to ~1.0):
+--   PRIORITY 1 (0.30-0.40): Output metrics — MRR, revenue, profit. THE key differentiator.
+--   PRIORITY 2 (0.15-0.25): Efficiency ratios — MRR/investment. Rewards doing more with less.
+--   PRIORITY 3 (0.10-0.20): Input/cost metrics — investment ask. Lower = better (ASC).
+--   PRIORITY 4 (0.05-0.10): Booleans — YES/NO flags. If most rows share the same value, weight VERY low (0.05).
+-- DESC = higher is better. ASC = lower is better.
+-- Missing data: COALESCE to negative (penalty) for important columns, 0 (neutral) for less important ones.
 scored AS (
   SELECT *,
-    COALESCE(PERCENT_RANK() OVER (ORDER BY mrr_num DESC), -0.1) * 0.30
-    + COALESCE(PERCENT_RANK() OVER (ORDER BY invest_num ASC), 0) * 0.20
-    + COALESCE(PERCENT_RANK() OVER (ORDER BY mrr_num / NULLIF(invest_num, 0) DESC), 0) * 0.15
-    + has_sales * 0.20
-    + has_mvp * 0.15
+    COALESCE(PERCENT_RANK() OVER (ORDER BY mrr_num DESC), -0.15) * 0.35  -- P1: MRR (most important)
+    + COALESCE(PERCENT_RANK() OVER (ORDER BY mrr_num / NULLIF(invest_num, 0) DESC), 0) * 0.25  -- P2: efficiency
+    + COALESCE(PERCENT_RANK() OVER (ORDER BY invest_num ASC), 0) * 0.15  -- P3: investment ask
+    + has_sales * 0.05  -- P4: boolean (most rows = YES, barely differentiates)
+    + has_mvp * 0.05   -- P4: boolean
     AS score
   FROM clean
 )
@@ -1015,14 +1024,17 @@ FROM scored ORDER BY score DESC LIMIT 20;
 
 ## SCORING RULES
 
-- Use ALL relevant numeric columns, not just 1-2. Abstract concepts (""best"", ""top"", ""healthiest"") ALWAYS need multiple columns.
+DO NOT copy the example weights above literally. Instead follow this PRIORITY system:
+- PRIORITY 1 (weight 0.30-0.40): Output/revenue metrics (MRR, revenue, profit, sales amount). This is THE most important factor. Missing data here = penalty (COALESCE to -0.15).
+- PRIORITY 2 (weight 0.15-0.25): Efficiency ratios (MRR/investment, revenue/cost). Rewards doing more with less.
+- PRIORITY 3 (weight 0.10-0.20): Input/cost metrics (investment ask, expenses). Lower is usually better (ORDER BY ASC).
+- PRIORITY 4 (weight 0.05-0.10): Booleans (has_sales, has_mvp). If nearly all rows have YES, weight 0.05 — it barely differentiates.
+- Weights must sum to approximately 1.0.
 - PERCENT_RANK(ORDER BY col DESC) = higher is better. PERCENT_RANK(ORDER BY col ASC) = lower is better.
-- Include ratio columns when both input/output exist (e.g., MRR/investment, revenue/cost).
-- Booleans (YES/NO): convert to 1/0, weight directly into score.
-- NEVER hardcode CASE WHEN for unknown category values. Use DENSE_RANK() or exclude from score.
-- NULLIF(x, 0) in EVERY division. COALESCE every score.
+- NULLIF(x, 0) in EVERY division. COALESCE every PERCENT_RANK.
 - Text numbers with commas: CAST(REPLACE(col, ',', '') AS REAL).
-- Rankings: ORDER BY score DESC, LIMIT 20 (unless user says otherwise). GROUP BY queries: no LIMIT.
+- NEVER hardcode CASE WHEN for unknown category values. Use DENSE_RANK() or exclude.
+- Rankings: ORDER BY score DESC, LIMIT 20. GROUP BY queries: no LIMIT.
 - Final SELECT: always include name + key data columns + score. Never just name + score.
 - Map user language to columns: ""revenue"" → amount/price/total, ""name"" → any name column. ""my""/""our"" = all data.
 - Simple queries (COUNT, SUM, basic filter): just write direct SQL, no scoring template needed.
