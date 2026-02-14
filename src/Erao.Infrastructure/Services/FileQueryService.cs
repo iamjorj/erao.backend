@@ -122,6 +122,130 @@ public class FileQueryService : IFileQueryService
         return string.Join("\n", lines);
     }
 
+    public string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount, string? parsedContentJson)
+    {
+        var baseDescription = BuildSchemaDescription(schemaInfoJson, tableName, rowCount);
+
+        if (string.IsNullOrEmpty(parsedContentJson))
+            return baseDescription;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(parsedContentJson);
+            var root = doc.RootElement;
+
+            if (root.ValueKind != JsonValueKind.Array || root.GetArrayLength() == 0)
+                return baseDescription;
+
+            var columns = ParseSchema(schemaInfoJson);
+            var sb = new StringBuilder(baseDescription);
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("Sample data (first 3 rows — use this to understand actual values, NOT to hardcode in CASE statements):");
+
+            var sampleCount = Math.Min(3, root.GetArrayLength());
+            for (var i = 0; i < sampleCount; i++)
+            {
+                var row = root[i];
+                var values = new List<string>();
+                foreach (var col in columns)
+                {
+                    var val = "null";
+                    if (row.TryGetProperty(col.Name, out var prop) && prop.ValueKind != JsonValueKind.Null)
+                    {
+                        val = prop.ValueKind == JsonValueKind.String ? $"\"{prop.GetString()}\"" : prop.ToString();
+                    }
+                    values.Add($"{col.Name}={val}");
+                }
+                sb.AppendLine($"  Row {i + 1}: {string.Join(", ", values)}");
+            }
+
+            // Analyze text columns: detect categories and mixed-type columns
+            var colAnalysis = new Dictionary<string, (HashSet<string> distinct, int numericCount, int textPlaceholderCount, HashSet<string> placeholders)>();
+            var placeholderValues = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { "not mentioned", "n/a", "na", "-", "null", "none", "tbd", "unknown", "not available", "not applicable" };
+
+            foreach (var col in columns)
+            {
+                if (MapToSqliteType(col.DataType) == "TEXT")
+                    colAnalysis[col.Name] = (new HashSet<string>(), 0, 0, new HashSet<string>());
+            }
+
+            if (colAnalysis.Count > 0)
+            {
+                var maxScan = Math.Min(100, root.GetArrayLength());
+                for (var i = 0; i < maxScan; i++)
+                {
+                    var row = root[i];
+                    foreach (var colName in colAnalysis.Keys.ToList())
+                    {
+                        if (row.TryGetProperty(colName, out var prop) && prop.ValueKind == JsonValueKind.String)
+                        {
+                            var v = prop.GetString();
+                            if (string.IsNullOrEmpty(v)) continue;
+
+                            var analysis = colAnalysis[colName];
+                            if (analysis.distinct.Count < 15)
+                                analysis.distinct.Add(v);
+
+                            // Check if value is numeric (possibly with commas)
+                            var cleaned = v.Replace(",", "").Trim();
+                            if (double.TryParse(cleaned, out _))
+                            {
+                                analysis.numericCount++;
+                            }
+                            else if (placeholderValues.Contains(v.Trim()))
+                            {
+                                analysis.textPlaceholderCount++;
+                                analysis.placeholders.Add(v);
+                            }
+
+                            colAnalysis[colName] = analysis;
+                        }
+                    }
+                }
+
+                // Output column analysis
+                var hasOutput = false;
+                foreach (var kvp in colAnalysis)
+                {
+                    var (distinct, numericCount, placeholderCount, foundPlaceholders) = kvp.Value;
+                    if (distinct.Count == 0) continue;
+
+                    if (!hasOutput)
+                    {
+                        sb.AppendLine();
+                        sb.AppendLine("Column analysis (from first 100 rows):");
+                        hasOutput = true;
+                    }
+
+                    // Mixed column: has both numbers and text placeholders
+                    if (numericCount > 0 && placeholderCount > 0)
+                    {
+                        sb.AppendLine($"  \"{kvp.Key}\": MIXED COLUMN — contains numeric values ({numericCount} rows) AND text placeholders ({string.Join(", ", foundPlaceholders.Select(p => $"\"{p}\""))}). " +
+                            $"⚠ MUST filter out placeholders and CAST(REPLACE(col, ',', '') AS REAL) before any ranking/aggregation.");
+                    }
+                    else if (distinct.Count <= 10)
+                    {
+                        // Low cardinality = categorical
+                        sb.AppendLine($"  \"{kvp.Key}\": {string.Join(", ", distinct.Select(v => $"\"{v}\""))}");
+                    }
+                    else
+                    {
+                        sb.AppendLine($"  \"{kvp.Key}\": {distinct.Count}+ distinct values (high cardinality)");
+                    }
+                }
+            }
+
+            return sb.ToString();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to add sample data to schema description");
+            return baseDescription;
+        }
+    }
+
     private List<ColumnDef> ParseSchema(string schemaInfoJson)
     {
         try

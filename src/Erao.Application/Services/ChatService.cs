@@ -121,9 +121,9 @@ public class ChatService : IChatService
             fileDocument = await _unitOfWork.FileDocuments.GetByIdAsync(conversation.FileDocumentId.Value);
             if (fileDocument != null)
             {
-                // Build a SQLite-oriented schema description for the AI
+                // Build a SQLite-oriented schema description with sample data for the AI
                 schemaContext = _fileQueryService.BuildSchemaDescription(
-                    fileDocument.SchemaInfo ?? "[]", "data", fileDocument.RowCount);
+                    fileDocument.SchemaInfo ?? "[]", "data", fileDocument.RowCount, fileDocument.ParsedContent);
             }
         }
 
@@ -557,8 +557,10 @@ ANALYTICAL THINKING (apply this for every query):
 - ""Most valuable customers"" is NOT just highest order count. Think: total revenue + order frequency + recency = value. Build a composite score.
 - ""Best performing employees"" is NOT just one metric. Consider all relevant positive and negative factors.
 - ""At-risk"", ""most loyal"", ""most efficient"" — these are ALL multi-column concepts. NEVER reduce them to a single column sort.
-- When creating composite scores, use PERCENT_RANK() or normalized scales to make columns comparable.
-- Weight positive factors (+) and negative factors (-) into a final score.
+- When creating composite scores, use PERCENT_RANK() to normalize columns to 0-1 scale so they're comparable. PERCENT_RANK() is STRONGLY preferred over manual (value - min) / (max - min) because it handles edge cases automatically.
+- If you must use manual normalization, ALWAYS wrap the denominator with NULLIF to prevent division by zero: (value - MIN(value) OVER()) / NULLIF(MAX(value) OVER() - MIN(value) OVER(), 0). Then COALESCE the result to 0.
+- NEVER hardcode categorical values in CASE WHEN statements (e.g., CASE WHEN stage = 'Seed' THEN 0.2). You do NOT know what values exist in the data. Instead, use DENSE_RANK() or PERCENT_RANK() OVER (ORDER BY column) to rank categorical columns ordinally, or simply exclude non-numeric columns from composite scores.
+- Weight positive factors (+) and negative factors (-) into a final score. Always COALESCE the final composite score to 0 to avoid NULL results.
 - Use CTEs (WITH clauses) for readability when building complex scoring queries.
 
 FORMAT:
@@ -639,6 +641,7 @@ NULL and empty value handling (CRITICAL):
 - For rankings (""top"", ""highest"", ""lowest"", ""best"", ""worst""), ALWAYS filter out NULL values: WHERE ""Column"" IS NOT NULL
 - When ORDER BY, use NULLS LAST (or filter NULLs) to avoid NULLs appearing first in results.
 - Empty strings should also be excluded from rankings: AND ""Column"" != ''
+- When using PERCENT_RANK() or any window function on a column that MIXES numeric values with non-numeric strings (""N/A"", ""Not Mentioned"", ""TBD""), FIRST filter out non-numeric rows in a CTE, THEN convert to numeric BEFORE ordering. Never rank raw text that mixes numbers and strings — text sort gives wrong results.
 
 Integer enums:
 - Columns like Status, Type, Tier, Role often store integers representing enum values.
@@ -649,6 +652,15 @@ Ambiguous queries:
 - ""Top X"" without a metric? Think about what defines ""top"" in context. If multiple columns are relevant, build a composite score. If only one metric makes sense, use it. Just run the query — don't ask.
 - ""Give me insights""? Write a useful query with aggregations. DO it, don't explain what COULD be done.
 - ""Most valuable/productive/efficient/at-risk"" → ALWAYS create a weighted composite score from multiple relevant columns. Never just sort by one column.
+";
+
+        prompt += @"
+
+## MANDATORY CHECKLIST (verify EVERY query against this before responding)
+1. COLUMNS: Your final SELECT MUST include the entity's real data columns (name, category, key attributes), NOT just name + score. The user needs to see WHY something ranks high.
+2. CLEAN DATA: Before ANY numeric operation (PERCENT_RANK, MIN, MAX, SUM, ORDER BY), filter out NULL and empty values. If a column mixes numbers with text strings, filter out non-numeric rows first.
+3. NO NULLS: COALESCE every computed score to 0. Use NULLIF in denominators.
+4. ORDER: Rankings must ORDER BY score DESC. Add LIMIT 20 unless user specifies a number.
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
@@ -1054,8 +1066,10 @@ ANALYTICAL THINKING (apply this for every query):
 - ""Most productive"" is NOT just highest Study_Hours. Think: what COMBINATION of columns defines productivity? High study hours + high GPA + low social media + low stress = productive. Build a composite score.
 - ""Best performing"" is NOT just one metric. Consider all relevant positive and negative factors.
 - ""Healthiest"", ""most at risk"", ""most successful"" — these are ALL multi-column concepts. NEVER reduce them to a single column sort.
-- When creating composite scores, use PERCENT_RANK() or (value - min) / (max - min) to normalize columns to 0-1 scale so they're comparable.
-- Weight positive factors (+) and negative factors (-) into a final score.
+- When creating composite scores, use PERCENT_RANK() to normalize columns to 0-1 scale so they're comparable. PERCENT_RANK() is STRONGLY preferred over manual (value - min) / (max - min) because it handles edge cases automatically.
+- If you must use manual normalization (value - MIN) / (MAX - MIN), ALWAYS wrap the denominator with NULLIF to prevent division by zero: (value - MIN(value) OVER()) / NULLIF(MAX(value) OVER() - MIN(value) OVER(), 0). Then COALESCE the result to 0: COALESCE((...), 0).
+- NEVER hardcode categorical values in CASE WHEN statements (e.g., CASE WHEN stage = 'Seed' THEN 0.2). You do NOT know what values exist in the data. Instead, use DENSE_RANK() or PERCENT_RANK() OVER (ORDER BY column) to rank categorical columns ordinally, or simply exclude non-numeric columns from composite scores.
+- Weight positive factors (+) and negative factors (-) into a final score. Always COALESCE the final composite score to 0 to avoid NULL results.
 - Use CTEs (WITH clauses) for readability when building complex scoring queries.
 
 FORMAT:
@@ -1139,11 +1153,24 @@ NULL and empty value handling (CRITICAL):
 String-to-number conversion:
 - If a column looks numeric but has commas (e.g., ""2,500,000""), use: CAST(REPLACE(""Column"", ',', '') AS REAL)
 - Always clean numeric strings before comparing or sorting numerically.
+- CRITICAL: When using PERCENT_RANK() or any window function on a column that MIXES numeric values with non-numeric strings (like ""Not Mentioned"", ""N/A"", ""TBD""), you MUST:
+  1. Filter out non-numeric rows BEFORE the window function (in a CTE with WHERE clause)
+  2. Convert the column to numeric BEFORE ordering: PERCENT_RANK() OVER (ORDER BY CAST(REPLACE(""Col"", ',', '') AS REAL))
+  3. NEVER rank raw text values that contain a mix of numbers and strings — the text sort will give wrong results (""Not Mentioned"" sorts higher than ""999,999"" alphabetically).
 
 Ambiguous queries:
 - ""Top X"" without a metric? Think about what defines ""top"" in context. If multiple columns are relevant (e.g., students: GPA + study hours), build a composite score. If only one metric makes sense, use it. Just run the query — don't ask.
 - ""Give me insights"" or ""analyze this""? Write a useful query that shows interesting aggregations (counts by category, totals, averages). DO it, don't explain what COULD be done.
 - ""Most productive/successful/healthy/at-risk"" → ALWAYS create a weighted composite score from multiple relevant columns. Never just sort by one column.
+";
+
+        prompt += @"
+
+## MANDATORY CHECKLIST (verify EVERY query against this before responding)
+1. COLUMNS: Your final SELECT MUST include the entity's real data columns (name, category, key attributes), NOT just name + score. The user needs to see WHY something ranks high.
+2. CLEAN DATA: Before ANY numeric operation (PERCENT_RANK, MIN, MAX, SUM, ORDER BY), filter out non-numeric values ('Not Mentioned', 'N/A', '', '-', 'null') AND convert strings to numbers: CAST(REPLACE(col, ',', '') AS REAL).
+3. NO NULLS: COALESCE every computed score to 0. Use NULLIF in denominators.
+4. ORDER: Rankings must ORDER BY score DESC. Add LIMIT 20 unless user specifies a number.
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))

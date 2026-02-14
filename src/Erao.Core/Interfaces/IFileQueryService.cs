@@ -23,6 +23,11 @@ public interface IFileQueryService
     string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount);
 
     /// <summary>
+    /// Builds a SQLite-compatible schema description with sample data rows for AI context.
+    /// </summary>
+    string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount, string? parsedContentJson);
+
+    /// <summary>
     /// Gets preview data from a file (first N rows).
     /// </summary>
     Task<string> GetPreviewDataAsync(Guid fileId, int limit = 50);
