@@ -568,7 +568,7 @@ SELECT <entity_name>, <data_col_1>, <data_col_2>, <data_col_3>, ROUND(score, 2) 
 FROM scored ORDER BY score DESC LIMIT 20;
 
 **How to build the scoring expression — think step-by-step:**
-1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias.
+1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias. CRITICAL: apply the EXACT SAME cleaning pattern to EVERY numeric column — never skip REPLACE or the NOT IN filter for any column. If one column gets REPLACE and NOT IN, they ALL must.
 2. List EVERY numeric and boolean column. For each, decide its role:
    OUTCOME — directly measures success or output → 0.30-0.40 weight, ORDER BY ASC
    EFFICIENCY — ratio you compute: outcome ÷ cost → 0.15-0.25 weight, ORDER BY ASC
@@ -602,7 +602,7 @@ group: most readable column (name > category > ID). values: ONLY 1-2 final metri
 
 ## VERIFY BEFORE RESPONDING (composite rankings only)
 □ Used 4+ columns? Include EVERY numeric and boolean column from schema that relates to the concept.
-□ Every scored column cleaned to _num/_flag in clean CTE? No raw text in PERCENT_RANK?
+□ Every numeric column has BOTH: REPLACE for commas/$ AND NOT IN ('Not Mentioned','N/A','','-','null')? Same pattern for ALL — never skip any column.
 □ CASE WHEN col_num IS NOT NULL wraps EVERY PERCENT_RANK expression?
 □ Booleans ≤ 0.10 weight? Outcome metrics ≥ 0.30?
 □ Final SELECT has entity name + 3+ data columns + score?
@@ -1026,7 +1026,7 @@ SELECT ""<Entity Name>"", ""<Data Col 1>"", ""<Data Col 2>"", ""<Data Col 3>"",
 FROM scored ORDER BY score DESC LIMIT 20;
 
 **How to build the scoring expression — think step-by-step:**
-1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias.
+1. Read the schema. Identify ALL columns relevant to the concept. Clean EVERY one in the clean CTE — each scored column MUST have a _num or _flag alias. CRITICAL: apply the EXACT SAME cleaning pattern to EVERY numeric column — never skip REPLACE or the NOT IN filter for any column. If one column gets REPLACE and NOT IN, they ALL must.
 2. List EVERY numeric and boolean column. For each, decide its role:
    OUTCOME — directly measures success or output → 0.30-0.40 weight, ORDER BY ASC
    EFFICIENCY — ratio you compute: outcome ÷ cost → 0.15-0.25 weight, ORDER BY ASC
@@ -1061,7 +1061,7 @@ group: most readable column (name > category > ID). values: ONLY 1-2 final metri
 
 ## VERIFY BEFORE RESPONDING (composite rankings only)
 □ Used 4+ columns? Include EVERY numeric and boolean column from schema that relates to the concept.
-□ Every scored column cleaned to _num/_flag in clean CTE? No raw text in PERCENT_RANK?
+□ Every numeric column has BOTH: REPLACE for commas/$ AND NOT IN ('Not Mentioned','N/A','','-','null')? Same pattern for ALL — never skip any column.
 □ CASE WHEN col_num IS NOT NULL wraps EVERY PERCENT_RANK expression?
 □ Booleans ≤ 0.10 weight? Outcome metrics ≥ 0.30?
 □ Final SELECT has entity name + 3+ data columns + score?
