@@ -11,4 +11,9 @@ public class ChatResponse
     /// AI-generated visualization hint for optimal chart display
     /// </summary>
     public VisualizationHint? VisualizationHint { get; set; }
+
+    /// <summary>
+    /// Clarification request when AI needs user to disambiguate intent
+    /// </summary>
+    public ClarificationRequest? Clarification { get; set; }
 }

@@ -185,6 +185,46 @@ public class ChatService : IChatService
         // Get AI response with full conversation history
         var (aiResponse, tokensUsed) = await _ollamaService.ChatAsync(request.Message, history, systemPrompt);
 
+        // Layer 2: Check if AI wants to clarify before proceeding
+        var clarification = ExtractClarification(aiResponse);
+        if (clarification != null)
+        {
+            var cleanedClarificationContent = StripCodeBlocks(aiResponse);
+
+            var clarificationAssistantMessage = new Message
+            {
+                ConversationId = conversation.Id,
+                Role = MessageRole.Assistant,
+                Content = cleanedClarificationContent,
+                TokensUsed = tokensUsed
+            };
+            await _unitOfWork.Messages.AddAsync(clarificationAssistantMessage);
+
+            user.QueriesUsedThisMonth++;
+            await _unitOfWork.Users.UpdateAsync(user);
+
+            stopwatch.Stop();
+            var clarificationUsageLog = new UsageLog
+            {
+                UserId = userId,
+                DatabaseConnectionId = dbConnection?.Id,
+                QueryType = "Clarification",
+                TokensUsed = tokensUsed,
+                ExecutionTimeMs = (int)stopwatch.ElapsedMilliseconds
+            };
+            await _unitOfWork.UsageLogs.AddAsync(clarificationUsageLog);
+            await _unitOfWork.SaveChangesAsync();
+
+            return new ChatResponse
+            {
+                UserMessage = _mapper.Map<MessageDto>(userMessage),
+                AssistantMessage = _mapper.Map<MessageDto>(clarificationAssistantMessage),
+                QueryResult = null,
+                TokensUsed = tokensUsed,
+                Clarification = clarification
+            };
+        }
+
         // Try to extract SQL from response (for database mode) or analyze file data
         string? sqlQuery = null;
         string? queryResult = null;
@@ -201,12 +241,40 @@ public class ChatService : IChatService
             dbPassword = _encryptionService.Decrypt(dbConnection.EncryptedPassword);
         }
 
+        // Layer 1: Parse schema once for pre-validation
+        var schemaLookup = !string.IsNullOrEmpty(schemaContext)
+            ? SqlSchemaValidator.ParseSchemaToLookup(schemaContext, fileDocument != null)
+            : new Dictionary<string, HashSet<string>>();
+
         if (dbConnection != null && request.ExecuteQuery)
         {
             var sqlQueries = ExtractAllSqlFromResponse(aiResponse);
 
             if (sqlQueries.Count > 0)
             {
+                // Layer 1: Schema pre-validation — catch hallucinated identifiers before DB roundtrip
+                if (schemaLookup.Count > 0)
+                {
+                    var combinedSql = string.Join("\n", sqlQueries);
+                    var validation = SqlSchemaValidator.Validate(combinedSql, schemaLookup);
+                    if (!validation.IsValid)
+                    {
+                        // Build targeted retry with schema correction hints
+                        var correctionHint = validation.BuildCorrectionHint();
+                        var fixPrompt = BuildSqlRetryPrompt(combinedSql, correctionHint, schemaContext, dbConnection.DatabaseType);
+                        var (fixResponse, fixTokens) = await _ollamaService.ChatAsync(
+                            $"Fix schema issues: {correctionHint}", new List<(string, string)>(), fixPrompt);
+                        tokensUsed += fixTokens;
+
+                        var fixedQueries = ExtractAllSqlFromResponse(fixResponse);
+                        if (fixedQueries.Count > 0)
+                        {
+                            sqlQueries = fixedQueries;
+                            aiResponse = fixResponse;
+                        }
+                    }
+                }
+
                 sqlQuery = string.Join("\n\n-- Next Query --\n\n", sqlQueries);
 
                 // Try executing with auto-retry on failure
@@ -282,6 +350,28 @@ public class ChatService : IChatService
 
             if (sqlQueries.Count > 0 && !string.IsNullOrEmpty(fileDocument.ParsedContent) && !string.IsNullOrEmpty(fileDocument.SchemaInfo))
             {
+                // Layer 1: Schema pre-validation for file mode
+                if (schemaLookup.Count > 0)
+                {
+                    var combinedSql = string.Join("\n", sqlQueries);
+                    var validation = SqlSchemaValidator.Validate(combinedSql, schemaLookup);
+                    if (!validation.IsValid)
+                    {
+                        var correctionHint = validation.BuildCorrectionHint();
+                        var fixPrompt = BuildSqlRetryPrompt(combinedSql, correctionHint, schemaContext, null, true);
+                        var (fixResponse, fixTokens) = await _ollamaService.ChatAsync(
+                            $"Fix schema issues: {correctionHint}", new List<(string, string)>(), fixPrompt);
+                        tokensUsed += fixTokens;
+
+                        var fixedQueries = ExtractAllSqlFromResponse(fixResponse);
+                        if (fixedQueries.Count > 0)
+                        {
+                            sqlQueries = fixedQueries;
+                            aiResponse = fixResponse;
+                        }
+                    }
+                }
+
                 sqlQuery = string.Join("\n\n-- Next Query --\n\n", sqlQueries);
 
                 // Try executing with auto-retry on failure
@@ -351,6 +441,24 @@ public class ChatService : IChatService
                 if (string.IsNullOrEmpty(queryResult))
                 {
                     queryResult = ExtractDataContextAsResult(aiResponse);
+                }
+            }
+        }
+
+        // Layer 3: Empty/suspicious result handling — explain why query returned no data
+        if (!string.IsNullOrEmpty(queryResult) && !queryResult.StartsWith("Error", StringComparison.Ordinal) && sqlQuery != null)
+        {
+            var (isEmpty, isSuspicious, rowCount) = AnalyzeQueryResult(queryResult);
+            if (isEmpty || isSuspicious)
+            {
+                var explainPrompt = BuildResultExplanationPrompt(sqlQuery, request.Message, schemaContext, isEmpty);
+                var (explanation, extraTokens) = await _ollamaService.ChatAsync(
+                    "Explain empty result", new List<(string, string)>(), explainPrompt);
+                tokensUsed += extraTokens;
+
+                if (!string.IsNullOrWhiteSpace(explanation))
+                {
+                    aiResponse = explanation.Trim() + "\n\n" + aiResponse;
                 }
             }
         }
@@ -574,7 +682,7 @@ F. **Structure**: Use CTEs for multi-step queries. Use window functions for comp
 
 G. **Smart mapping**: ""revenue"" → amount/price/total. ""my""/""our"" → all data. Integer enum columns (Status, Type) — return as numbers.
 
-H. **Ambiguity**: ""Top X"" without a metric? Build a composite score. ""Give me insights""? Write aggregations. Just run it — never ask.
+H. **Ambiguity**: ""Top X"" without a metric? Build a composite score. ""Give me insights""? Write aggregations.
 
 ## 3. VISUALIZATION
 
@@ -605,6 +713,25 @@ Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAUL
 3. Rankings: ORDER BY DESC + LIMIT 20.
 4. viz group = individual entity name for rankings. Category only for ""by X"" aggregations. Date only for time series.
 5. Final SELECT has real data columns, not just name + score.
+
+## 5. CLARIFICATION (use RARELY — only when you truly cannot proceed)
+
+If ALL of these are true, ask ONE clarification question:
+1. The user's request references a concept that has NO matching column in the schema (not even partial match).
+2. There are 2+ equally valid interpretations that would produce COMPLETELY different results.
+3. Conversation history gives no clue about intent.
+
+Format: output a ```clarification block with JSON:
+{{""question"":""Which metric did you mean by 'performance'?"",""options"":[{{""label"":""Revenue"",""value"":""Show revenue data""}},{{""label"":""Employee Rating"",""value"":""Show employee ratings""}},{{""label"":""Something else"",""value"":""Let me clarify""}}]}}
+
+NEVER clarify when:
+- A column partially matches — just use it.
+- ""Top X"" or ""best"" without metric — build composite score.
+- ""Give me insights"" / ""analyze"" — just run meaningful aggregations.
+- Only 1 reasonable interpretation exists.
+- You can infer from conversation context.
+
+Max 4 options. Always include ""Something else"" as the last option.
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
@@ -1029,7 +1156,7 @@ F. **Structure**: Use CTEs for multi-step queries. Use window functions for comp
 
 G. **Smart mapping**: Map user language to columns (""revenue"" → amount/price/total). ""my""/""our"" → all data.
 
-H. **Ambiguity**: ""Top X"" without a metric? Build a composite score. ""Give me insights""? Write aggregations. Just run it — never ask.
+H. **Ambiguity**: ""Top X"" without a metric? Build a composite score. ""Give me insights""? Write aggregations.
 
 ## 3. VISUALIZATION
 
@@ -1060,6 +1187,25 @@ Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAUL
 3. Rankings: ORDER BY DESC + LIMIT 20.
 4. viz group = individual entity name for rankings. Category only for ""by X"" aggregations. Date only for time series.
 5. Final SELECT has real data columns, not just name + score.
+
+## 5. CLARIFICATION (use RARELY — only when you truly cannot proceed)
+
+If ALL of these are true, ask ONE clarification question:
+1. The user's request references a concept that has NO matching column in the schema (not even partial match).
+2. There are 2+ equally valid interpretations that would produce COMPLETELY different results.
+3. Conversation history gives no clue about intent.
+
+Format: output a ```clarification block with JSON:
+{{""question"":""Which metric did you mean by 'performance'?"",""options"":[{{""label"":""Revenue"",""value"":""Show revenue data""}},{{""label"":""Employee Rating"",""value"":""Show employee ratings""}},{{""label"":""Something else"",""value"":""Let me clarify""}}]}}
+
+NEVER clarify when:
+- A column partially matches — just use it.
+- ""Top X"" or ""best"" without metric — build composite score.
+- ""Give me insights"" / ""analyze"" — just run meaningful aggregations.
+- Only 1 reasonable interpretation exists.
+- You can infer from conversation context.
+
+Max 4 options. Always include ""Something else"" as the last option.
 ";
 
         if (!string.IsNullOrEmpty(schemaContext))
@@ -1213,6 +1359,10 @@ Use EXACT column names in double quotes. Never invent columns.
         content = System.Text.RegularExpressions.Regex.Replace(
             content, @"```viz[\s\S]*?```", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
+        // Remove clarification code blocks
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"```clarification[\s\S]*?```", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
         // Remove empty markdown headers (e.g., "**Top 5 Sales:**" followed by empty line or end)
         // These appear when JSON blocks are stripped but headers remain
         // Only match headers followed by empty line or end, not headers with content after
@@ -1223,5 +1373,166 @@ Use EXACT column names in double quotes. Never invent columns.
         content = System.Text.RegularExpressions.Regex.Replace(content, @"\n{3,}", "\n\n");
 
         return content.Trim();
+    }
+
+    private static ClarificationRequest? ExtractClarification(string response)
+    {
+        try
+        {
+            var clarStart = response.IndexOf("```clarification", StringComparison.OrdinalIgnoreCase);
+            if (clarStart == -1) return null;
+
+            var contentStart = response.IndexOf('\n', clarStart);
+            if (contentStart == -1) return null;
+            contentStart++;
+
+            var clarEnd = response.IndexOf("```", contentStart);
+            if (clarEnd == -1) return null;
+
+            var clarJson = response.Substring(contentStart, clarEnd - contentStart).Trim();
+            if (string.IsNullOrEmpty(clarJson)) return null;
+
+            using var doc = System.Text.Json.JsonDocument.Parse(clarJson);
+            var root = doc.RootElement;
+
+            var result = new ClarificationRequest();
+
+            if (root.TryGetProperty("question", out var questionProp))
+            {
+                result.Question = questionProp.GetString() ?? string.Empty;
+            }
+
+            if (root.TryGetProperty("options", out var optionsProp) &&
+                optionsProp.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                foreach (var opt in optionsProp.EnumerateArray())
+                {
+                    var option = new ClarificationOption();
+                    if (opt.TryGetProperty("label", out var labelProp))
+                        option.Label = labelProp.GetString() ?? string.Empty;
+                    if (opt.TryGetProperty("value", out var valueProp))
+                        option.Value = valueProp.GetString() ?? string.Empty;
+
+                    if (!string.IsNullOrEmpty(option.Label))
+                        result.Options.Add(option);
+                }
+            }
+
+            return result.Options.Count > 0 ? result : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static (bool isEmpty, bool isSuspicious, int rowCount) AnalyzeQueryResult(string? queryResultJson)
+    {
+        if (string.IsNullOrEmpty(queryResultJson))
+            return (false, false, 0);
+
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(queryResultJson);
+            var root = doc.RootElement;
+
+            // Handle multi-table results
+            if (root.TryGetProperty("tables", out var tables))
+            {
+                // Check first table
+                if (tables.ValueKind == System.Text.Json.JsonValueKind.Array && tables.GetArrayLength() > 0)
+                {
+                    var firstTable = tables[0];
+                    return AnalyzeResultElement(firstTable);
+                }
+                return (false, false, 0);
+            }
+
+            return AnalyzeResultElement(root);
+        }
+        catch
+        {
+            return (false, false, 0);
+        }
+    }
+
+    private static (bool isEmpty, bool isSuspicious, int rowCount) AnalyzeResultElement(System.Text.Json.JsonElement element)
+    {
+        int rowCount = 0;
+
+        if (element.TryGetProperty("rowCount", out var rowCountProp))
+        {
+            rowCount = rowCountProp.GetInt32();
+        }
+        else if (element.TryGetProperty("rows", out var rowsProp) &&
+                 rowsProp.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            rowCount = rowsProp.GetArrayLength();
+        }
+
+        if (rowCount == 0)
+            return (true, false, 0);
+
+        // Check for suspicious results: all values in a numeric column are NULL
+        bool isSuspicious = false;
+        if (element.TryGetProperty("rows", out var rows) &&
+            element.TryGetProperty("columns", out var columns) &&
+            rows.ValueKind == System.Text.Json.JsonValueKind.Array &&
+            columns.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            foreach (var col in columns.EnumerateArray())
+            {
+                var colName = col.GetString();
+                if (string.IsNullOrEmpty(colName)) continue;
+
+                var allNull = true;
+                foreach (var row in rows.EnumerateArray())
+                {
+                    if (row.TryGetProperty(colName, out var val) &&
+                        val.ValueKind != System.Text.Json.JsonValueKind.Null)
+                    {
+                        allNull = false;
+                        break;
+                    }
+                }
+
+                if (allNull && rows.GetArrayLength() > 0)
+                {
+                    isSuspicious = true;
+                    break;
+                }
+            }
+        }
+
+        return (false, isSuspicious, rowCount);
+    }
+
+    private static string BuildResultExplanationPrompt(string sqlQuery, string userMessage, string? schemaContext, bool isEmpty)
+    {
+        var situation = isEmpty
+            ? "The query returned 0 rows (empty result)."
+            : "The query returned suspicious results (some columns are entirely NULL).";
+
+        var prompt = $@"You are a data analyst explaining query results. {situation}
+
+User asked: ""{userMessage}""
+SQL executed: {sqlQuery}
+
+In 1-2 sentences:
+1. Explain WHY the result is empty or suspicious (e.g., filter too restrictive, no matching data, column mismatch).
+2. Suggest what the user could try instead (e.g., broaden filter, check a different column/table).
+
+Be concise and helpful. Do not include SQL code. Do not use markdown headers.";
+
+        if (!string.IsNullOrEmpty(schemaContext))
+        {
+            // Include a truncated schema for context (limit to avoid huge prompts)
+            var schemaSnippet = schemaContext.Length > 500
+                ? schemaContext[..500] + "\n..."
+                : schemaContext;
+            prompt += $"\n\nSchema context:\n{schemaSnippet}";
+        }
+
+        return prompt;
     }
 }
