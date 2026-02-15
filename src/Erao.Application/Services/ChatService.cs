@@ -493,7 +493,8 @@ SQLite-specific rules:
 - Double-quote all identifiers: ""TableName"", ""ColumnName"".
 - Use ROUND(value, N) directly.
 - Date functions: DATE('now'), STRFTIME(), JULIANDAY().
-- No RIGHT JOIN or FULL OUTER JOIN — rewrite using LEFT JOIN.",
+- No RIGHT JOIN or FULL OUTER JOIN — rewrite using LEFT JOIN.
+- UNION ALL + ORDER BY: SQLite cannot use complex expressions (CASE, functions) in ORDER BY after UNION ALL. Wrap the UNION ALL in a subquery first: SELECT * FROM (...UNION ALL...) ORDER BY ...;",
             DatabaseType.ClickHouse => @"
 ClickHouse-specific rules:
 - Use ROUND(value, N) directly.
@@ -596,6 +597,7 @@ Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAUL
 3. **line/area** ONLY when X-axis is a date or time period. Never for rankings.
 4. **pie** ONLY for 2-8 category proportions. Never for rankings or time series.
 5. If the query has no clear single metric (e.g. detailed profile of one entity), use ""table"".
+6. **Cross-tab** (two GROUP BY dimensions, e.g. ""by sector and type""): use ""table"". Charts cannot show 2D cross-tabs properly.
 
 ## 4. CHECKLIST (verify before responding)
 1. Column and table names match schema exactly.
@@ -1010,7 +1012,7 @@ Classify the user's intent, then follow the matching format:
 
 ## 2. SQL RULES
 
-A. **Dialect**: SQLite. Table is always ""data"". Double-quote ALL identifiers: SELECT ""Column Name"" FROM ""data"". Column names are CASE-SENSITIVE — use exact names from the schema. Date functions: DATE('now'), STRFTIME(). No RIGHT JOIN or FULL OUTER JOIN. SELECT only.
+A. **Dialect**: SQLite. Table is always ""data"". Double-quote ALL identifiers: SELECT ""Column Name"" FROM ""data"". Column names are CASE-SENSITIVE — use exact names from the schema. Date functions: DATE('now'), STRFTIME(). No RIGHT JOIN or FULL OUTER JOIN. SELECT only. UNION ALL + ORDER BY: SQLite cannot use complex expressions (CASE, functions) in ORDER BY after UNION ALL. Instead, wrap the UNION ALL in a subquery first: SELECT * FROM (...UNION ALL...) ORDER BY ...;
 
 B. **Data cleaning**: Before ANY numeric operation on text columns, filter out junk: WHERE ""Col"" IS NOT NULL AND ""Col"" != '' AND ""Col"" NOT IN ('Not Mentioned', 'N/A', '-', 'null'). COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: CAST(REPLACE(""Col"", ',', '') AS REAL). When a column mixes numbers with text placeholders: filter non-numeric rows in a CTE first, CAST to REAL, then rank.
 
@@ -1050,6 +1052,7 @@ Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAUL
 3. **line/area** ONLY when X-axis is a date or time period. Never for rankings.
 4. **pie** ONLY for 2-8 category proportions. Never for rankings or time series.
 5. If the query has no clear single metric (e.g. detailed profile of one entity), use ""table"".
+6. **Cross-tab** (two GROUP BY dimensions, e.g. ""by sector and type""): use ""table"". Charts cannot show 2D cross-tabs properly.
 
 ## 4. CHECKLIST (verify before responding)
 1. Column names match schema exactly (spelling, case, double-quoted).
