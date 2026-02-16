@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Erao.Application.Services;
 using Erao.Core.DTOs.Chat;
 using Erao.Core.DTOs.Common;
@@ -10,6 +11,7 @@ namespace Erao.API.Controllers;
 [ApiController]
 [Route("api/[controller]")]
 [Authorize]
+[EnableRateLimiting("chat")]
 public class ChatController : ControllerBase
 {
     private readonly IChatService _chatService;

@@ -305,7 +305,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecutePostgreSqlQueryAsync(string host, int port, string database, string username, string password, string query)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password}";
+        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};Options=-c default_transaction_read_only=on";
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -317,7 +317,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<string>> ExecutePostgreSqlQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password}";
+        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};Options=-c default_transaction_read_only=on";
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -609,6 +609,12 @@ public class DatabaseQueryService : IDatabaseQueryService
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
 
+        // Set session to read-only to prevent destructive queries
+        await using (var roCmd = new MySqlCommand("SET SESSION TRANSACTION READ ONLY", connection))
+        {
+            await roCmd.ExecuteNonQueryAsync();
+        }
+
         await using var command = new MySqlCommand(query, connection);
         await using var reader = await command.ExecuteReaderAsync();
 
@@ -869,6 +875,12 @@ public class DatabaseQueryService : IDatabaseQueryService
         var connectionString = $"Server={host},{port};Database={database};User Id={username};Password={password};TrustServerCertificate=True";
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync();
+
+        // Set session to read-only to prevent destructive queries
+        await using (var roCmd = new SqlCommand("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN TRANSACTION; SET XACT_ABORT ON;", connection))
+        {
+            await roCmd.ExecuteNonQueryAsync();
+        }
 
         await using var command = new SqlCommand(query, connection);
         await using var reader = await command.ExecuteReaderAsync();

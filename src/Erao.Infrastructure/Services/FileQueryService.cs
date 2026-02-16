@@ -4,6 +4,7 @@ using System.Text.Json;
 using DuckDB.NET.Data;
 using Erao.Core.Interfaces;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
 namespace Erao.Infrastructure.Services;
@@ -14,10 +15,55 @@ public class FileQueryService : IFileQueryService
     private readonly ILogger<FileQueryService> _logger;
     private const string TableName = "data";
 
-    public FileQueryService(IUnitOfWork unitOfWork, ILogger<FileQueryService> logger)
+    // S3/R2 config for DuckDB httpfs
+    private readonly string _s3Endpoint;
+    private readonly string _s3AccessKey;
+    private readonly string _s3SecretKey;
+    private readonly string _s3Region;
+    private readonly string _s3BucketName;
+    private readonly bool _s3UseSSL;
+
+    public FileQueryService(IUnitOfWork unitOfWork, ILogger<FileQueryService> logger, IConfiguration configuration)
     {
         _unitOfWork = unitOfWork;
         _logger = logger;
+
+        // Read S3/R2 credentials from Minio config (same credentials, S3-compatible)
+        _s3Endpoint = configuration["Minio:Endpoint"] ?? "localhost:9000";
+        _s3AccessKey = configuration["Minio:AccessKey"] ?? "minioadmin";
+        _s3SecretKey = configuration["Minio:SecretKey"] ?? "minioadmin";
+        _s3Region = configuration["Minio:Region"] ?? "auto";
+        _s3BucketName = configuration["Minio:BucketName"] ?? "erao-files";
+        _s3UseSSL = configuration.GetValue<bool>("Minio:UseSSL", false);
+    }
+
+    /// <summary>
+    /// Configures a DuckDB connection with httpfs extension and S3/R2 credentials.
+    /// </summary>
+    private async Task ConfigureDuckDBForS3Async(DuckDBConnection connection)
+    {
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = $@"
+            INSTALL httpfs;
+            LOAD httpfs;
+            SET s3_endpoint = '{_s3Endpoint.Replace("'", "''")}';
+            SET s3_access_key_id = '{_s3AccessKey.Replace("'", "''")}';
+            SET s3_secret_access_key = '{_s3SecretKey.Replace("'", "''")}';
+            SET s3_region = '{_s3Region.Replace("'", "''")}';
+            SET s3_url_style = 'path';
+            SET s3_use_ssl = {(_s3UseSSL ? "true" : "false")};
+        ";
+        await cmd.ExecuteNonQueryAsync();
+        _logger.LogDebug("DuckDB httpfs configured for S3 endpoint: {Endpoint}", _s3Endpoint);
+    }
+
+    /// <summary>
+    /// Builds the S3 URL for a Parquet file stored in R2/MinIO.
+    /// ParquetStoragePath stores the object key (e.g., "parquet/{userId}/{fileId}.parquet").
+    /// </summary>
+    private string BuildS3ParquetUrl(string objectKey)
+    {
+        return $"s3://{_s3BucketName}/{objectKey}";
     }
 
     // ─── DuckDB Parquet query methods ───────────────────────────────────
@@ -28,9 +74,14 @@ public class FileQueryService : IFileQueryService
         if (file == null)
             return JsonSerializer.Serialize(new { error = "File not found", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
 
-        // Route to Parquet (DuckDB) or legacy (SQLite) path
+        _logger.LogInformation("[DEBUG] ExecuteQueryForFileAsync: FileId={FileId}, UsesParquet={UsesParquet}, ParquetPath={ParquetPath}, RowCount={RowCount}, TotalRowCount={TotalRowCount}",
+            fileId, file.UsesParquet, file.ParquetStoragePath ?? "null", file.RowCount, file.TotalRowCount);
+        _logger.LogInformation("[DEBUG] Query: {Query}", query);
+
+        // Route to Parquet (DuckDB via S3/R2) or legacy (SQLite) path
         if (file.UsesParquet && !string.IsNullOrEmpty(file.ParquetStoragePath))
         {
+            _logger.LogInformation("[DEBUG] Routing to Parquet via S3. ObjectKey={ObjectKey}", file.ParquetStoragePath);
             return await ExecuteQueryViaParquetAsync(file.ParquetStoragePath, query);
         }
 
@@ -66,7 +117,7 @@ public class FileQueryService : IFileQueryService
         return await ExecuteQueriesAsync(file.ParsedContent, file.SchemaInfo, queries);
     }
 
-    private async Task<string> ExecuteQueryViaParquetAsync(string parquetPath, string query)
+    private async Task<string> ExecuteQueryViaParquetAsync(string parquetObjectKey, string query)
     {
         var stopwatch = Stopwatch.StartNew();
 
@@ -75,26 +126,29 @@ public class FileQueryService : IFileQueryService
             await using var connection = new DuckDBConnection("DataSource=:memory:");
             await connection.OpenAsync();
 
-            // Create a view named "data" pointing to the Parquet file
-            var escapedPath = parquetPath.Replace("\\", "/").Replace("'", "''");
+            // Configure httpfs for S3/R2 access
+            await ConfigureDuckDBForS3Async(connection);
+
+            // Create a view named "data" pointing to the Parquet file in S3/R2
+            var s3Url = BuildS3ParquetUrl(parquetObjectKey);
             await using (var viewCmd = connection.CreateCommand())
             {
-                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{escapedPath}')";
+                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{s3Url.Replace("'", "''")}')";
                 await viewCmd.ExecuteNonQueryAsync();
             }
 
-            _logger.LogInformation("DuckDB Parquet view created for {Path}", parquetPath);
+            _logger.LogInformation("DuckDB Parquet view created for S3: {Url}", s3Url);
 
             return await ExecuteDuckDBQueryAsync(connection, query, stopwatch);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "DuckDB Parquet query failed: {Query}", query);
+            _logger.LogWarning(ex, "DuckDB S3 Parquet query failed: {Query}", query);
             return JsonSerializer.Serialize(new { error = $"Query error: {ex.Message}", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
         }
     }
 
-    private async Task<List<string>> ExecuteQueriesViaParquetAsync(string parquetPath, List<string> queries)
+    private async Task<List<string>> ExecuteQueriesViaParquetAsync(string parquetObjectKey, List<string> queries)
     {
         var results = new List<string>();
 
@@ -103,10 +157,12 @@ public class FileQueryService : IFileQueryService
             await using var connection = new DuckDBConnection("DataSource=:memory:");
             await connection.OpenAsync();
 
-            var escapedPath = parquetPath.Replace("\\", "/").Replace("'", "''");
+            await ConfigureDuckDBForS3Async(connection);
+
+            var s3Url = BuildS3ParquetUrl(parquetObjectKey);
             await using (var viewCmd = connection.CreateCommand())
             {
-                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{escapedPath}')";
+                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{s3Url.Replace("'", "''")}')";
                 await viewCmd.ExecuteNonQueryAsync();
             }
 
@@ -290,7 +346,7 @@ public class FileQueryService : IFileQueryService
         await using var connection = new SqliteConnection("Data Source=:memory:");
         await connection.OpenAsync();
 
-        // Enable WAL mode for better performance
+        // Performance pragmas
         await using (var pragmaCmd = connection.CreateCommand())
         {
             pragmaCmd.CommandText = "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;";
@@ -310,6 +366,13 @@ public class FileQueryService : IFileQueryService
         // Load data in batches
         var rowsInserted = await LoadDataAsync(connection, parsedContentJson, columns);
         _logger.LogInformation("Loaded {RowCount} rows into SQLite in {ElapsedMs}ms", rowsInserted, stopwatch.ElapsedMilliseconds);
+
+        // Enable read-only mode before executing user query
+        await using (var roCmd = connection.CreateCommand())
+        {
+            roCmd.CommandText = "PRAGMA query_only = ON;";
+            await roCmd.ExecuteNonQueryAsync();
+        }
 
         // Execute the user's query
         try
@@ -347,6 +410,13 @@ public class FileQueryService : IFileQueryService
         await CreateTableAsync(connection, columns);
         var rowsInserted = await LoadDataAsync(connection, parsedContentJson, columns);
         _logger.LogInformation("Loaded {RowCount} rows into SQLite in {ElapsedMs}ms for {QueryCount} queries", rowsInserted, stopwatch.ElapsedMilliseconds, queries.Count);
+
+        // Enable read-only mode before executing user queries
+        await using (var roCmd = connection.CreateCommand())
+        {
+            roCmd.CommandText = "PRAGMA query_only = ON;";
+            await roCmd.ExecuteNonQueryAsync();
+        }
 
         var results = new List<string>();
         foreach (var query in queries)
@@ -974,10 +1044,12 @@ public class FileQueryService : IFileQueryService
             await using var connection = new DuckDBConnection("DataSource=:memory:");
             await connection.OpenAsync();
 
-            var escapedPath = file.ParquetStoragePath!.Replace("\\", "/").Replace("'", "''");
+            await ConfigureDuckDBForS3Async(connection);
+
+            var s3Url = BuildS3ParquetUrl(file.ParquetStoragePath!);
             await using (var viewCmd = connection.CreateCommand())
             {
-                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{escapedPath}')";
+                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{s3Url.Replace("'", "''")}')";
                 await viewCmd.ExecuteNonQueryAsync();
             }
 
@@ -1129,10 +1201,12 @@ public class FileQueryService : IFileQueryService
             await using var connection = new DuckDBConnection("DataSource=:memory:");
             await connection.OpenAsync();
 
-            var escapedPath = file.ParquetStoragePath!.Replace("\\", "/").Replace("'", "''");
+            await ConfigureDuckDBForS3Async(connection);
+
+            var s3Url = BuildS3ParquetUrl(file.ParquetStoragePath!);
             await using (var viewCmd = connection.CreateCommand())
             {
-                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{escapedPath}')";
+                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{s3Url.Replace("'", "''")}')";
                 await viewCmd.ExecuteNonQueryAsync();
             }
 

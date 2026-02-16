@@ -3,6 +3,7 @@ using Erao.Core.DTOs;
 using Erao.Core.DTOs.Auth;
 using Erao.Core.Entities;
 using Erao.Core.Enums;
+using System.Security.Cryptography;
 using Erao.Core.Helpers;
 using Erao.Core.Interfaces;
 using Google.Apis.Auth;
@@ -84,8 +85,7 @@ public class AuthService : IAuthService
         }
         catch (Exception)
         {
-            // Log OTP for development testing when email fails
-            Console.WriteLine($"[DEV] Email verification OTP for {user.Email}: {otp}");
+            // Email send failed — OTP is stored in DB, admin can check if needed
         }
 
         return new RegisterResponse
@@ -205,7 +205,17 @@ public class AuthService : IAuthService
             return false;
         }
 
-        return user.PasswordResetOtp == request.Otp;
+        if (user.PasswordResetOtp != request.Otp)
+        {
+            return false;
+        }
+
+        // Shorten the OTP window after verification (5 min to enter new password)
+        user.PasswordResetOtpExpiry = DateTime.UtcNow.AddMinutes(5);
+        await _unitOfWork.Users.UpdateAsync(user);
+        await _unitOfWork.SaveChangesAsync();
+
+        return true;
     }
 
     public async Task ResetPasswordAsync(ResetPasswordRequest request)
@@ -347,8 +357,7 @@ public class AuthService : IAuthService
         }
         catch (Exception)
         {
-            // Log OTP for development testing when email fails
-            Console.WriteLine($"[DEV] Email verification OTP for {user.Email}: {otp}");
+            // Email send failed — OTP is stored in DB, admin can check if needed
         }
     }
 
@@ -438,8 +447,10 @@ public class AuthService : IAuthService
 
     private static string GenerateOtp()
     {
-        var random = new Random();
-        return random.Next(100000, 999999).ToString();
+        var bytes = new byte[4];
+        RandomNumberGenerator.Fill(bytes);
+        var value = BitConverter.ToUInt32(bytes, 0) % 900000 + 100000;
+        return value.ToString();
     }
 
     private static int GetQueryLimitForTier(SubscriptionTier tier)

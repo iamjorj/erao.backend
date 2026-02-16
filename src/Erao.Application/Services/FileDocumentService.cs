@@ -17,7 +17,6 @@ public class FileDocumentService : IFileDocumentService
     private readonly IParquetConversionService _parquetConversionService;
     private readonly ILogger<FileDocumentService> _logger;
     private readonly long _maxFileSizeBytes;
-    private readonly string _parquetBasePath;
     private readonly int _smallFileRowThreshold;
 
     private static readonly Dictionary<string, FileType> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -46,7 +45,6 @@ public class FileDocumentService : IFileDocumentService
         _parquetConversionService = parquetConversionService;
         _logger = logger;
         _maxFileSizeBytes = configuration.GetValue<long>("FileStorage:MaxFileSizeBytes", 100 * 1024 * 1024); // 100MB default
-        _parquetBasePath = configuration.GetValue<string>("ParquetStorage:BasePath") ?? Path.Combine(Directory.GetCurrentDirectory(), "data", "parquet");
         _smallFileRowThreshold = configuration.GetValue<int>("ParquetStorage:SmallFileRowThreshold", 50000);
     }
 
@@ -110,6 +108,10 @@ public class FileDocumentService : IFileDocumentService
 
             // Download from MinIO to parse
             using var fileStream = await _minioService.DownloadFileAsync(objectName);
+            _logger.LogInformation("[DEBUG] MinIO download stream: Type={Type}, CanSeek={CanSeek}, CanRead={CanRead}, Length={Length}, Position={Position}",
+                fileStream.GetType().Name, fileStream.CanSeek, fileStream.CanRead,
+                fileStream.CanSeek ? fileStream.Length : -1,
+                fileStream.CanSeek ? fileStream.Position : -1);
 
             // For CSV/Excel: convert to Parquet via DuckDB (supports 500M+ rows)
             if (fileType == FileType.Csv || fileType == FileType.Excel)
@@ -333,10 +335,18 @@ public class FileDocumentService : IFileDocumentService
             }
         }
 
-        // Delete Parquet file from disk
+        // Delete Parquet file from R2/S3
         if (!string.IsNullOrEmpty(file.ParquetStoragePath))
         {
-            await _parquetConversionService.DeleteParquetFileAsync(file.ParquetStoragePath);
+            try
+            {
+                await _minioService.DeleteFileAsync(file.ParquetStoragePath);
+                _logger.LogInformation("Deleted Parquet from R2: {ObjectKey}", file.ParquetStoragePath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to delete Parquet from R2: {ObjectKey}", file.ParquetStoragePath);
+            }
         }
 
         await _unitOfWork.FileDocuments.DeleteAsync(file);
@@ -355,65 +365,89 @@ public class FileDocumentService : IFileDocumentService
 
     private async Task ConvertToParquetAsync(FileDocument fileDocument, Stream fileStream, FileType fileType, CancellationToken cancellationToken)
     {
-        var parquetPath = Path.Combine(_parquetBasePath, fileDocument.UserId.ToString(), $"{fileDocument.Id}.parquet");
+        // Convert to a local temp Parquet file, then upload to R2/S3
+        var tempParquetPath = Path.Combine(Path.GetTempPath(), $"{fileDocument.Id}.parquet");
 
-        ParquetConversionResult conversionResult;
-        if (fileType == FileType.Csv)
+        try
         {
-            conversionResult = await _parquetConversionService.ConvertCsvToParquetAsync(fileStream, parquetPath);
-        }
-        else
-        {
-            conversionResult = await _parquetConversionService.ConvertExcelToParquetAsync(fileStream, parquetPath);
-        }
-
-        if (conversionResult.Success)
-        {
-            fileDocument.UsesParquet = true;
-            fileDocument.ParquetStoragePath = conversionResult.ParquetPath;
-            fileDocument.TotalRowCount = conversionResult.RowCount;
-            fileDocument.RowCount = conversionResult.RowCount <= int.MaxValue ? (int)conversionResult.RowCount : int.MaxValue;
-            fileDocument.SchemaInfo = conversionResult.SchemaInfoJson;
-            fileDocument.SampleDataJson = conversionResult.SampleDataJson;
-            fileDocument.Status = FileProcessingStatus.Completed;
-
-            // For small files, also keep ParsedContent for backward compatibility
-            if (conversionResult.RowCount <= _smallFileRowThreshold)
+            ParquetConversionResult conversionResult;
+            if (fileType == FileType.Csv)
             {
-                fileDocument.ParsedContent = conversionResult.SampleDataJson;
+                conversionResult = await _parquetConversionService.ConvertCsvToParquetAsync(fileStream, tempParquetPath);
+            }
+            else
+            {
+                conversionResult = await _parquetConversionService.ConvertExcelToParquetAsync(fileStream, tempParquetPath);
             }
 
-            _logger.LogInformation(
-                "File {FileId} converted to Parquet: {RowCount} rows at {Path}",
-                fileDocument.Id, conversionResult.RowCount, conversionResult.ParquetPath);
-        }
-        else
-        {
-            // Parquet conversion failed — fall back to legacy parsing
-            _logger.LogWarning("Parquet conversion failed for {FileId}: {Error}. Falling back to legacy parser.", fileDocument.Id, conversionResult.ErrorMessage);
+            _logger.LogInformation("[DEBUG] Parquet conversion result: Success={Success}, RowCount={RowCount}, Error={Error}",
+                conversionResult.Success, conversionResult.RowCount, conversionResult.ErrorMessage ?? "none");
 
-            fileStream.Position = 0;
-            var parser = _fileParsers.FirstOrDefault(p => p.CanParse(fileType));
-            if (parser != null)
+            if (conversionResult.Success)
             {
-                var parseResult = await parser.ParseAsync(fileStream, fileDocument.OriginalFileName, cancellationToken);
-                if (parseResult.Success)
+                // Upload Parquet file to R2/S3
+                string parquetObjectKey;
+                await using (var parquetStream = File.OpenRead(tempParquetPath))
                 {
-                    fileDocument.ParsedContent = parseResult.ParsedContentJson;
-                    fileDocument.SchemaInfo = parseResult.SchemaInfoJson;
-                    fileDocument.RowCount = parseResult.RowCount;
-                    fileDocument.Status = FileProcessingStatus.Completed;
+                    parquetObjectKey = await _minioService.UploadFileAsync(parquetStream, $"{fileDocument.Id}.parquet", "application/octet-stream", fileDocument.UserId, "parquet");
+                }
+
+                _logger.LogInformation("Parquet uploaded to R2: {ObjectKey}", parquetObjectKey);
+
+                fileDocument.UsesParquet = true;
+                fileDocument.ParquetStoragePath = parquetObjectKey;
+                fileDocument.TotalRowCount = conversionResult.RowCount;
+                fileDocument.RowCount = conversionResult.RowCount <= int.MaxValue ? (int)conversionResult.RowCount : int.MaxValue;
+                fileDocument.SchemaInfo = conversionResult.SchemaInfoJson;
+                fileDocument.SampleDataJson = conversionResult.SampleDataJson;
+                fileDocument.Status = FileProcessingStatus.Completed;
+
+                // For small files, also keep ParsedContent for backward compatibility
+                if (conversionResult.RowCount <= _smallFileRowThreshold)
+                {
+                    fileDocument.ParsedContent = conversionResult.SampleDataJson;
+                }
+
+                _logger.LogInformation(
+                    "File {FileId} converted to Parquet: {RowCount} rows, stored at {ObjectKey}",
+                    fileDocument.Id, conversionResult.RowCount, parquetObjectKey);
+            }
+            else
+            {
+                // Parquet conversion failed — fall back to legacy parsing
+                _logger.LogWarning("Parquet conversion failed for {FileId}: {Error}. Falling back to legacy parser.", fileDocument.Id, conversionResult.ErrorMessage);
+
+                fileStream.Position = 0;
+                var parser = _fileParsers.FirstOrDefault(p => p.CanParse(fileType));
+                if (parser != null)
+                {
+                    var parseResult = await parser.ParseAsync(fileStream, fileDocument.OriginalFileName, cancellationToken);
+                    if (parseResult.Success)
+                    {
+                        fileDocument.ParsedContent = parseResult.ParsedContentJson;
+                        fileDocument.SchemaInfo = parseResult.SchemaInfoJson;
+                        fileDocument.RowCount = parseResult.RowCount;
+                        fileDocument.Status = FileProcessingStatus.Completed;
+                    }
+                    else
+                    {
+                        fileDocument.Status = FileProcessingStatus.Failed;
+                        fileDocument.ErrorMessage = parseResult.ErrorMessage;
+                    }
                 }
                 else
                 {
                     fileDocument.Status = FileProcessingStatus.Failed;
-                    fileDocument.ErrorMessage = parseResult.ErrorMessage;
+                    fileDocument.ErrorMessage = conversionResult.ErrorMessage;
                 }
             }
-            else
+        }
+        finally
+        {
+            // Always clean up the local temp Parquet file
+            if (File.Exists(tempParquetPath))
             {
-                fileDocument.Status = FileProcessingStatus.Failed;
-                fileDocument.ErrorMessage = conversionResult.ErrorMessage;
+                try { File.Delete(tempParquetPath); } catch { /* best effort */ }
             }
         }
     }

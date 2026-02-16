@@ -43,9 +43,16 @@ public class MinioService : IMinioService
 
     public async Task<string> UploadFileAsync(Stream fileStream, string fileName, string contentType, Guid userId)
     {
+        return await UploadFileAsync(fileStream, fileName, contentType, userId, prefix: null);
+    }
+
+    public async Task<string> UploadFileAsync(Stream fileStream, string fileName, string contentType, Guid userId, string? prefix)
+    {
         await EnsureBucketExistsAsync();
 
-        var objectName = GetObjectName(userId, fileName);
+        var objectName = string.IsNullOrEmpty(prefix)
+            ? GetObjectName(userId, fileName)
+            : $"{prefix}/{userId}/{fileName}";
 
         var putObjectArgs = new PutObjectArgs()
             .WithBucket(_bucketName)
