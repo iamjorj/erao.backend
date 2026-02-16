@@ -62,6 +62,9 @@ public class EraoDbContext : DbContext
             entity.Property(e => e.ParsedContent).HasColumnType("text");
             entity.Property(e => e.SchemaInfo).HasColumnType("text");
             entity.Property(e => e.StoragePath).HasMaxLength(1000);
+            entity.Property(e => e.ParquetStoragePath).HasMaxLength(1000);
+            entity.Property(e => e.UsesParquet).HasDefaultValue(false);
+            entity.Property(e => e.SampleDataJson).HasColumnType("text");
             entity.Property(e => e.ErrorMessage).HasMaxLength(2000);
 
             entity.HasOne(e => e.User)

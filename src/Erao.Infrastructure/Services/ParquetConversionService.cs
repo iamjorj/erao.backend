@@ -1,0 +1,307 @@
+using System.Text;
+using System.Text.Json;
+using ClosedXML.Excel;
+using DuckDB.NET.Data;
+using Erao.Core.Interfaces;
+using Microsoft.Extensions.Logging;
+
+namespace Erao.Infrastructure.Services;
+
+public class ParquetConversionService : IParquetConversionService
+{
+    private readonly ILogger<ParquetConversionService> _logger;
+
+    public ParquetConversionService(ILogger<ParquetConversionService> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task<ParquetConversionResult> ConvertCsvToParquetAsync(Stream csvStream, string outputPath)
+    {
+        string? tempCsvPath = null;
+        try
+        {
+            // Save stream to temp file (DuckDB reads from file path)
+            tempCsvPath = Path.GetTempFileName() + ".csv";
+            await using (var fileStream = File.Create(tempCsvPath))
+            {
+                await csvStream.CopyToAsync(fileStream);
+            }
+
+            // Ensure output directory exists
+            var outputDir = Path.GetDirectoryName(outputPath);
+            if (!string.IsNullOrEmpty(outputDir))
+                Directory.CreateDirectory(outputDir);
+
+            // Use DuckDB to convert CSV → Parquet
+            await using var connection = new DuckDBConnection("DataSource=:memory:");
+            await connection.OpenAsync();
+
+            var escapedCsv = EscapePath(tempCsvPath);
+            var escapedParquet = EscapePath(outputPath);
+
+            // COPY CSV to Parquet with ZSTD compression
+            var copySql = $"COPY (SELECT * FROM read_csv_auto('{escapedCsv}', header=true, all_varchar=false)) TO '{escapedParquet}' (FORMAT PARQUET, COMPRESSION ZSTD)";
+            await using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = copySql;
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            // Get row count
+            long rowCount;
+            await using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = $"SELECT COUNT(*) FROM read_parquet('{escapedParquet}')";
+                rowCount = (long)(await cmd.ExecuteScalarAsync() ?? 0);
+            }
+
+            // Get schema info
+            var schemaJson = await GetParquetSchemaAsync(outputPath, connection);
+
+            // Get sample data (first 100 rows)
+            var sampleJson = await GetSampleDataAsync(outputPath, 100, connection);
+
+            _logger.LogInformation("Converted CSV to Parquet: {RowCount} rows at {Path}", rowCount, outputPath);
+
+            return new ParquetConversionResult
+            {
+                Success = true,
+                ParquetPath = outputPath,
+                RowCount = rowCount,
+                SchemaInfoJson = schemaJson,
+                SampleDataJson = sampleJson
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to convert CSV to Parquet: {OutputPath}", outputPath);
+            // Clean up partial Parquet file on failure
+            if (File.Exists(outputPath))
+            {
+                try { File.Delete(outputPath); } catch { /* best effort */ }
+            }
+            return new ParquetConversionResult
+            {
+                Success = false,
+                ErrorMessage = $"Parquet conversion failed: {ex.Message}"
+            };
+        }
+        finally
+        {
+            if (tempCsvPath != null && File.Exists(tempCsvPath))
+            {
+                try { File.Delete(tempCsvPath); } catch { /* best effort */ }
+            }
+        }
+    }
+
+    public async Task<ParquetConversionResult> ConvertExcelToParquetAsync(Stream excelStream, string outputPath)
+    {
+        string? tempCsvPath = null;
+        try
+        {
+            // Convert Excel → temp CSV using ClosedXML, then CSV → Parquet
+            tempCsvPath = Path.GetTempFileName() + ".csv";
+            using (var workbook = new XLWorkbook(excelStream))
+            {
+                var worksheet = workbook.Worksheets.First();
+                var range = worksheet.RangeUsed();
+                if (range == null)
+                {
+                    return new ParquetConversionResult
+                    {
+                        Success = false,
+                        ErrorMessage = "Excel file has no data"
+                    };
+                }
+
+                await using var csvWriter = new StreamWriter(tempCsvPath, false, Encoding.UTF8);
+                var rowCount = range.RowCount();
+                var colCount = range.ColumnCount();
+
+                for (var row = 1; row <= rowCount; row++)
+                {
+                    var values = new List<string>();
+                    for (var col = 1; col <= colCount; col++)
+                    {
+                        var cell = worksheet.Cell(row, col);
+                        var value = cell.GetFormattedString();
+                        // Escape CSV: quote if contains comma, newline, or quote
+                        if (value.Contains(',') || value.Contains('\n') || value.Contains('"'))
+                        {
+                            value = "\"" + value.Replace("\"", "\"\"") + "\"";
+                        }
+                        values.Add(value);
+                    }
+                    await csvWriter.WriteLineAsync(string.Join(",", values));
+                }
+            }
+
+            // Now convert the temp CSV to Parquet using the CSV method
+            await using var csvStream2 = File.OpenRead(tempCsvPath);
+            // We already have the CSV on disk, so use DuckDB directly
+            await using var connection = new DuckDBConnection("DataSource=:memory:");
+            await connection.OpenAsync();
+
+            var outputDir = Path.GetDirectoryName(outputPath);
+            if (!string.IsNullOrEmpty(outputDir))
+                Directory.CreateDirectory(outputDir);
+
+            var escapedCsv = EscapePath(tempCsvPath);
+            var escapedParquet = EscapePath(outputPath);
+
+            var copySql = $"COPY (SELECT * FROM read_csv_auto('{escapedCsv}', header=true, all_varchar=false)) TO '{escapedParquet}' (FORMAT PARQUET, COMPRESSION ZSTD)";
+            await using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = copySql;
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            long parquetRowCount;
+            await using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = $"SELECT COUNT(*) FROM read_parquet('{escapedParquet}')";
+                parquetRowCount = (long)(await cmd.ExecuteScalarAsync() ?? 0);
+            }
+
+            var schemaJson = await GetParquetSchemaAsync(outputPath, connection);
+            var sampleJson = await GetSampleDataAsync(outputPath, 100, connection);
+
+            _logger.LogInformation("Converted Excel to Parquet: {RowCount} rows at {Path}", parquetRowCount, outputPath);
+
+            return new ParquetConversionResult
+            {
+                Success = true,
+                ParquetPath = outputPath,
+                RowCount = parquetRowCount,
+                SchemaInfoJson = schemaJson,
+                SampleDataJson = sampleJson
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to convert Excel to Parquet: {OutputPath}", outputPath);
+            if (File.Exists(outputPath))
+            {
+                try { File.Delete(outputPath); } catch { /* best effort */ }
+            }
+            return new ParquetConversionResult
+            {
+                Success = false,
+                ErrorMessage = $"Parquet conversion failed: {ex.Message}"
+            };
+        }
+        finally
+        {
+            if (tempCsvPath != null && File.Exists(tempCsvPath))
+            {
+                try { File.Delete(tempCsvPath); } catch { /* best effort */ }
+            }
+        }
+    }
+
+    public async Task<string> GetParquetSchemaAsync(string parquetPath)
+    {
+        await using var connection = new DuckDBConnection("DataSource=:memory:");
+        await connection.OpenAsync();
+        return await GetParquetSchemaAsync(parquetPath, connection);
+    }
+
+    public async Task<string> GetSampleDataAsync(string parquetPath, int count = 100)
+    {
+        await using var connection = new DuckDBConnection("DataSource=:memory:");
+        await connection.OpenAsync();
+        return await GetSampleDataAsync(parquetPath, count, connection);
+    }
+
+    public Task DeleteParquetFileAsync(string parquetPath)
+    {
+        if (File.Exists(parquetPath))
+        {
+            try
+            {
+                File.Delete(parquetPath);
+                _logger.LogInformation("Deleted Parquet file: {Path}", parquetPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to delete Parquet file: {Path}", parquetPath);
+            }
+        }
+        return Task.CompletedTask;
+    }
+
+    private static async Task<string> GetParquetSchemaAsync(string parquetPath, DuckDBConnection connection)
+    {
+        var escapedPath = EscapePath(parquetPath);
+        var columns = new List<object>();
+
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"DESCRIBE SELECT * FROM read_parquet('{escapedPath}')";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            var colName = reader.GetString(0);
+            var colType = reader.GetString(1);
+
+            columns.Add(new
+            {
+                Name = colName,
+                DataType = MapDuckDBTypeToSimple(colType),
+                IsNullable = true
+            });
+        }
+
+        return JsonSerializer.Serialize(columns);
+    }
+
+    private static async Task<string> GetSampleDataAsync(string parquetPath, int count, DuckDBConnection connection)
+    {
+        var escapedPath = EscapePath(parquetPath);
+        var rows = new List<Dictionary<string, object?>>();
+
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"SELECT * FROM read_parquet('{escapedPath}') LIMIT {count}";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var columnNames = new List<string>();
+        for (var i = 0; i < reader.FieldCount; i++)
+        {
+            columnNames.Add(reader.GetName(i));
+        }
+
+        while (await reader.ReadAsync())
+        {
+            var row = new Dictionary<string, object?>();
+            for (var i = 0; i < reader.FieldCount; i++)
+            {
+                row[columnNames[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+            }
+            rows.Add(row);
+        }
+
+        return JsonSerializer.Serialize(rows);
+    }
+
+    private static string MapDuckDBTypeToSimple(string duckDbType)
+    {
+        var upper = duckDbType.ToUpperInvariant();
+        if (upper.Contains("INT") || upper == "BIGINT" || upper == "SMALLINT" || upper == "TINYINT" || upper == "HUGEINT")
+            return "integer";
+        if (upper.Contains("FLOAT") || upper.Contains("DOUBLE") || upper.Contains("DECIMAL") || upper.Contains("NUMERIC"))
+            return "number";
+        if (upper == "BOOLEAN" || upper == "BOOL")
+            return "boolean";
+        if (upper.Contains("DATE") || upper.Contains("TIME") || upper.Contains("TIMESTAMP"))
+            return "date";
+        return "string";
+    }
+
+    private static string EscapePath(string path)
+    {
+        // DuckDB expects forward slashes and single-quote escaping
+        return path.Replace("\\", "/").Replace("'", "''");
+    }
+}

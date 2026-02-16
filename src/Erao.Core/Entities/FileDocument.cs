@@ -20,6 +20,12 @@ public class FileDocument : BaseEntity
     // Row count for tabular data
     public int? RowCount { get; set; }
 
+    // Parquet support for large files (DuckDB)
+    public string? ParquetStoragePath { get; set; }
+    public bool UsesParquet { get; set; }
+    public long? TotalRowCount { get; set; }
+    public string? SampleDataJson { get; set; }
+
     // Processing status
     public FileProcessingStatus Status { get; set; } = FileProcessingStatus.Pending;
     public string? ErrorMessage { get; set; }

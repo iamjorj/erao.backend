@@ -28,6 +28,21 @@ public interface IFileQueryService
     string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount, string? parsedContentJson);
 
     /// <summary>
+    /// Executes a SQL query against a file, auto-detecting Parquet (DuckDB) vs legacy (SQLite) path.
+    /// </summary>
+    Task<string> ExecuteQueryForFileAsync(Guid fileId, string query);
+
+    /// <summary>
+    /// Executes multiple SQL queries against a file, auto-detecting Parquet vs legacy path.
+    /// </summary>
+    Task<List<string>> ExecuteQueriesForFileAsync(Guid fileId, List<string> queries);
+
+    /// <summary>
+    /// Builds a schema description with sample data, supporting both Parquet and legacy files.
+    /// </summary>
+    string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount, string? sampleDataJson, bool usesParquet);
+
+    /// <summary>
     /// Gets preview data from a file (first N rows).
     /// </summary>
     Task<string> GetPreviewDataAsync(Guid fileId, int limit = 50);

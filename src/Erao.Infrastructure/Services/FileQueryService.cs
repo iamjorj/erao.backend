@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using DuckDB.NET.Data;
 using Erao.Core.Interfaces;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
@@ -18,6 +19,268 @@ public class FileQueryService : IFileQueryService
         _unitOfWork = unitOfWork;
         _logger = logger;
     }
+
+    // ─── DuckDB Parquet query methods ───────────────────────────────────
+
+    public async Task<string> ExecuteQueryForFileAsync(Guid fileId, string query)
+    {
+        var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
+        if (file == null)
+            return JsonSerializer.Serialize(new { error = "File not found", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+
+        // Route to Parquet (DuckDB) or legacy (SQLite) path
+        if (file.UsesParquet && !string.IsNullOrEmpty(file.ParquetStoragePath))
+        {
+            return await ExecuteQueryViaParquetAsync(file.ParquetStoragePath, query);
+        }
+
+        // Legacy SQLite path
+        if (string.IsNullOrEmpty(file.ParsedContent) || string.IsNullOrEmpty(file.SchemaInfo))
+            return JsonSerializer.Serialize(new { error = "No parsed content available", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+
+        return await ExecuteQueryAsync(file.ParsedContent, file.SchemaInfo, query);
+    }
+
+    public async Task<List<string>> ExecuteQueriesForFileAsync(Guid fileId, List<string> queries)
+    {
+        var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
+        if (file == null)
+        {
+            var errorJson = JsonSerializer.Serialize(new { error = "File not found", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+            return queries.Select(_ => errorJson).ToList();
+        }
+
+        // Route to Parquet (DuckDB) or legacy (SQLite) path
+        if (file.UsesParquet && !string.IsNullOrEmpty(file.ParquetStoragePath))
+        {
+            return await ExecuteQueriesViaParquetAsync(file.ParquetStoragePath, queries);
+        }
+
+        // Legacy SQLite path
+        if (string.IsNullOrEmpty(file.ParsedContent) || string.IsNullOrEmpty(file.SchemaInfo))
+        {
+            var errorJson = JsonSerializer.Serialize(new { error = "No parsed content available", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+            return queries.Select(_ => errorJson).ToList();
+        }
+
+        return await ExecuteQueriesAsync(file.ParsedContent, file.SchemaInfo, queries);
+    }
+
+    private async Task<string> ExecuteQueryViaParquetAsync(string parquetPath, string query)
+    {
+        var stopwatch = Stopwatch.StartNew();
+
+        try
+        {
+            await using var connection = new DuckDBConnection("DataSource=:memory:");
+            await connection.OpenAsync();
+
+            // Create a view named "data" pointing to the Parquet file
+            var escapedPath = parquetPath.Replace("\\", "/").Replace("'", "''");
+            await using (var viewCmd = connection.CreateCommand())
+            {
+                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{escapedPath}')";
+                await viewCmd.ExecuteNonQueryAsync();
+            }
+
+            _logger.LogInformation("DuckDB Parquet view created for {Path}", parquetPath);
+
+            return await ExecuteDuckDBQueryAsync(connection, query, stopwatch);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "DuckDB Parquet query failed: {Query}", query);
+            return JsonSerializer.Serialize(new { error = $"Query error: {ex.Message}", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+        }
+    }
+
+    private async Task<List<string>> ExecuteQueriesViaParquetAsync(string parquetPath, List<string> queries)
+    {
+        var results = new List<string>();
+
+        try
+        {
+            await using var connection = new DuckDBConnection("DataSource=:memory:");
+            await connection.OpenAsync();
+
+            var escapedPath = parquetPath.Replace("\\", "/").Replace("'", "''");
+            await using (var viewCmd = connection.CreateCommand())
+            {
+                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{escapedPath}')";
+                await viewCmd.ExecuteNonQueryAsync();
+            }
+
+            foreach (var query in queries)
+            {
+                try
+                {
+                    results.Add(await ExecuteDuckDBQueryAsync(connection, query, Stopwatch.StartNew()));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "DuckDB Parquet query failed: {Query}", query);
+                    results.Add(JsonSerializer.Serialize(new { error = $"Query error: {ex.Message}", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "DuckDB connection failed for Parquet queries");
+            var errorJson = JsonSerializer.Serialize(new { error = $"Connection error: {ex.Message}", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+            while (results.Count < queries.Count)
+                results.Add(errorJson);
+        }
+
+        return results;
+    }
+
+    private async Task<string> ExecuteDuckDBQueryAsync(DuckDBConnection connection, string query, Stopwatch stopwatch)
+    {
+        const int maxResultRows = 100000; // Cap at 100K rows for frontend safety
+        const int maxCellLength = 5000;
+
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = query;
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var columnNames = new List<string>();
+        for (int i = 0; i < reader.FieldCount; i++)
+        {
+            columnNames.Add(reader.GetName(i));
+        }
+
+        using var stream = new MemoryStream();
+        using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { SkipValidation = true });
+
+        writer.WriteStartObject();
+
+        writer.WritePropertyName("columns");
+        writer.WriteStartArray();
+        foreach (var col in columnNames)
+        {
+            writer.WriteStringValue(col);
+        }
+        writer.WriteEndArray();
+
+        writer.WritePropertyName("rows");
+        writer.WriteStartArray();
+
+        var rowCount = 0;
+        var truncated = false;
+
+        while (await reader.ReadAsync())
+        {
+            if (rowCount >= maxResultRows)
+            {
+                truncated = true;
+                break;
+            }
+
+            writer.WriteStartObject();
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
+                writer.WritePropertyName(columnNames[i]);
+
+                if (reader.IsDBNull(i))
+                {
+                    writer.WriteNullValue();
+                }
+                else
+                {
+                    var value = reader.GetValue(i);
+                    WriteJsonValue(writer, value, maxCellLength);
+                }
+            }
+            writer.WriteEndObject();
+            rowCount++;
+
+            if (rowCount % 10000 == 0)
+            {
+                await writer.FlushAsync();
+            }
+        }
+
+        writer.WriteEndArray();
+
+        stopwatch.Stop();
+
+        writer.WriteNumber("rowCount", rowCount);
+        writer.WriteNumber("executionTimeMs", stopwatch.ElapsedMilliseconds);
+
+        if (truncated)
+        {
+            writer.WriteBoolean("truncated", true);
+            writer.WriteNumber("maxRows", maxResultRows);
+        }
+
+        writer.WriteEndObject();
+        await writer.FlushAsync();
+
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private static void WriteJsonValue(Utf8JsonWriter writer, object value, int maxCellLength)
+    {
+        switch (value)
+        {
+            case double d:
+                if (double.IsNaN(d) || double.IsInfinity(d))
+                    writer.WriteNullValue();
+                else if (d == Math.Floor(d) && d >= long.MinValue && d <= long.MaxValue)
+                    writer.WriteNumberValue((long)d);
+                else
+                    writer.WriteNumberValue(Math.Round(d, 2));
+                break;
+            case float f:
+                if (float.IsNaN(f) || float.IsInfinity(f))
+                    writer.WriteNullValue();
+                else
+                    writer.WriteNumberValue(Math.Round(f, 2));
+                break;
+            case long l:
+                writer.WriteNumberValue(l);
+                break;
+            case int intVal:
+                writer.WriteNumberValue(intVal);
+                break;
+            case short s:
+                writer.WriteNumberValue(s);
+                break;
+            case decimal dec:
+                writer.WriteNumberValue(dec);
+                break;
+            case bool b:
+                writer.WriteBooleanValue(b);
+                break;
+            case string strVal:
+                if (strVal.Length > maxCellLength)
+                    writer.WriteStringValue(strVal.Substring(0, maxCellLength) + "...");
+                else
+                    writer.WriteStringValue(strVal);
+                break;
+            default:
+                var strValue = value.ToString() ?? "";
+                if (strValue.Length > maxCellLength)
+                    writer.WriteStringValue(strValue.Substring(0, maxCellLength) + "...");
+                else
+                    writer.WriteStringValue(strValue);
+                break;
+        }
+    }
+
+    public string BuildSchemaDescription(string schemaInfoJson, string tableName, int? rowCount, string? sampleDataJson, bool usesParquet)
+    {
+        // For Parquet files, sampleDataJson is pre-computed (first 100 rows stored at upload time)
+        // For legacy files, sampleDataJson is the full ParsedContent
+        if (usesParquet && !string.IsNullOrEmpty(sampleDataJson))
+        {
+            return BuildSchemaDescription(schemaInfoJson, tableName, rowCount, sampleDataJson);
+        }
+        return BuildSchemaDescription(schemaInfoJson, tableName, rowCount, sampleDataJson);
+    }
+
+    // ─── DuckDB-aware preview/stats for Parquet files ────────────────────
 
     public async Task<string> ExecuteQueryAsync(string parsedContentJson, string schemaInfoJson, string query)
     {
@@ -605,25 +868,42 @@ public class FileQueryService : IFileQueryService
     public async Task<string> GetPreviewDataAsync(Guid fileId, int limit = 50)
     {
         var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
-        if (file == null || string.IsNullOrEmpty(file.ParsedContent))
-        {
+        if (file == null)
             return JsonSerializer.Serialize(new { columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+
+        // Parquet path
+        if (file.UsesParquet && !string.IsNullOrEmpty(file.ParquetStoragePath))
+        {
+            var query = $"SELECT * FROM \"data\" LIMIT {Math.Min(limit, 100)}";
+            return await ExecuteQueryViaParquetAsync(file.ParquetStoragePath, query);
         }
 
-        var query = $"SELECT * FROM {TableName} LIMIT {Math.Min(limit, 100)}";
-        return await ExecuteQueryAsync(file.ParsedContent, file.SchemaInfo ?? "[]", query);
+        // Legacy SQLite path
+        if (string.IsNullOrEmpty(file.ParsedContent))
+            return JsonSerializer.Serialize(new { columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
+
+        var sqliteQuery = $"SELECT * FROM {TableName} LIMIT {Math.Min(limit, 100)}";
+        return await ExecuteQueryAsync(file.ParsedContent, file.SchemaInfo ?? "[]", sqliteQuery);
     }
 
     public async Task<string> GetColumnStatsAsync(Guid fileId, string columnName)
     {
         var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
-        if (file == null || string.IsNullOrEmpty(file.ParsedContent))
-        {
+        if (file == null)
             return JsonSerializer.Serialize(new { error = "File not found" });
-        }
 
         var safeColumn = new string(columnName.Where(c => char.IsLetterOrDigit(c) || c == '_' || c == ' ').ToArray());
         var quotedColumn = $"\"{safeColumn}\"";
+
+        // Parquet path (DuckDB)
+        if (file.UsesParquet && !string.IsNullOrEmpty(file.ParquetStoragePath))
+        {
+            return await GetColumnStatsViaDuckDBAsync(file, columnName, safeColumn, quotedColumn);
+        }
+
+        // Legacy SQLite path
+        if (string.IsNullOrEmpty(file.ParsedContent))
+            return JsonSerializer.Serialize(new { error = "No parsed content available" });
 
         var stopwatch = Stopwatch.StartNew();
 
@@ -687,6 +967,75 @@ public class FileQueryService : IFileQueryService
         return JsonSerializer.Serialize(result);
     }
 
+    private async Task<string> GetColumnStatsViaDuckDBAsync(Core.Entities.FileDocument file, string columnName, string safeColumn, string quotedColumn)
+    {
+        try
+        {
+            await using var connection = new DuckDBConnection("DataSource=:memory:");
+            await connection.OpenAsync();
+
+            var escapedPath = file.ParquetStoragePath!.Replace("\\", "/").Replace("'", "''");
+            await using (var viewCmd = connection.CreateCommand())
+            {
+                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{escapedPath}')";
+                await viewCmd.ExecuteNonQueryAsync();
+            }
+
+            var columns = ParseSchema(file.SchemaInfo ?? "[]");
+            var result = new Dictionary<string, object?>();
+
+            var statsQuery = $@"
+                SELECT
+                    COUNT(*) as total_count,
+                    COUNT(*) - COUNT({quotedColumn}) as null_count,
+                    COUNT(DISTINCT {quotedColumn}) as unique_count,
+                    MIN({quotedColumn}) as min_value,
+                    MAX({quotedColumn}) as max_value,
+                    AVG(TRY_CAST({quotedColumn} AS DOUBLE)) as avg_value
+                FROM ""data""";
+
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = statsQuery;
+            await using var reader = await cmd.ExecuteReaderAsync();
+
+            if (await reader.ReadAsync())
+            {
+                var totalCount = Convert.ToInt64(reader.GetValue(0));
+                var nullCount = Convert.ToInt64(reader.GetValue(1));
+
+                result["columnName"] = columnName;
+                result["dataType"] = columns.FirstOrDefault(c => c.Name == columnName)?.DataType ?? "unknown";
+                result["totalCount"] = totalCount;
+                result["nullCount"] = nullCount;
+                result["nullPercentage"] = totalCount > 0 ? Math.Round((double)nullCount / totalCount * 100, 2) : 0;
+                result["uniqueCount"] = Convert.ToInt64(reader.GetValue(2));
+                result["minValue"] = reader.IsDBNull(3) ? null : reader.GetValue(3);
+                result["maxValue"] = reader.IsDBNull(4) ? null : reader.GetValue(4);
+                result["avgValue"] = reader.IsDBNull(5) ? null : Math.Round(Convert.ToDouble(reader.GetValue(5)), 2);
+            }
+
+            // Get sample values
+            var sampleQuery = $"SELECT DISTINCT {quotedColumn} FROM \"data\" WHERE {quotedColumn} IS NOT NULL LIMIT 10";
+            await using var sampleCmd = connection.CreateCommand();
+            sampleCmd.CommandText = sampleQuery;
+            await using var sampleReader = await sampleCmd.ExecuteReaderAsync();
+
+            var samples = new List<object?>();
+            while (await sampleReader.ReadAsync())
+            {
+                samples.Add(sampleReader.IsDBNull(0) ? null : sampleReader.GetValue(0));
+            }
+            result["sampleValues"] = samples;
+
+            return JsonSerializer.Serialize(result);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "DuckDB column stats failed for {Column}", columnName);
+            return JsonSerializer.Serialize(new { error = $"Stats error: {ex.Message}" });
+        }
+    }
+
     public async Task<string> GetSchemaAsync(Guid fileId)
     {
         var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
@@ -700,10 +1049,18 @@ public class FileQueryService : IFileQueryService
     public async Task<string> GetFileStatsAsync(Guid fileId)
     {
         var file = await _unitOfWork.FileDocuments.GetByIdAsync(fileId);
-        if (file == null || string.IsNullOrEmpty(file.ParsedContent))
-        {
+        if (file == null)
             return JsonSerializer.Serialize(new { rowCount = 0, columns = Array.Empty<object>() });
+
+        // Parquet path (DuckDB)
+        if (file.UsesParquet && !string.IsNullOrEmpty(file.ParquetStoragePath))
+        {
+            return await GetFileStatsViaDuckDBAsync(file);
         }
+
+        // Legacy SQLite path
+        if (string.IsNullOrEmpty(file.ParsedContent))
+            return JsonSerializer.Serialize(new { rowCount = 0, columns = Array.Empty<object>() });
 
         var columns = ParseSchema(file.SchemaInfo ?? "[]");
 
@@ -763,6 +1120,67 @@ public class FileQueryService : IFileQueryService
             columnCount = columns.Count,
             columns = columnStats
         });
+    }
+
+    private async Task<string> GetFileStatsViaDuckDBAsync(Core.Entities.FileDocument file)
+    {
+        try
+        {
+            await using var connection = new DuckDBConnection("DataSource=:memory:");
+            await connection.OpenAsync();
+
+            var escapedPath = file.ParquetStoragePath!.Replace("\\", "/").Replace("'", "''");
+            await using (var viewCmd = connection.CreateCommand())
+            {
+                viewCmd.CommandText = $"CREATE VIEW \"data\" AS SELECT * FROM read_parquet('{escapedPath}')";
+                await viewCmd.ExecuteNonQueryAsync();
+            }
+
+            // Get row count
+            long rowCount;
+            await using (var cmd = connection.CreateCommand())
+            {
+                cmd.CommandText = "SELECT COUNT(*) FROM \"data\"";
+                rowCount = Convert.ToInt64(await cmd.ExecuteScalarAsync() ?? 0);
+            }
+
+            var columns = ParseSchema(file.SchemaInfo ?? "[]");
+            var columnStats = new List<object>();
+
+            foreach (var col in columns.Take(10))
+            {
+                try
+                {
+                    var quotedCol = $"\"{col.Name}\"";
+                    await using var cmd = connection.CreateCommand();
+                    cmd.CommandText = $"SELECT COUNT(*) - COUNT({quotedCol}) FROM \"data\"";
+                    var nullCount = Convert.ToInt64(await cmd.ExecuteScalarAsync() ?? 0);
+
+                    columnStats.Add(new
+                    {
+                        name = col.Name,
+                        dataType = col.DataType,
+                        nullPercentage = rowCount > 0 ? Math.Round((double)nullCount / rowCount * 100, 2) : 0
+                    });
+                }
+                catch
+                {
+                    columnStats.Add(new { name = col.Name, dataType = col.DataType, nullPercentage = 0 });
+                }
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                rowCount,
+                columnCount = columns.Count,
+                columns = columnStats
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "DuckDB file stats failed for {FileId}", file.Id);
+            return JsonSerializer.Serialize(new { rowCount = file.TotalRowCount ?? 0, columns = Array.Empty<object>() });
+        }
     }
 
     private class ColumnDef

@@ -14,8 +14,11 @@ public class FileDocumentService : IFileDocumentService
     private readonly IUnitOfWork _unitOfWork;
     private readonly IEnumerable<IFileParser> _fileParsers;
     private readonly IMinioService _minioService;
+    private readonly IParquetConversionService _parquetConversionService;
     private readonly ILogger<FileDocumentService> _logger;
     private readonly long _maxFileSizeBytes;
+    private readonly string _parquetBasePath;
+    private readonly int _smallFileRowThreshold;
 
     private static readonly Dictionary<string, FileType> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -33,14 +36,18 @@ public class FileDocumentService : IFileDocumentService
         IUnitOfWork unitOfWork,
         IEnumerable<IFileParser> fileParsers,
         IMinioService minioService,
+        IParquetConversionService parquetConversionService,
         IConfiguration configuration,
         ILogger<FileDocumentService> logger)
     {
         _unitOfWork = unitOfWork;
         _fileParsers = fileParsers;
         _minioService = minioService;
+        _parquetConversionService = parquetConversionService;
         _logger = logger;
         _maxFileSizeBytes = configuration.GetValue<long>("FileStorage:MaxFileSizeBytes", 100 * 1024 * 1024); // 100MB default
+        _parquetBasePath = configuration.GetValue<string>("ParquetStorage:BasePath") ?? Path.Combine(Directory.GetCurrentDirectory(), "data", "parquet");
+        _smallFileRowThreshold = configuration.GetValue<int>("ParquetStorage:SmallFileRowThreshold", 50000);
     }
 
     public async Task<FileUploadResponse> UploadFileAsync(Guid userId, IFormFile file, CancellationToken cancellationToken = default)
@@ -104,39 +111,47 @@ public class FileDocumentService : IFileDocumentService
             // Download from MinIO to parse
             using var fileStream = await _minioService.DownloadFileAsync(objectName);
 
-            // Parse file
-            var parser = _fileParsers.FirstOrDefault(p => p.CanParse(fileType));
-            if (parser != null)
+            // For CSV/Excel: convert to Parquet via DuckDB (supports 500M+ rows)
+            if (fileType == FileType.Csv || fileType == FileType.Excel)
             {
-                var parseResult = await parser.ParseAsync(fileStream, file.FileName, cancellationToken);
-
-                if (parseResult.Success)
-                {
-                    fileDocument.ParsedContent = parseResult.ParsedContentJson;
-                    fileDocument.SchemaInfo = parseResult.SchemaInfoJson;
-                    fileDocument.RowCount = parseResult.RowCount;
-                    fileDocument.Status = FileProcessingStatus.Completed;
-                }
-                else
-                {
-                    fileDocument.Status = FileProcessingStatus.Failed;
-                    fileDocument.ErrorMessage = parseResult.ErrorMessage;
-                }
+                await ConvertToParquetAsync(fileDocument, fileStream, fileType, cancellationToken);
             }
             else
             {
-                // For unsupported parsing (like plain text), just store as-is
-                if (fileType == FileType.Text || fileType == FileType.Json || fileType == FileType.Xml)
+                // Non-tabular files: use legacy parsing
+                var parser = _fileParsers.FirstOrDefault(p => p.CanParse(fileType));
+                if (parser != null)
                 {
-                    using var reader = new StreamReader(fileStream);
-                    var content = await reader.ReadToEndAsync(cancellationToken);
-                    fileDocument.ParsedContent = content;
-                    fileDocument.Status = FileProcessingStatus.Completed;
+                    var parseResult = await parser.ParseAsync(fileStream, file.FileName, cancellationToken);
+
+                    if (parseResult.Success)
+                    {
+                        fileDocument.ParsedContent = parseResult.ParsedContentJson;
+                        fileDocument.SchemaInfo = parseResult.SchemaInfoJson;
+                        fileDocument.RowCount = parseResult.RowCount;
+                        fileDocument.Status = FileProcessingStatus.Completed;
+                    }
+                    else
+                    {
+                        fileDocument.Status = FileProcessingStatus.Failed;
+                        fileDocument.ErrorMessage = parseResult.ErrorMessage;
+                    }
                 }
                 else
                 {
-                    fileDocument.Status = FileProcessingStatus.Failed;
-                    fileDocument.ErrorMessage = $"No parser available for file type: {fileType}";
+                    // For unsupported parsing (like plain text), just store as-is
+                    if (fileType == FileType.Text || fileType == FileType.Json || fileType == FileType.Xml)
+                    {
+                        using var reader = new StreamReader(fileStream);
+                        var content = await reader.ReadToEndAsync(cancellationToken);
+                        fileDocument.ParsedContent = content;
+                        fileDocument.Status = FileProcessingStatus.Completed;
+                    }
+                    else
+                    {
+                        fileDocument.Status = FileProcessingStatus.Failed;
+                        fileDocument.ErrorMessage = $"No parser available for file type: {fileType}";
+                    }
                 }
             }
 
@@ -203,7 +218,27 @@ public class FileDocumentService : IFileDocumentService
 
         // Get sample data (first 5 rows)
         string? sampleData = null;
-        if (!string.IsNullOrEmpty(file.ParsedContent))
+
+        // Parquet files: use pre-computed SampleDataJson
+        if (file.UsesParquet && !string.IsNullOrEmpty(file.SampleDataJson))
+        {
+            try
+            {
+                var data = JsonSerializer.Deserialize<List<Dictionary<string, object?>>>(file.SampleDataJson);
+                if (data != null)
+                {
+                    var sample = data.Take(5).ToList();
+                    sampleData = JsonSerializer.Serialize(sample, new JsonSerializerOptions { WriteIndented = true });
+                }
+            }
+            catch
+            {
+                sampleData = file.SampleDataJson.Length > 500
+                    ? file.SampleDataJson.Substring(0, 500) + "..."
+                    : file.SampleDataJson;
+            }
+        }
+        else if (!string.IsNullOrEmpty(file.ParsedContent))
         {
             try
             {
@@ -229,7 +264,7 @@ public class FileDocumentService : IFileDocumentService
             FileName = file.OriginalFileName,
             FileType = file.FileType,
             Columns = columns,
-            TotalRows = file.RowCount ?? 0,
+            TotalRows = (int)(file.TotalRowCount ?? file.RowCount ?? 0),
             SampleData = sampleData
         };
     }
@@ -298,6 +333,12 @@ public class FileDocumentService : IFileDocumentService
             }
         }
 
+        // Delete Parquet file from disk
+        if (!string.IsNullOrEmpty(file.ParquetStoragePath))
+        {
+            await _parquetConversionService.DeleteParquetFileAsync(file.ParquetStoragePath);
+        }
+
         await _unitOfWork.FileDocuments.DeleteAsync(file);
         await _unitOfWork.SaveChangesAsync();
 
@@ -311,6 +352,71 @@ public class FileDocumentService : IFileDocumentService
         return file?.ParsedContent;
     }
 
+
+    private async Task ConvertToParquetAsync(FileDocument fileDocument, Stream fileStream, FileType fileType, CancellationToken cancellationToken)
+    {
+        var parquetPath = Path.Combine(_parquetBasePath, fileDocument.UserId.ToString(), $"{fileDocument.Id}.parquet");
+
+        ParquetConversionResult conversionResult;
+        if (fileType == FileType.Csv)
+        {
+            conversionResult = await _parquetConversionService.ConvertCsvToParquetAsync(fileStream, parquetPath);
+        }
+        else
+        {
+            conversionResult = await _parquetConversionService.ConvertExcelToParquetAsync(fileStream, parquetPath);
+        }
+
+        if (conversionResult.Success)
+        {
+            fileDocument.UsesParquet = true;
+            fileDocument.ParquetStoragePath = conversionResult.ParquetPath;
+            fileDocument.TotalRowCount = conversionResult.RowCount;
+            fileDocument.RowCount = conversionResult.RowCount <= int.MaxValue ? (int)conversionResult.RowCount : int.MaxValue;
+            fileDocument.SchemaInfo = conversionResult.SchemaInfoJson;
+            fileDocument.SampleDataJson = conversionResult.SampleDataJson;
+            fileDocument.Status = FileProcessingStatus.Completed;
+
+            // For small files, also keep ParsedContent for backward compatibility
+            if (conversionResult.RowCount <= _smallFileRowThreshold)
+            {
+                fileDocument.ParsedContent = conversionResult.SampleDataJson;
+            }
+
+            _logger.LogInformation(
+                "File {FileId} converted to Parquet: {RowCount} rows at {Path}",
+                fileDocument.Id, conversionResult.RowCount, conversionResult.ParquetPath);
+        }
+        else
+        {
+            // Parquet conversion failed — fall back to legacy parsing
+            _logger.LogWarning("Parquet conversion failed for {FileId}: {Error}. Falling back to legacy parser.", fileDocument.Id, conversionResult.ErrorMessage);
+
+            fileStream.Position = 0;
+            var parser = _fileParsers.FirstOrDefault(p => p.CanParse(fileType));
+            if (parser != null)
+            {
+                var parseResult = await parser.ParseAsync(fileStream, fileDocument.OriginalFileName, cancellationToken);
+                if (parseResult.Success)
+                {
+                    fileDocument.ParsedContent = parseResult.ParsedContentJson;
+                    fileDocument.SchemaInfo = parseResult.SchemaInfoJson;
+                    fileDocument.RowCount = parseResult.RowCount;
+                    fileDocument.Status = FileProcessingStatus.Completed;
+                }
+                else
+                {
+                    fileDocument.Status = FileProcessingStatus.Failed;
+                    fileDocument.ErrorMessage = parseResult.ErrorMessage;
+                }
+            }
+            else
+            {
+                fileDocument.Status = FileProcessingStatus.Failed;
+                fileDocument.ErrorMessage = conversionResult.ErrorMessage;
+            }
+        }
+    }
 
     private FileDocumentDto MapToDto(FileDocument file)
     {

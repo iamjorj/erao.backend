@@ -53,6 +53,7 @@ public static class ServiceExtensions
         services.AddHttpClient<IOllamaService, OllamaService>();
         services.AddScoped<IDatabaseQueryService, DatabaseQueryService>();
         services.AddScoped<IFileQueryService, FileQueryService>();
+        services.AddScoped<IParquetConversionService, ParquetConversionService>();
         services.AddHttpClient<IEmailService, EmailService>();
         services.AddHttpClient<IDodoPaymentsService, DodoPaymentsService>();
 

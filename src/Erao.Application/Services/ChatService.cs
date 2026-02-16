@@ -121,9 +121,16 @@ public class ChatService : IChatService
             fileDocument = await _unitOfWork.FileDocuments.GetByIdAsync(conversation.FileDocumentId.Value);
             if (fileDocument != null)
             {
-                // Build a SQLite-oriented schema description with sample data for the AI
+                // Use SampleDataJson for Parquet files (avoids loading huge ParsedContent)
+                var sampleData = fileDocument.UsesParquet
+                    ? fileDocument.SampleDataJson
+                    : fileDocument.ParsedContent;
+                var effectiveRowCount = fileDocument.UsesParquet
+                    ? (int?)(fileDocument.TotalRowCount <= int.MaxValue ? (int?)fileDocument.TotalRowCount : int.MaxValue)
+                    : fileDocument.RowCount;
+
                 schemaContext = _fileQueryService.BuildSchemaDescription(
-                    fileDocument.SchemaInfo ?? "[]", "data", fileDocument.RowCount, fileDocument.ParsedContent);
+                    fileDocument.SchemaInfo ?? "[]", "data", effectiveRowCount, sampleData, fileDocument.UsesParquet);
             }
         }
 
@@ -179,7 +186,9 @@ public class ChatService : IChatService
 
         // Build system prompt - different for database vs file
         var systemPrompt = fileDocument != null
-            ? BuildFileSystemPrompt(schemaContext, fileDocument.OriginalFileName, fileDocument.RowCount)
+            ? BuildFileSystemPrompt(schemaContext, fileDocument.OriginalFileName,
+                fileDocument.UsesParquet ? (int?)(fileDocument.TotalRowCount <= int.MaxValue ? (int?)fileDocument.TotalRowCount : int.MaxValue) : fileDocument.RowCount,
+                fileDocument.UsesParquet)
             : BuildSystemPrompt(schemaContext, dbConnection?.DatabaseType);
 
         // Get AI response with full conversation history
@@ -345,10 +354,13 @@ public class ChatService : IChatService
         }
         else if (fileDocument != null && request.ExecuteQuery)
         {
-            // File mode: extract SQL from AI response and execute against in-memory SQLite
+            // File mode: extract SQL from AI response and execute via DuckDB (Parquet) or SQLite (legacy)
             var sqlQueries = ExtractAllSqlFromResponse(aiResponse);
+            var hasQueryableData = fileDocument.UsesParquet
+                ? !string.IsNullOrEmpty(fileDocument.ParquetStoragePath)
+                : !string.IsNullOrEmpty(fileDocument.ParsedContent) && !string.IsNullOrEmpty(fileDocument.SchemaInfo);
 
-            if (sqlQueries.Count > 0 && !string.IsNullOrEmpty(fileDocument.ParsedContent) && !string.IsNullOrEmpty(fileDocument.SchemaInfo))
+            if (sqlQueries.Count > 0 && hasQueryableData)
             {
                 // Layer 1: Schema pre-validation for file mode
                 if (schemaLookup.Count > 0)
@@ -358,7 +370,7 @@ public class ChatService : IChatService
                     if (!validation.IsValid)
                     {
                         var correctionHint = validation.BuildCorrectionHint();
-                        var fixPrompt = BuildSqlRetryPrompt(combinedSql, correctionHint, schemaContext, null, true);
+                        var fixPrompt = BuildSqlRetryPrompt(combinedSql, correctionHint, schemaContext, null, !fileDocument.UsesParquet, fileDocument.UsesParquet);
                         var (fixResponse, fixTokens) = await _ollamaService.ChatAsync(
                             $"Fix schema issues: {correctionHint}", new List<(string, string)>(), fixPrompt);
                         tokensUsed += fixTokens;
@@ -382,13 +394,13 @@ public class ChatService : IChatService
                     {
                         if (sqlQueries.Count == 1)
                         {
-                            queryResult = await _fileQueryService.ExecuteQueryAsync(
-                                fileDocument.ParsedContent, fileDocument.SchemaInfo, sqlQueries[0]);
+                            queryResult = await _fileQueryService.ExecuteQueryForFileAsync(
+                                fileDocument.Id, sqlQueries[0]);
                         }
                         else
                         {
-                            var results = await _fileQueryService.ExecuteQueriesAsync(
-                                fileDocument.ParsedContent, fileDocument.SchemaInfo, sqlQueries);
+                            var results = await _fileQueryService.ExecuteQueriesForFileAsync(
+                                fileDocument.Id, sqlQueries);
                             var allResults = new List<object>();
                             foreach (var result in results)
                             {
@@ -408,7 +420,7 @@ public class ChatService : IChatService
                         {
                             // Ask AI to fix the SQL
                             var failedSql = string.Join("\n\n", sqlQueries);
-                            var retryPrompt = BuildSqlRetryPrompt(failedSql, ex.Message, schemaContext, null, true);
+                            var retryPrompt = BuildSqlRetryPrompt(failedSql, ex.Message, schemaContext, null, !fileDocument.UsesParquet, fileDocument.UsesParquet);
                             var (retryResponse, retryTokens) = await _ollamaService.ChatAsync(
                                 $"Fix this SQL error: {ex.Message}", new List<(string role, string content)>(), retryPrompt);
                             tokensUsed += retryTokens;
@@ -752,9 +764,9 @@ No schema available. Tell the user to connect a database first.";
         return prompt;
     }
 
-    private static string BuildSqlRetryPrompt(string failedSql, string errorMessage, string? schemaContext, DatabaseType? dbType, bool isFile = false)
+    private static string BuildSqlRetryPrompt(string failedSql, string errorMessage, string? schemaContext, DatabaseType? dbType, bool isFile = false, bool isDuckDBFile = false)
     {
-        var dialect = isFile ? "SQLite" : dbType switch
+        var dialect = isDuckDBFile ? "DuckDB" : isFile ? "SQLite" : dbType switch
         {
             DatabaseType.PostgreSQL => "PostgreSQL",
             DatabaseType.MySQL => "MySQL",
@@ -789,7 +801,14 @@ RULES:
 - SELECT queries only.
 - Also include the original ```viz block if the query had visualization intent.";
 
-        if (isFile)
+        if (isDuckDBFile)
+        {
+            prompt += @"
+- DuckDB dialect (PostgreSQL-compatible). Table is ""data"". Double-quote all identifiers.
+- ROUND(value, N) works directly. ILIKE for case-insensitive. TRY_CAST() for safe conversion.
+- RIGHT JOIN and FULL OUTER JOIN work. UNION ALL + ORDER BY works directly.";
+        }
+        else if (isFile)
         {
             prompt += @"
 - SQLite dialect. Table is ""data"". Double-quote all identifiers.";
@@ -1105,11 +1124,21 @@ SCHEMA:
         return string.IsNullOrEmpty(cleaned) ? "New Chat" : cleaned;
     }
 
-    private static string BuildFileSystemPrompt(string? schemaContext, string fileName, int? rowCount)
+    private static string BuildFileSystemPrompt(string? schemaContext, string fileName, int? rowCount, bool usesParquet = false)
     {
         var rowInfo = rowCount.HasValue ? $" ({rowCount.Value:N0} rows)" : "";
 
-        var prompt = $@"You are Erao, an expert data analyst. The user uploaded '{fileName}'{rowInfo}. Data is in a SQLite table called ""data"". You can ONLY answer questions about THIS file's columns. If a question matches any column, ALWAYS query it. Only refuse for topics with no matching column.
+        // DuckDB (Parquet) vs SQLite dialect
+        var dialect = usesParquet ? "DuckDB" : "SQLite";
+        var dialectRules = usesParquet
+            ? @"A. **Dialect**: DuckDB (PostgreSQL-compatible). Table is always ""data"". Double-quote ALL identifiers: SELECT ""Column Name"" FROM ""data"". Column names are CASE-SENSITIVE — use exact names from the schema. ROUND(value, N) works directly on all types. ILIKE for case-insensitive matching. Use TRY_CAST() for safe type conversion. RIGHT JOIN and FULL OUTER JOIN work. UNION ALL + ORDER BY works directly. SELECT only."
+            : @"A. **Dialect**: SQLite. Table is always ""data"". Double-quote ALL identifiers: SELECT ""Column Name"" FROM ""data"". Column names are CASE-SENSITIVE — use exact names from the schema. Date functions: DATE('now'), STRFTIME(). No RIGHT JOIN or FULL OUTER JOIN. SELECT only. UNION ALL + ORDER BY: SQLite cannot use complex expressions (CASE, functions) in ORDER BY after UNION ALL. Instead, wrap the UNION ALL in a subquery first: SELECT * FROM (...UNION ALL...) ORDER BY ...;";
+
+        var dataCleaning = usesParquet
+            ? @"B. **Data cleaning**: Before ANY numeric operation on text columns, filter out junk: WHERE ""Col"" IS NOT NULL AND ""Col"" != '' AND ""Col"" NOT IN ('Not Mentioned', 'N/A', '-', 'null'). COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: TRY_CAST(REPLACE(""Col"", ',', '') AS DOUBLE). When a column mixes numbers with text placeholders: filter non-numeric rows in a CTE first, TRY_CAST to DOUBLE, then rank."
+            : @"B. **Data cleaning**: Before ANY numeric operation on text columns, filter out junk: WHERE ""Col"" IS NOT NULL AND ""Col"" != '' AND ""Col"" NOT IN ('Not Mentioned', 'N/A', '-', 'null'). COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: CAST(REPLACE(""Col"", ',', '') AS REAL). When a column mixes numbers with text placeholders: filter non-numeric rows in a CTE first, CAST to REAL, then rank.";
+
+        var prompt = $@"You are Erao, an expert data analyst. The user uploaded '{fileName}'{rowInfo}. Data is in a {dialect} table called ""data"". You can ONLY answer questions about THIS file's columns. If a question matches any column, ALWAYS query it. Only refuse for topics with no matching column.
 
 ## 1. RESPONSE FORMAT
 
@@ -1139,9 +1168,9 @@ Classify the user's intent, then follow the matching format:
 
 ## 2. SQL RULES
 
-A. **Dialect**: SQLite. Table is always ""data"". Double-quote ALL identifiers: SELECT ""Column Name"" FROM ""data"". Column names are CASE-SENSITIVE — use exact names from the schema. Date functions: DATE('now'), STRFTIME(). No RIGHT JOIN or FULL OUTER JOIN. SELECT only. UNION ALL + ORDER BY: SQLite cannot use complex expressions (CASE, functions) in ORDER BY after UNION ALL. Instead, wrap the UNION ALL in a subquery first: SELECT * FROM (...UNION ALL...) ORDER BY ...;
+{dialectRules}
 
-B. **Data cleaning**: Before ANY numeric operation on text columns, filter out junk: WHERE ""Col"" IS NOT NULL AND ""Col"" != '' AND ""Col"" NOT IN ('Not Mentioned', 'N/A', '-', 'null'). COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: CAST(REPLACE(""Col"", ',', '') AS REAL). When a column mixes numbers with text placeholders: filter non-numeric rows in a CTE first, CAST to REAL, then rank.
+{dataCleaning}
 
 C. **Composite scores**: For abstract concepts (""most productive"", ""healthiest"", ""at-risk""), NEVER sort by one column. Look at ALL scoreable columns in the schema (tagged NUMERIC, MIXED, BOOLEAN), normalize each with PERCENT_RANK() OVER (ORDER BY col) to 0-1 scale, weight by importance to the question, sum into a final score. Use CTEs for cleaning → scoring → final SELECT.
 - PERCENT_RANK: 0.0 = first row, 1.0 = last row. Higher-is-better → ORDER BY ASC. Lower-is-better → ORDER BY DESC.

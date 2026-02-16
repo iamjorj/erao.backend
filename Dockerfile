@@ -25,8 +25,10 @@ RUN dotnet publish src/Erao.API/Erao.API.csproj -c Release -o /app/publish --no-
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
 WORKDIR /app
 
-# Create non-root user for security
-RUN adduser --disabled-password --gecos "" appuser && chown -R appuser /app
+# Create Parquet data directory and non-root user for security
+RUN mkdir -p /app/data/parquet && \
+    adduser --disabled-password --gecos "" appuser && \
+    chown -R appuser /app
 USER appuser
 
 # Copy published application
