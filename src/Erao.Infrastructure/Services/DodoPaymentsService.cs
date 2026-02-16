@@ -116,7 +116,6 @@ public class DodoPaymentsService : IDodoPaymentsService
         }
 
         var json = await response.Content.ReadAsStringAsync();
-        _logger.LogDebug("Dodo checkout response: {Response}", json);
 
         using var doc = JsonDocument.Parse(json);
 

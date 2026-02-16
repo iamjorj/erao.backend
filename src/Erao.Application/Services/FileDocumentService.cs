@@ -108,10 +108,6 @@ public class FileDocumentService : IFileDocumentService
 
             // Download from MinIO to parse
             using var fileStream = await _minioService.DownloadFileAsync(objectName);
-            _logger.LogInformation("[DEBUG] MinIO download stream: Type={Type}, CanSeek={CanSeek}, CanRead={CanRead}, Length={Length}, Position={Position}",
-                fileStream.GetType().Name, fileStream.CanSeek, fileStream.CanRead,
-                fileStream.CanSeek ? fileStream.Length : -1,
-                fileStream.CanSeek ? fileStream.Position : -1);
 
             // For CSV/Excel: convert to Parquet via DuckDB (supports 500M+ rows)
             if (fileType == FileType.Csv || fileType == FileType.Excel)
@@ -379,9 +375,6 @@ public class FileDocumentService : IFileDocumentService
             {
                 conversionResult = await _parquetConversionService.ConvertExcelToParquetAsync(fileStream, tempParquetPath);
             }
-
-            _logger.LogInformation("[DEBUG] Parquet conversion result: Success={Success}, RowCount={RowCount}, Error={Error}",
-                conversionResult.Success, conversionResult.RowCount, conversionResult.ErrorMessage ?? "none");
 
             if (conversionResult.Success)
             {

@@ -13,10 +13,10 @@ public static class SubscriptionLimits
     /// </summary>
     public static int GetQueryLimit(SubscriptionTier tier) => tier switch
     {
-        SubscriptionTier.Starter => 10,
-        SubscriptionTier.Professional => 100,
+        SubscriptionTier.Starter => 25,
+        SubscriptionTier.Professional => 150,
         SubscriptionTier.Enterprise => -1, // Unlimited
-        _ => 10
+        _ => 25
     };
 
     /// <summary>
@@ -83,19 +83,19 @@ public static class SubscriptionLimits
         SubscriptionTier.Starter => new List<string>
         {
             "1 database connection",
-            "10 queries/month"
+            "25 queries/month"
         },
         SubscriptionTier.Professional => new List<string>
         {
             "5 database connections",
-            "100 queries/month"
+            "150 queries/month"
         },
         SubscriptionTier.Enterprise => new List<string>
         {
             "Unlimited database connections",
             "Unlimited queries"
         },
-        _ => new List<string> { "1 database connection", "10 queries/month" }
+        _ => new List<string> { "1 database connection", "25 queries/month" }
     };
 
     /// <summary>

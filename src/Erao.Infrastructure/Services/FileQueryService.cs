@@ -74,14 +74,9 @@ public class FileQueryService : IFileQueryService
         if (file == null)
             return JsonSerializer.Serialize(new { error = "File not found", columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 });
 
-        _logger.LogInformation("[DEBUG] ExecuteQueryForFileAsync: FileId={FileId}, UsesParquet={UsesParquet}, ParquetPath={ParquetPath}, RowCount={RowCount}, TotalRowCount={TotalRowCount}",
-            fileId, file.UsesParquet, file.ParquetStoragePath ?? "null", file.RowCount, file.TotalRowCount);
-        _logger.LogInformation("[DEBUG] Query: {Query}", query);
-
         // Route to Parquet (DuckDB via S3/R2) or legacy (SQLite) path
         if (file.UsesParquet && !string.IsNullOrEmpty(file.ParquetStoragePath))
         {
-            _logger.LogInformation("[DEBUG] Routing to Parquet via S3. ObjectKey={ObjectKey}", file.ParquetStoragePath);
             return await ExecuteQueryViaParquetAsync(file.ParquetStoragePath, query);
         }
 

@@ -82,6 +82,7 @@ public class EncryptionService : IEncryptionService
         }
 
         // Legacy format: static IV, no IV prepended
+        try
         {
             using var aes = Aes.Create();
             aes.Key = _key;
@@ -92,6 +93,12 @@ public class EncryptionService : IEncryptionService
             using var decryptor = aes.CreateDecryptor();
             var decryptedBytes = decryptor.TransformFinalBlock(allBytes, 0, allBytes.Length);
             return Encoding.UTF8.GetString(decryptedBytes);
+        }
+        catch (CryptographicException)
+        {
+            throw new CryptographicException(
+                "Unable to decrypt data. The encryption key may have changed since this data was stored. " +
+                "Please delete and re-add the database connection.");
         }
     }
 

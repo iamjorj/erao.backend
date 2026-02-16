@@ -153,6 +153,12 @@ public class DatabasesController : ControllerBase
         {
             return NotFound(ApiResponse<SchemaResponse>.ErrorResponse(ex.Message));
         }
+        catch (System.Security.Cryptography.CryptographicException ex)
+        {
+            _logger.LogWarning("Decryption failed for database connection {Id}: {Message}", id, ex.Message);
+            return BadRequest(ApiResponse<SchemaResponse>.ErrorResponse(
+                "Unable to decrypt connection details. Please delete and re-add this database connection."));
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error getting schema for database connection {Id}", id);
