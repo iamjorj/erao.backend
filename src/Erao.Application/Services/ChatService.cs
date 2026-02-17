@@ -185,11 +185,30 @@ public class ChatService : IChatService
             .ToList();
 
         // Build system prompt - different for database vs file
-        var systemPrompt = fileDocument != null
-            ? BuildFileSystemPrompt(schemaContext, fileDocument.OriginalFileName,
-                fileDocument.UsesParquet ? (int?)(fileDocument.TotalRowCount <= int.MaxValue ? (int?)fileDocument.TotalRowCount : int.MaxValue) : fileDocument.RowCount,
-                fileDocument.UsesParquet)
-            : BuildSystemPrompt(schemaContext, dbConnection?.DatabaseType);
+        string systemPrompt;
+        if (fileDocument != null)
+        {
+            var isDocumentType = fileDocument.FileType == FileType.Word || fileDocument.FileType == FileType.Text;
+            var effectiveRowCountForPrompt = fileDocument.UsesParquet
+                ? (int?)(fileDocument.TotalRowCount <= int.MaxValue ? (int?)fileDocument.TotalRowCount : int.MaxValue)
+                : fileDocument.RowCount;
+
+            if (isDocumentType && !fileDocument.UsesParquet)
+            {
+                // Document mode: pass content as context + SQL capability for structured queries
+                systemPrompt = BuildDocumentSystemPrompt(schemaContext, fileDocument.OriginalFileName,
+                    effectiveRowCountForPrompt, fileDocument.ParsedContent, fileDocument.FileType);
+            }
+            else
+            {
+                systemPrompt = BuildFileSystemPrompt(schemaContext, fileDocument.OriginalFileName,
+                    effectiveRowCountForPrompt, fileDocument.UsesParquet);
+            }
+        }
+        else
+        {
+            systemPrompt = BuildSystemPrompt(schemaContext, dbConnection?.DatabaseType);
+        }
 
         // Get AI response with full conversation history
         var (aiResponse, tokensUsed) = await _ollamaService.ChatAsync(request.Message, history, systemPrompt);
@@ -665,8 +684,10 @@ Classify the user's intent, then follow the matching format:
 - After the ```text block, explain what each part does conversationally.
 - Do NOT include ```sql or ```viz blocks. No execution. No chart. Just the query as readable text and your explanation.
 
-**EXPLANATION** (ONLY for pure conceptual questions with NO data request — ""what is this database about"", ""what do these columns mean"", ""describe the schema""):
-- NEVER use this if the user mentions any metric, ranking, number, SQL, or asks for data in any way.
+**EXPLANATION** (for conceptual questions, follow-up questions about previous results, or definitions — ""what is this database about"", ""what do these columns mean"", ""describe the schema"", ""what is X"", ""what does Y mean"", ""explain that"", ""why did you...""):
+- Use this when the user asks about the MEANING of something from a previous result (e.g. ""what is share_pct"", ""what does that column mean"", ""explain the last result"").
+- Use this when the user asks general knowledge or conceptual questions that don't need new data.
+- Do NOT use this if the user is clearly requesting NEW data, a NEW query, or a NEW comparison.
 - Write like a knowledgeable colleague — conversational, clear, concise.
 - Short paragraphs (2-3 sentences each). Bold only the key takeaway. No headers. No bullet walls. No numbered lists.
 - No SQL blocks. No filler. No emojis.
@@ -1157,8 +1178,10 @@ Classify the user's intent, then follow the matching format:
 - After the ```text block, explain what each part does conversationally.
 - Do NOT include ```sql or ```viz blocks. No execution. No chart. Just the query as readable text and your explanation.
 
-**EXPLANATION** (ONLY for pure conceptual questions with NO data request — ""what is this file about"", ""what do these columns mean"", ""describe the data""):
-- NEVER use this if the user mentions any metric, ranking, number, SQL, or asks for data in any way.
+**EXPLANATION** (for conceptual questions, follow-up questions about previous results, or definitions — ""what is this file about"", ""what do these columns mean"", ""describe the data"", ""what is X"", ""what does Y mean"", ""explain that"", ""why did you...""):
+- Use this when the user asks about the MEANING of something from a previous result (e.g. ""what is share_pct"", ""what does that column mean"", ""explain the last result"").
+- Use this when the user asks general knowledge or conceptual questions that don't need new data.
+- Do NOT use this if the user is clearly requesting NEW data, a NEW query, or a NEW comparison.
 - Write like a knowledgeable colleague — conversational, clear, concise.
 - Short paragraphs (2-3 sentences each). Bold only the key takeaway. No headers. No bullet walls. No numbered lists.
 - No SQL blocks. No filler. No emojis.
@@ -1247,6 +1270,113 @@ Use EXACT column names in double quotes. Never invent columns.
         }
 
         return prompt;
+    }
+
+    private static string BuildDocumentSystemPrompt(string? schemaContext, string fileName, int? rowCount, string? parsedContent, FileType fileType)
+    {
+        var fileTypeLabel = fileType == FileType.Word ? "Word document" : "text file";
+
+        // Extract readable content from parsed data for document context
+        var documentContent = ExtractDocumentContent(parsedContent);
+        var contentPreview = documentContent.Length > 8000
+            ? documentContent.Substring(0, 8000) + "\n\n[... document truncated for context ...]"
+            : documentContent;
+
+        var prompt = $@"You are Erao, an expert document analyst. The user uploaded '{fileName}' (a {fileTypeLabel}).
+
+You have TWO capabilities:
+
+## CAPABILITY 1: DOCUMENT Q&A (for questions about the document content)
+
+When the user asks about the document content (""what is this about"", ""summarize"", ""what does section X say"", ""find mentions of..."", ""explain...""), answer directly from the document content below. NO SQL needed.
+
+Write conversationally — short paragraphs, clear, concise. Bold key takeaways. No bullet walls.
+
+## CAPABILITY 2: STRUCTURED QUERIES (for data extraction)
+
+The document content is also stored in a SQLite table called ""data"" with columns: ""section"" (number), ""type"" (heading/paragraph/list/table_row), ""content"" (text).
+
+When the user asks for structured extraction (""list all headings"", ""how many paragraphs"", ""find rows containing X"", ""count sections""), generate SQL:
+
+```sql
+SELECT ""content"" FROM ""data"" WHERE ""type"" = 'heading'
+```
+
+Rules:
+- Table is always ""data"". Double-quote ALL identifiers.
+- Use LIKE for text search: WHERE ""content"" LIKE '%keyword%'
+- Available types: 'heading', 'paragraph', 'list', 'table_row'
+- Include a ```viz block after SQL: {{""chart"":""table"",""group"":""content"",""values"":[{{""col"":""type"",""agg"":""NONE""}}]}}
+
+## HOW TO DECIDE
+
+- Questions about meaning, summary, explanation → CAPABILITY 1 (no SQL)
+- Questions about structure, counts, searching, listing → CAPABILITY 2 (SQL)
+- If unclear, prefer CAPABILITY 1 (most document questions are about content)
+
+## DOCUMENT CONTENT
+
+```
+{contentPreview}
+```
+";
+
+        if (!string.IsNullOrEmpty(schemaContext))
+        {
+            prompt += $@"
+## Table schema (for structured queries)
+{schemaContext}";
+        }
+
+        return prompt;
+    }
+
+    private static string ExtractDocumentContent(string? parsedContent)
+    {
+        if (string.IsNullOrEmpty(parsedContent)) return "(no content available)";
+
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(parsedContent);
+            var root = doc.RootElement;
+
+            if (root.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                // New format: array of {section, type, content}
+                var lines = new List<string>();
+                foreach (var row in root.EnumerateArray())
+                {
+                    var type = row.TryGetProperty("type", out var t) ? t.GetString() : "paragraph";
+                    var content = row.TryGetProperty("content", out var c) ? c.GetString() : "";
+
+                    if (string.IsNullOrWhiteSpace(content)) continue;
+
+                    if (type == "heading")
+                        lines.Add($"\n## {content}");
+                    else if (type == "table_row")
+                        lines.Add($"  | {content}");
+                    else if (type == "list")
+                        lines.Add($"  - {content}");
+                    else
+                        lines.Add(content);
+                }
+                return string.Join("\n", lines);
+            }
+            else if (root.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                // Old format: {sections, fullText, ...}
+                if (root.TryGetProperty("fullText", out var fullText))
+                    return fullText.GetString() ?? "(no content)";
+            }
+        }
+        catch
+        {
+            // If parsing fails, try to use raw content
+            if (parsedContent.Length < 10000)
+                return parsedContent;
+        }
+
+        return "(content could not be extracted)";
     }
 
     private static string? ExtractJsonBlock(string response)

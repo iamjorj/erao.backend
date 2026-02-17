@@ -1,5 +1,6 @@
 using AutoMapper;
 using Erao.Core.DTOs;
+using Erao.Core.Enums;
 using Erao.Core.Interfaces;
 
 namespace Erao.Application.Services;
@@ -8,6 +9,7 @@ public interface IAccountService
 {
     Task<UserDto?> GetAccountAsync(Guid userId);
     Task<UserDto> UpdateAccountAsync(Guid userId, string? firstName, string? lastName);
+    Task DeleteAccountAsync(Guid userId);
 }
 
 public class AccountService : IAccountService
@@ -50,5 +52,22 @@ public class AccountService : IAccountService
         await _unitOfWork.SaveChangesAsync();
 
         return _mapper.Map<UserDto>(user);
+    }
+
+    public async Task DeleteAccountAsync(Guid userId)
+    {
+        var user = await _unitOfWork.Users.GetByIdAsync(userId);
+        if (user == null)
+        {
+            throw new InvalidOperationException("User not found");
+        }
+
+        if (user.SubscriptionTier == SubscriptionTier.Starter)
+        {
+            throw new InvalidOperationException("Account deletion is only available for paid plans. Please upgrade to delete your account.");
+        }
+
+        await _unitOfWork.Users.DeleteAsync(user);
+        await _unitOfWork.SaveChangesAsync();
     }
 }

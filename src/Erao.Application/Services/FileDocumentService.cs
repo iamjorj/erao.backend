@@ -22,13 +22,12 @@ public class FileDocumentService : IFileDocumentService
     private static readonly Dictionary<string, FileType> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         { ".xlsx", FileType.Excel },
-        { ".xls", FileType.Excel },
         { ".docx", FileType.Word },
-        { ".doc", FileType.Word },
         { ".csv", FileType.Csv },
         { ".xml", FileType.Xml },
         { ".json", FileType.Json },
-        { ".txt", FileType.Text }
+        { ".txt", FileType.Text },
+        { ".tsv", FileType.Text }
     };
 
     public FileDocumentService(
@@ -108,19 +107,42 @@ public class FileDocumentService : IFileDocumentService
 
             // Download from MinIO to parse
             using var fileStream = await _minioService.DownloadFileAsync(objectName);
+            _logger.LogWarning("[DEBUG] File {FileName}: type={FileType}, streamLength={StreamLen}, streamPos={StreamPos}",
+                file.FileName, fileType, fileStream.CanSeek ? fileStream.Length : -1, fileStream.CanSeek ? fileStream.Position : -1);
+
+            var debugInfo = new List<string> { $"FileType={fileType}" };
 
             // For CSV/Excel: convert to Parquet via DuckDB (supports 500M+ rows)
             if (fileType == FileType.Csv || fileType == FileType.Excel)
             {
+                debugInfo.Add("Path=Parquet");
                 await ConvertToParquetAsync(fileDocument, fileStream, fileType, cancellationToken);
             }
             else
             {
                 // Non-tabular files: use legacy parsing
+                var availableParsers = _fileParsers.Select(p => p.GetType().Name).ToList();
+                debugInfo.Add($"AvailableParsers=[{string.Join(",", availableParsers)}]");
+
                 var parser = _fileParsers.FirstOrDefault(p => p.CanParse(fileType));
+                debugInfo.Add($"MatchedParser={parser?.GetType().Name ?? "NONE"}");
+                _logger.LogWarning("[DEBUG] Parsers: [{Parsers}], matched: {Matched}",
+                    string.Join(", ", availableParsers), parser?.GetType().Name ?? "NONE");
+
                 if (parser != null)
                 {
                     var parseResult = await parser.ParseAsync(fileStream, file.FileName, cancellationToken);
+                    debugInfo.Add($"ParseSuccess={parseResult.Success}");
+                    debugInfo.Add($"ParseRows={parseResult.RowCount}");
+                    debugInfo.Add($"ParseColumns={parseResult.Columns?.Count ?? 0}");
+                    debugInfo.Add($"SchemaInfoLength={parseResult.SchemaInfoJson?.Length ?? 0}");
+                    debugInfo.Add($"ParsedContentLength={parseResult.ParsedContentJson?.Length ?? 0}");
+                    debugInfo.Add($"ParseError={parseResult.ErrorMessage ?? "null"}");
+
+                    _logger.LogWarning("[DEBUG] Parse result: success={Success}, rows={Rows}, cols={Cols}, schemaLen={SchemaLen}, contentLen={ContentLen}, error={Error}",
+                        parseResult.Success, parseResult.RowCount, parseResult.Columns?.Count ?? 0,
+                        parseResult.SchemaInfoJson?.Length ?? 0, parseResult.ParsedContentJson?.Length ?? 0,
+                        parseResult.ErrorMessage ?? "null");
 
                     if (parseResult.Success)
                     {
@@ -128,6 +150,10 @@ public class FileDocumentService : IFileDocumentService
                         fileDocument.SchemaInfo = parseResult.SchemaInfoJson;
                         fileDocument.RowCount = parseResult.RowCount;
                         fileDocument.Status = FileProcessingStatus.Completed;
+
+                        // Log first 200 chars of schema for debugging
+                        _logger.LogWarning("[DEBUG] SchemaInfo preview: {Schema}",
+                            parseResult.SchemaInfoJson?.Substring(0, Math.Min(200, parseResult.SchemaInfoJson?.Length ?? 0)) ?? "null");
                     }
                     else
                     {
@@ -137,33 +163,24 @@ public class FileDocumentService : IFileDocumentService
                 }
                 else
                 {
-                    // For unsupported parsing (like plain text), just store as-is
-                    if (fileType == FileType.Text || fileType == FileType.Json || fileType == FileType.Xml)
-                    {
-                        using var reader = new StreamReader(fileStream);
-                        var content = await reader.ReadToEndAsync(cancellationToken);
-                        fileDocument.ParsedContent = content;
-                        fileDocument.Status = FileProcessingStatus.Completed;
-                    }
-                    else
-                    {
-                        fileDocument.Status = FileProcessingStatus.Failed;
-                        fileDocument.ErrorMessage = $"No parser available for file type: {fileType}";
-                    }
+                    fileDocument.Status = FileProcessingStatus.Failed;
+                    fileDocument.ErrorMessage = $"No parser available for file type: {fileType}";
+                    debugInfo.Add($"Error=NoParser");
                 }
             }
 
             await _unitOfWork.FileDocuments.UpdateAsync(fileDocument);
             await _unitOfWork.SaveChangesAsync();
 
-            _logger.LogInformation("File {FileName} uploaded to MinIO successfully for user {UserId}", file.FileName, userId);
+            _logger.LogInformation("File {FileName} uploaded for user {UserId}", file.FileName, userId);
 
+            var debugString = string.Join(" | ", debugInfo);
             return new FileUploadResponse
             {
                 Success = true,
                 Message = fileDocument.Status == FileProcessingStatus.Completed
-                    ? "File uploaded and processed successfully"
-                    : $"File uploaded but processing failed: {fileDocument.ErrorMessage}",
+                    ? $"File uploaded and processed successfully. [DEBUG: {debugString}]"
+                    : $"File uploaded but processing failed: {fileDocument.ErrorMessage}. [DEBUG: {debugString}]",
                 File = MapToDto(fileDocument)
             };
         }
@@ -358,6 +375,69 @@ public class FileDocumentService : IFileDocumentService
         return file?.ParsedContent;
     }
 
+    public async Task<FileUploadResponse> ReparseFileAsync(Guid userId, Guid fileId, CancellationToken cancellationToken = default)
+    {
+        var fileDocument = await _unitOfWork.FileDocuments.GetByUserIdAndFileIdAsync(userId, fileId);
+        if (fileDocument == null)
+            return new FileUploadResponse { Success = false, Message = "File not found" };
+
+        try
+        {
+            // Download from MinIO
+            using var fileStream = await _minioService.DownloadFileAsync(fileDocument.StoragePath);
+
+            fileDocument.Status = FileProcessingStatus.Processing;
+            fileDocument.ErrorMessage = null;
+
+            if (fileDocument.FileType == FileType.Csv || fileDocument.FileType == FileType.Excel)
+            {
+                await ConvertToParquetAsync(fileDocument, fileStream, fileDocument.FileType, cancellationToken);
+            }
+            else
+            {
+                var parser = _fileParsers.FirstOrDefault(p => p.CanParse(fileDocument.FileType));
+                if (parser != null)
+                {
+                    var parseResult = await parser.ParseAsync(fileStream, fileDocument.OriginalFileName, cancellationToken);
+                    if (parseResult.Success)
+                    {
+                        fileDocument.ParsedContent = parseResult.ParsedContentJson;
+                        fileDocument.SchemaInfo = parseResult.SchemaInfoJson;
+                        fileDocument.RowCount = parseResult.RowCount;
+                        fileDocument.Status = FileProcessingStatus.Completed;
+                    }
+                    else
+                    {
+                        fileDocument.Status = FileProcessingStatus.Failed;
+                        fileDocument.ErrorMessage = parseResult.ErrorMessage;
+                    }
+                }
+                else
+                {
+                    fileDocument.Status = FileProcessingStatus.Failed;
+                    fileDocument.ErrorMessage = $"No parser available for file type: {fileDocument.FileType}";
+                }
+            }
+
+            await _unitOfWork.FileDocuments.UpdateAsync(fileDocument);
+            await _unitOfWork.SaveChangesAsync();
+
+            return new FileUploadResponse
+            {
+                Success = fileDocument.Status == FileProcessingStatus.Completed,
+                Message = fileDocument.Status == FileProcessingStatus.Completed
+                    ? "File re-parsed successfully"
+                    : $"Re-parse failed: {fileDocument.ErrorMessage}",
+                File = MapToDto(fileDocument)
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error re-parsing file {FileId} for user {UserId}", fileId, userId);
+            return new FileUploadResponse { Success = false, Message = $"Error: {ex.Message}" };
+        }
+    }
+
 
     private async Task ConvertToParquetAsync(FileDocument fileDocument, Stream fileStream, FileType fileType, CancellationToken cancellationToken)
     {
@@ -473,7 +553,12 @@ public class FileDocumentService : IFileDocumentService
             ErrorMessage = file.ErrorMessage,
             Columns = columns,
             CreatedAt = file.CreatedAt,
-            UpdatedAt = file.UpdatedAt
+            UpdatedAt = file.UpdatedAt,
+            // Debug fields
+            DebugSchemaInfo = file.SchemaInfo,
+            DebugParsedContentPreview = file.ParsedContent != null
+                ? file.ParsedContent.Substring(0, Math.Min(500, file.ParsedContent.Length))
+                : null
         };
     }
 }

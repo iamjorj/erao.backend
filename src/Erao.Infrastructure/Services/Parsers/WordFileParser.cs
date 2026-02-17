@@ -44,8 +44,32 @@ public class WordFileParser : IFileParser
                 return result;
             }
 
-            var documentContent = new List<DocumentSection>();
-            var currentSection = new DocumentSection { Type = "paragraph", Content = "" };
+            // First pass: check if document has tables with data
+            var tables = body.Elements<Table>().ToList();
+            var paragraphs = body.Elements<Paragraph>().ToList();
+            var hasDataTables = tables.Any(t => t.Elements<TableRow>().Count() > 1);
+
+            // If document has a significant data table, extract it as proper tabular data
+            if (hasDataTables)
+            {
+                var tableResult = ExtractLargestTable(tables, fileName);
+                if (tableResult != null && tableResult.RowCount > 0)
+                {
+                    // Also store the full text as a metadata field for document Q&A
+                    var fullText = ExtractFullText(body, cancellationToken);
+                    tableResult.Data.ForEach(row => row["_document_text"] = null); // placeholder
+
+                    // Actually, don't pollute table data. Just return clean table.
+                    result = tableResult;
+                    _logger.LogInformation("Parsed Word file {FileName} as table: {RowCount} rows, {ColCount} columns",
+                        fileName, result.RowCount, result.Columns.Count);
+                    return result;
+                }
+            }
+
+            // No significant tables — extract document content as rows
+            var rows = new List<Dictionary<string, object?>>();
+            var sectionNumber = 0;
             var totalCharacters = 0;
 
             foreach (var element in body.Elements())
@@ -63,78 +87,66 @@ public class WordFileParser : IFileParser
                     var text = GetParagraphText(paragraph);
                     if (!string.IsNullOrWhiteSpace(text))
                     {
-                        var section = new DocumentSection
+                        sectionNumber++;
+                        rows.Add(new Dictionary<string, object?>
                         {
-                            Type = GetParagraphType(paragraph),
-                            Content = text
-                        };
-                        documentContent.Add(section);
+                            ["section"] = sectionNumber,
+                            ["type"] = GetParagraphType(paragraph),
+                            ["content"] = text
+                        });
                         totalCharacters += text.Length;
                     }
                 }
                 else if (element is Table table)
                 {
-                    var tableData = ParseTable(table);
-                    if (tableData.Any())
+                    // Inline table rows into the document flow
+                    var tableRows = table.Elements<TableRow>().ToList();
+                    if (tableRows.Count > 0)
                     {
-                        var section = new DocumentSection
+                        sectionNumber++;
+                        foreach (var row in tableRows)
                         {
-                            Type = "table",
-                            TableData = tableData
-                        };
-                        documentContent.Add(section);
-                        totalCharacters += JsonSerializer.Serialize(tableData).Length;
+                            var cells = row.Elements<TableCell>().Select(cell =>
+                            {
+                                var cellText = new StringBuilder();
+                                foreach (var para in cell.Elements<Paragraph>())
+                                {
+                                    if (cellText.Length > 0) cellText.Append(" ");
+                                    cellText.Append(GetParagraphText(para));
+                                }
+                                return cellText.ToString();
+                            }).ToList();
+
+                            var rowContent = string.Join(" | ", cells);
+                            rows.Add(new Dictionary<string, object?>
+                            {
+                                ["section"] = sectionNumber,
+                                ["type"] = "table_row",
+                                ["content"] = rowContent
+                            });
+                            totalCharacters += rowContent.Length;
+                        }
                     }
                 }
             }
 
-            // Create columns info for document structure
-            result.Columns = new List<ColumnInfo>
+            var columns = new List<ColumnInfo>
             {
+                new() { Name = "section", DataType = "number", IsNullable = false },
                 new() { Name = "type", DataType = "string", IsNullable = false },
-                new() { Name = "content", DataType = "string", IsNullable = true },
-                new() { Name = "tableData", DataType = "object", IsNullable = true }
+                new() { Name = "content", DataType = "string", IsNullable = false }
             };
 
-            // Convert to data format
-            result.Data = documentContent.Select(section => new Dictionary<string, object?>
-            {
-                ["type"] = section.Type,
-                ["content"] = section.Content,
-                ["tableData"] = section.TableData
-            }).ToList();
-
-            result.RowCount = documentContent.Count;
-
-            // Create a more readable parsed content
-            var parsedContent = new
-            {
-                sections = documentContent,
-                fullText = string.Join("\n\n", documentContent
-                    .Where(s => s.Type != "table" && !string.IsNullOrEmpty(s.Content))
-                    .Select(s => s.Content)),
-                tableCount = documentContent.Count(s => s.Type == "table"),
-                paragraphCount = documentContent.Count(s => s.Type == "paragraph"),
-                headingCount = documentContent.Count(s => s.Type.StartsWith("heading"))
-            };
-
-            result.ParsedContentJson = JsonSerializer.Serialize(parsedContent, new JsonSerializerOptions
-            {
-                WriteIndented = false
-            });
-
-            result.SchemaInfoJson = JsonSerializer.Serialize(new
-            {
-                documentType = "word",
-                sectionCount = documentContent.Count,
-                hasTable = documentContent.Any(s => s.Type == "table"),
-                characterCount = totalCharacters
-            });
-
+            result.Columns = columns;
+            result.Data = rows;
+            result.RowCount = rows.Count;
             result.Success = true;
 
-            _logger.LogInformation("Successfully parsed Word file {FileName}: {SectionCount} sections, {CharCount} characters",
-                fileName, documentContent.Count, totalCharacters);
+            result.ParsedContentJson = JsonSerializer.Serialize(rows, new JsonSerializerOptions { WriteIndented = false });
+            result.SchemaInfoJson = JsonSerializer.Serialize(columns, new JsonSerializerOptions { WriteIndented = false });
+
+            _logger.LogInformation("Successfully parsed Word file {FileName}: {RowCount} sections, {CharCount} characters",
+                fileName, rows.Count, totalCharacters);
         }
         catch (Exception ex)
         {
@@ -144,6 +156,116 @@ public class WordFileParser : IFileParser
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Extracts the largest table in the document as proper tabular data.
+    /// First row is treated as headers.
+    /// </summary>
+    private FileParseResult? ExtractLargestTable(List<Table> tables, string fileName)
+    {
+        Table? largest = null;
+        int maxRows = 0;
+
+        foreach (var table in tables)
+        {
+            var rowCount = table.Elements<TableRow>().Count();
+            if (rowCount > maxRows)
+            {
+                maxRows = rowCount;
+                largest = table;
+            }
+        }
+
+        if (largest == null || maxRows < 2) return null; // Need at least header + 1 data row
+
+        var tableRows = largest.Elements<TableRow>().ToList();
+        var headerRow = tableRows[0];
+        var headerCells = headerRow.Elements<TableCell>().Select(GetCellText).ToList();
+
+        // Build unique column names
+        var columnNames = new List<string>();
+        for (int i = 0; i < headerCells.Count; i++)
+        {
+            var name = string.IsNullOrWhiteSpace(headerCells[i]) ? $"Column{i + 1}" : headerCells[i].Trim();
+            var baseName = name;
+            var counter = 1;
+            while (columnNames.Contains(name))
+                name = $"{baseName}_{counter++}";
+            columnNames.Add(name);
+        }
+
+        var columns = columnNames.Select(n => new ColumnInfo
+        {
+            Name = n,
+            DataType = "string",
+            IsNullable = true
+        }).ToList();
+
+        // Parse data rows
+        var rows = new List<Dictionary<string, object?>>();
+        for (int i = 1; i < tableRows.Count; i++)
+        {
+            var cells = tableRows[i].Elements<TableCell>().Select(GetCellText).ToList();
+            var row = new Dictionary<string, object?>();
+            var hasData = false;
+
+            for (int j = 0; j < columnNames.Count; j++)
+            {
+                var value = j < cells.Count ? cells[j].Trim() : null;
+                if (!string.IsNullOrEmpty(value))
+                {
+                    row[columnNames[j]] = ParseValue(value);
+                    hasData = true;
+                }
+                else
+                {
+                    row[columnNames[j]] = null;
+                }
+            }
+
+            if (hasData)
+                rows.Add(row);
+        }
+
+        // Infer types
+        InferDataTypes(columns, rows);
+
+        return new FileParseResult
+        {
+            Success = true,
+            Columns = columns,
+            Data = rows,
+            RowCount = rows.Count,
+            ParsedContentJson = JsonSerializer.Serialize(rows, new JsonSerializerOptions { WriteIndented = false }),
+            SchemaInfoJson = JsonSerializer.Serialize(columns, new JsonSerializerOptions { WriteIndented = false })
+        };
+    }
+
+    private string ExtractFullText(Body body, CancellationToken cancellationToken)
+    {
+        var sb = new StringBuilder();
+        foreach (var para in body.Elements<Paragraph>())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var text = GetParagraphText(para);
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                sb.AppendLine(text);
+            }
+        }
+        return sb.ToString();
+    }
+
+    private string GetCellText(TableCell cell)
+    {
+        var sb = new StringBuilder();
+        foreach (var para in cell.Elements<Paragraph>())
+        {
+            if (sb.Length > 0) sb.Append(" ");
+            sb.Append(GetParagraphText(para));
+        }
+        return sb.ToString();
     }
 
     private string GetParagraphText(Paragraph paragraph)
@@ -170,50 +292,52 @@ public class WordFileParser : IFileParser
 
         return style.ToLower() switch
         {
-            "heading1" or "title" => "heading1",
-            "heading2" or "subtitle" => "heading2",
-            "heading3" => "heading3",
-            "heading4" => "heading4",
-            "heading5" => "heading5",
-            "heading6" => "heading6",
+            "heading1" or "title" => "heading",
+            "heading2" or "subtitle" => "heading",
+            "heading3" => "heading",
+            "heading4" => "heading",
+            "heading5" => "heading",
+            "heading6" => "heading",
             "listparagraph" => "list",
             _ => "paragraph"
         };
     }
 
-    private List<List<string>> ParseTable(Table table)
+    private object? ParseValue(string value)
     {
-        var tableData = new List<List<string>>();
+        if (string.IsNullOrWhiteSpace(value)) return null;
 
-        foreach (var row in table.Elements<TableRow>())
-        {
-            var rowData = new List<string>();
+        if (double.TryParse(value, out var d)) return d;
+        if (bool.TryParse(value, out var b)) return b;
 
-            foreach (var cell in row.Elements<TableCell>())
-            {
-                var cellText = new StringBuilder();
-
-                foreach (var para in cell.Elements<Paragraph>())
-                {
-                    if (cellText.Length > 0)
-                        cellText.Append(" ");
-                    cellText.Append(GetParagraphText(para));
-                }
-
-                rowData.Add(cellText.ToString());
-            }
-
-            if (rowData.Any())
-                tableData.Add(rowData);
-        }
-
-        return tableData;
+        return value;
     }
 
-    private class DocumentSection
+    private void InferDataTypes(List<ColumnInfo> columns, List<Dictionary<string, object?>> data)
     {
-        public string Type { get; set; } = string.Empty;
-        public string? Content { get; set; }
-        public List<List<string>>? TableData { get; set; }
+        foreach (var column in columns)
+        {
+            var values = data
+                .Select(row => row.GetValueOrDefault(column.Name))
+                .Where(v => v != null)
+                .Take(100)
+                .ToList();
+
+            if (!values.Any())
+            {
+                column.DataType = "string";
+                column.IsNullable = true;
+                continue;
+            }
+
+            var allNumbers = values.All(v => v is int or long or double or float or decimal);
+            var allBooleans = values.All(v => v is bool);
+
+            if (allNumbers) column.DataType = "number";
+            else if (allBooleans) column.DataType = "boolean";
+            else column.DataType = "string";
+
+            column.IsNullable = data.Any(row => row.GetValueOrDefault(column.Name) == null);
+        }
     }
 }

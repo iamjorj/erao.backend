@@ -12,4 +12,5 @@ public interface IFileDocumentService
     Task<FileContentResponse?> GetFileContentAsync(Guid userId, Guid fileId, int page = 1, int pageSize = 100, CancellationToken cancellationToken = default);
     Task<bool> DeleteFileAsync(Guid userId, Guid fileId, CancellationToken cancellationToken = default);
     Task<string?> GetParsedContentForQueryAsync(Guid fileId, CancellationToken cancellationToken = default);
+    Task<FileUploadResponse> ReparseFileAsync(Guid userId, Guid fileId, CancellationToken cancellationToken = default);
 }

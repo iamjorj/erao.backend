@@ -130,6 +130,27 @@ public class FilesController : ControllerBase
     }
 
     /// <summary>
+    /// Re-parse an existing file with updated parsers
+    /// </summary>
+    [HttpPost("{fileId:guid}/reparse")]
+    [ProducesResponseType(typeof(FileUploadResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    public async Task<ActionResult<FileUploadResponse>> ReparseFile(Guid fileId, CancellationToken cancellationToken)
+    {
+        var userId = GetUserId();
+        if (userId == null)
+            return Unauthorized();
+
+        var result = await _fileService.ReparseFileAsync(userId.Value, fileId, cancellationToken);
+
+        if (!result.Success)
+            return BadRequest(result);
+
+        return Ok(result);
+    }
+
+    /// <summary>
     /// Delete a file
     /// </summary>
     [HttpDelete("{fileId:guid}")]

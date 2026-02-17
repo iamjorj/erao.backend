@@ -61,6 +61,9 @@ public static class ServiceExtensions
         services.AddScoped<IFileParser, ExcelFileParser>();
         services.AddScoped<IFileParser, WordFileParser>();
         services.AddScoped<IFileParser, CsvFileParser>();
+        services.AddScoped<IFileParser, JsonFileParser>();
+        services.AddScoped<IFileParser, XmlFileParser>();
+        services.AddScoped<IFileParser, TextFileParser>();
         services.AddScoped<IFileDocumentService, FileDocumentService>();
 
         // MinIO storage
