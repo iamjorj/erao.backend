@@ -128,6 +128,27 @@ public class AdminController : ControllerBase
         }
     }
 
+    [HttpPost("auth/refresh")]
+    [AllowAnonymous]
+    [EnableRateLimiting("admin-auth")]
+    public async Task<ActionResult<ApiResponse<AdminAuthResponse>>> RefreshToken([FromBody] AdminRefreshRequest request)
+    {
+        try
+        {
+            var result = await _adminService.RefreshTokenAsync(request.RefreshToken);
+            return Ok(ApiResponse<AdminAuthResponse>.SuccessResponse(result));
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Unauthorized(ApiResponse<AdminAuthResponse>.ErrorResponse(ex.Message));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error refreshing admin token");
+            return StatusCode(500, ApiResponse<AdminAuthResponse>.ErrorResponse("An error occurred."));
+        }
+    }
+
     // ─── Dashboard (admin only) ──────────────────────────────────────
 
     [HttpGet("dashboard")]

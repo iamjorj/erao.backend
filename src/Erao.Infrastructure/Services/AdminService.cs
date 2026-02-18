@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using Erao.Core.DTOs.Admin;
 using Erao.Core.Enums;
+using Erao.Core.Helpers;
 using Erao.Core.Interfaces;
 using Erao.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -88,6 +89,8 @@ public class AdminService : IAdminService
         user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password);
         user.AdminOtp = null;
         user.AdminOtpExpiry = null;
+        user.RefreshToken = _tokenService.GenerateRefreshToken();
+        user.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(7);
         await _db.SaveChangesAsync();
 
         var token = _tokenService.GenerateAccessToken(user);
@@ -96,6 +99,7 @@ public class AdminService : IAdminService
         return new AdminAuthResponse
         {
             AccessToken = token,
+            RefreshToken = user.RefreshToken,
             ExpiresAt = DateTime.UtcNow.AddHours(8)
         };
     }
@@ -136,6 +140,8 @@ public class AdminService : IAdminService
 
         user.AdminOtp = null;
         user.AdminOtpExpiry = null;
+        user.RefreshToken = _tokenService.GenerateRefreshToken();
+        user.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(7);
         await _db.SaveChangesAsync();
 
         var token = _tokenService.GenerateAccessToken(user);
@@ -144,6 +150,29 @@ public class AdminService : IAdminService
         return new AdminAuthResponse
         {
             AccessToken = token,
+            RefreshToken = user.RefreshToken,
+            ExpiresAt = DateTime.UtcNow.AddHours(8)
+        };
+    }
+
+    public async Task<AdminAuthResponse> RefreshTokenAsync(string refreshToken)
+    {
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.RefreshToken == refreshToken && u.IsAdmin)
+            ?? throw new UnauthorizedAccessException("Invalid refresh token.");
+
+        if (user.RefreshTokenExpiryTime == null || user.RefreshTokenExpiryTime < DateTime.UtcNow)
+            throw new UnauthorizedAccessException("Refresh token expired.");
+
+        user.RefreshToken = _tokenService.GenerateRefreshToken();
+        user.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(7);
+        await _db.SaveChangesAsync();
+
+        var token = _tokenService.GenerateAccessToken(user);
+
+        return new AdminAuthResponse
+        {
+            AccessToken = token,
+            RefreshToken = user.RefreshToken,
             ExpiresAt = DateTime.UtcNow.AddHours(8)
         };
     }
@@ -218,6 +247,59 @@ public class AdminService : IAdminService
             });
         }
 
+        // Revenue — MRR from current paid user counts
+        var mrr = breakdown.Professional * SubscriptionLimits.GetPrice(SubscriptionTier.Professional)
+                + breakdown.Enterprise * SubscriptionLimits.GetPrice(SubscriptionTier.Enterprise);
+
+        // Today = actual revenue from subscriptions that started today
+        var newSubsToday = await _db.Users
+            .Where(u => u.SubscriptionTier != SubscriptionTier.Starter
+                && u.SubscriptionStartDate != null
+                && u.SubscriptionStartDate >= todayStart)
+            .Select(u => u.SubscriptionTier)
+            .ToListAsync();
+        var todayRevenue = newSubsToday.Sum(t => SubscriptionLimits.GetPrice(t));
+
+        // Monthly revenue chart (last 12 months)
+        var paidUsers = await _db.Users
+            .Where(u => u.SubscriptionTier != SubscriptionTier.Starter && u.SubscriptionStartDate != null)
+            .Select(u => new { u.SubscriptionTier, u.SubscriptionStartDate })
+            .ToListAsync();
+
+        var monthlyRevenueList = new List<MonthlyRevenuePoint>();
+        var currentMonthStart = new DateTime(now.Year, now.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+        var thisYearRevenue = 0m;
+
+        for (var i = 0; i < 12; i++)
+        {
+            var mStart = twelveMonthsAgo.AddMonths(i);
+            var mEnd = mStart.AddMonths(1);
+
+            // Current month: use live MRR; past months: use SubscriptionStartDate
+            var amount = mStart == currentMonthStart
+                ? mrr
+                : paidUsers
+                    .Where(u => u.SubscriptionStartDate < mEnd)
+                    .Sum(u => SubscriptionLimits.GetPrice(u.SubscriptionTier));
+
+            monthlyRevenueList.Add(new MonthlyRevenuePoint
+            {
+                Month = mStart.ToString("MMM yyyy"),
+                Amount = amount,
+            });
+
+            // Sum months in current year for This Year
+            if (mStart.Year == now.Year)
+                thisYearRevenue += amount;
+        }
+
+        var revenue = new RevenueDto
+        {
+            Mrr = mrr,
+            Today = todayRevenue,
+            ThisYear = thisYearRevenue,
+        };
+
         var recentSignups = await _db.Users
             .OrderByDescending(u => u.CreatedAt)
             .Take(10)
@@ -241,8 +323,10 @@ public class AdminService : IAdminService
             ActiveUsersLast7Days = activeUsers,
             TotalQueries = totalQueries,
             SubscriptionBreakdown = breakdown,
+            Revenue = revenue,
             DailyNewUsers = dailyNewUsers,
             MonthlyNewUsers = monthlyNewUsers,
+            MonthlyRevenue = monthlyRevenueList,
             RecentSignups = recentSignups,
         };
     }
@@ -283,6 +367,8 @@ public class AdminService : IAdminService
                 QueryLimitPerMonth = u.QueryLimitPerMonth,
                 QueriesUsedThisMonth = u.QueriesUsedThisMonth,
                 IsEmailVerified = u.IsEmailVerified,
+                SubscriptionStartDate = u.SubscriptionStartDate,
+                SubscriptionEndDate = u.SubscriptionEndDate,
                 CreatedAt = u.CreatedAt,
                 UpdatedAt = u.UpdatedAt,
                 DatabaseCount = u.DatabaseConnections.Count,
@@ -324,6 +410,8 @@ public class AdminService : IAdminService
                 QueryLimitPerMonth = u.QueryLimitPerMonth,
                 QueriesUsedThisMonth = u.QueriesUsedThisMonth,
                 IsEmailVerified = u.IsEmailVerified,
+                SubscriptionStartDate = u.SubscriptionStartDate,
+                SubscriptionEndDate = u.SubscriptionEndDate,
                 CreatedAt = u.CreatedAt,
                 UpdatedAt = u.UpdatedAt,
                 DatabaseCount = u.DatabaseConnections.Count,
@@ -342,6 +430,7 @@ public class AdminService : IAdminService
 
         if (request.SubscriptionTier.HasValue)
         {
+            var oldTier = user.SubscriptionTier;
             user.SubscriptionTier = request.SubscriptionTier.Value;
             user.QueryLimitPerMonth = request.SubscriptionTier.Value switch
             {
@@ -349,6 +438,21 @@ public class AdminService : IAdminService
                 SubscriptionTier.Enterprise => 10000,
                 _ => 25,
             };
+
+            // Track subscription dates
+            if (request.SubscriptionTier.Value != SubscriptionTier.Starter)
+            {
+                if (oldTier != request.SubscriptionTier.Value || user.SubscriptionStartDate == null)
+                {
+                    user.SubscriptionStartDate = DateTime.UtcNow;
+                    user.SubscriptionEndDate = DateTime.UtcNow.AddDays(30);
+                }
+            }
+            else
+            {
+                user.SubscriptionStartDate = null;
+                user.SubscriptionEndDate = null;
+            }
         }
 
         if (request.QueryLimitPerMonth.HasValue)

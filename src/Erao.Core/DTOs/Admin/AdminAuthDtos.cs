@@ -27,7 +27,13 @@ public class AdminVerifyOtpRequest
 public class AdminAuthResponse
 {
     public string AccessToken { get; set; } = string.Empty;
+    public string RefreshToken { get; set; } = string.Empty;
     public DateTime ExpiresAt { get; set; }
+}
+
+public class AdminRefreshRequest
+{
+    public string RefreshToken { get; set; } = string.Empty;
 }
 
 public class AdminStatusResponse

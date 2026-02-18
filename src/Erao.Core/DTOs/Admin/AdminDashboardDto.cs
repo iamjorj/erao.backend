@@ -11,10 +11,20 @@ public class AdminDashboardDto
 
     public SubscriptionBreakdownDto SubscriptionBreakdown { get; set; } = new();
 
+    public RevenueDto Revenue { get; set; } = new();
+
     public List<DailyChartPoint> DailyNewUsers { get; set; } = [];
     public List<MonthlyChartPoint> MonthlyNewUsers { get; set; } = [];
+    public List<MonthlyRevenuePoint> MonthlyRevenue { get; set; } = [];
 
     public List<RecentSignupDto> RecentSignups { get; set; } = [];
+}
+
+public class RevenueDto
+{
+    public decimal Mrr { get; set; }
+    public decimal Today { get; set; }
+    public decimal ThisYear { get; set; }
 }
 
 public class SubscriptionBreakdownDto
@@ -34,6 +44,12 @@ public class MonthlyChartPoint
 {
     public string Month { get; set; } = string.Empty;
     public int Count { get; set; }
+}
+
+public class MonthlyRevenuePoint
+{
+    public string Month { get; set; } = string.Empty;
+    public decimal Amount { get; set; }
 }
 
 public class RecentSignupDto

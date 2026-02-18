@@ -21,6 +21,8 @@ public class AdminUserDto
     public int QueryLimitPerMonth { get; set; }
     public int QueriesUsedThisMonth { get; set; }
     public bool IsEmailVerified { get; set; }
+    public DateTime? SubscriptionStartDate { get; set; }
+    public DateTime? SubscriptionEndDate { get; set; }
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
     public int DatabaseCount { get; set; }

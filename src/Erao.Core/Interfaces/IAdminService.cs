@@ -10,6 +10,7 @@ public interface IAdminService
     Task<AdminAuthResponse> CompleteRegistrationAsync(AdminSetPasswordRequest request);
     Task LoginAsync(AdminLoginRequest request);
     Task<AdminAuthResponse> VerifyLoginOtpAsync(AdminVerifyOtpRequest request);
+    Task<AdminAuthResponse> RefreshTokenAsync(string refreshToken);
 
     // Dashboard
     Task<AdminDashboardDto> GetDashboardAsync();

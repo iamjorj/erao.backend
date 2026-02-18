@@ -10,6 +10,7 @@ public class User : BaseEntity
     public string LastName { get; set; } = string.Empty;
     public SubscriptionTier SubscriptionTier { get; set; } = SubscriptionTier.Starter;
     public DateTime? SubscriptionStartDate { get; set; }
+    public DateTime? SubscriptionEndDate { get; set; }
     public int QueryLimitPerMonth { get; set; } = 25; // Default for Starter tier
     public int QueriesUsedThisMonth { get; set; } = 0;
     public DateTime BillingCycleReset { get; set; }
