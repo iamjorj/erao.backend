@@ -71,6 +71,16 @@ builder.Services.AddRateLimiter(options =>
                 PermitLimit = 20,
                 Window = TimeSpan.FromMinutes(1),
             }));
+
+    // Admin auth: 5 requests per minute per IP (OTP, login, register)
+    options.AddPolicy("admin-auth", context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 5,
+                Window = TimeSpan.FromMinutes(1),
+            }));
 });
 
 // Custom service extensions
@@ -78,6 +88,10 @@ builder.Services.AddApplicationServices(builder.Configuration);
 builder.Services.AddJwtAuthentication(builder.Configuration);
 builder.Services.AddSwaggerDocumentation();
 builder.Services.AddCorsPolicies(builder.Configuration);
+
+// Authorization policies
+builder.Services.AddAuthorizationBuilder()
+    .AddPolicy("AdminOnly", p => p.RequireRole("Admin"));
 
 var app = builder.Build();
 

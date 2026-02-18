@@ -29,6 +29,11 @@ public class User : BaseEntity
     public string? DodoCustomerId { get; set; }
     public string? DodoSubscriptionId { get; set; }
 
+    // Admin
+    public bool IsAdmin { get; set; } = false;
+    public string? AdminOtp { get; set; }
+    public DateTime? AdminOtpExpiry { get; set; }
+
     // Navigation properties
     public virtual ICollection<DatabaseConnection> DatabaseConnections { get; set; } = new List<DatabaseConnection>();
     public virtual ICollection<Conversation> Conversations { get; set; } = new List<Conversation>();
