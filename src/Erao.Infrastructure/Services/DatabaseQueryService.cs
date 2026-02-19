@@ -190,7 +190,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<bool> TestPostgreSqlConnectionAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};Timeout=30";
+        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true;Timeout=30";
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
         return true;
@@ -198,7 +198,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> GetPostgreSqlSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password}";
+        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true";
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -305,7 +305,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecutePostgreSqlQueryAsync(string host, int port, string database, string username, string password, string query)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};Options=-c default_transaction_read_only=on";
+        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true;Options=-c default_transaction_read_only=on";
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -317,7 +317,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<string>> ExecutePostgreSqlQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};Options=-c default_transaction_read_only=on";
+        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true;Options=-c default_transaction_read_only=on";
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -340,7 +340,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<TableSchema>> GetPostgreSqlStructuredSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password}";
+        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true";
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -559,7 +559,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<bool> TestMySqlConnectionAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};Connection Timeout=30";
+        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred;Connection Timeout=30";
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
         return true;
@@ -567,7 +567,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> GetMySqlSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password}";
+        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred";
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -605,7 +605,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteMySqlQueryAsync(string host, int port, string database, string username, string password, string query)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password}";
+        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred";
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -623,7 +623,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<string>> ExecuteMySqlQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password}";
+        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred";
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -646,7 +646,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<TableSchema>> GetMySqlStructuredSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password}";
+        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred";
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
 

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Erao.Core.DTOs.File;
 using Erao.Core.Entities;
@@ -82,10 +83,13 @@ public class FileDocumentService : IFileDocumentService
 
             // Generate unique filename
             var fileName = $"{Guid.NewGuid()}{extension}";
+            var sw = Stopwatch.StartNew();
 
             // Buffer file in memory once — avoids re-downloading from MinIO for parsing
             using var memoryStream = new MemoryStream();
             await file.CopyToAsync(memoryStream, cancellationToken);
+
+            _logger.LogInformation("[TIMING] File buffered to memory: {Ms}ms ({Size}MB)", sw.ElapsedMilliseconds, file.Length / (1024 * 1024));
 
             // Create file document entity (save early so we have an ID for Parquet naming)
             var fileDocument = new FileDocument
@@ -118,6 +122,8 @@ public class FileDocumentService : IFileDocumentService
                 var convertTask = ConvertToParquetAsync(fileDocument, parseStream, fileType, cancellationToken);
 
                 await Task.WhenAll(uploadTask, convertTask);
+
+                _logger.LogInformation("[TIMING] R2 upload + Parquet conversion (parallel): {Ms}ms", sw.ElapsedMilliseconds);
 
                 fileDocument.StoragePath = await uploadTask;
                 uploadStream.Dispose();
@@ -183,6 +189,7 @@ public class FileDocumentService : IFileDocumentService
             await _unitOfWork.FileDocuments.UpdateAsync(fileDocument);
             await _unitOfWork.SaveChangesAsync();
 
+            _logger.LogInformation("[TIMING] Total server-side processing: {Ms}ms", sw.ElapsedMilliseconds);
             _logger.LogInformation("File {FileName} uploaded for user {UserId}", file.FileName, userId);
 
             var debugString = string.Join(" | ", debugInfo);
@@ -454,6 +461,7 @@ public class FileDocumentService : IFileDocumentService
     {
         // Convert to a local temp Parquet file, then upload to R2/S3
         var tempParquetPath = Path.Combine(Path.GetTempPath(), $"{fileDocument.Id}.parquet");
+        var sw = Stopwatch.StartNew();
 
         try
         {
@@ -467,15 +475,19 @@ public class FileDocumentService : IFileDocumentService
                 conversionResult = await _parquetConversionService.ConvertExcelToParquetAsync(fileStream, tempParquetPath);
             }
 
+            _logger.LogInformation("[TIMING] Parquet conversion done: {Ms}ms", sw.ElapsedMilliseconds);
+
             if (conversionResult.Success)
             {
                 // Upload Parquet file to R2/S3
                 string parquetObjectKey;
+                var parquetSize = new FileInfo(tempParquetPath).Length;
                 await using (var parquetStream = File.OpenRead(tempParquetPath))
                 {
                     parquetObjectKey = await _minioService.UploadFileAsync(parquetStream, $"{fileDocument.Id}.parquet", "application/octet-stream", fileDocument.UserId, "parquet");
                 }
 
+                _logger.LogInformation("[TIMING] Parquet upload to R2: {Ms}ms ({Size}KB)", sw.ElapsedMilliseconds, parquetSize / 1024);
                 _logger.LogInformation("Parquet uploaded to R2: {ObjectKey}", parquetObjectKey);
 
                 fileDocument.UsesParquet = true;
