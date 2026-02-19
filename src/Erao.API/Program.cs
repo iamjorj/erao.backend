@@ -10,6 +10,18 @@ using Erao.Infrastructure.Data;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Allow large file uploads (100MB) — Kestrel default is ~30MB
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Limits.MaxRequestBodySize = 100 * 1024 * 1024; // 100MB
+});
+
+// Also increase form multipart limit
+builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
+{
+    options.MultipartBodyLengthLimit = 100 * 1024 * 1024; // 100MB
+});
+
 // Configure Serilog
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)

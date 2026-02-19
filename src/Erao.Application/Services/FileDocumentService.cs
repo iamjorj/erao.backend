@@ -83,12 +83,13 @@ public class FileDocumentService : IFileDocumentService
             // Generate unique filename
             var fileName = $"{Guid.NewGuid()}{extension}";
 
+            // Buffer file in memory once — avoids re-downloading from MinIO for parsing
+            using var memoryStream = new MemoryStream();
+            await file.CopyToAsync(memoryStream, cancellationToken);
+
             // Upload to MinIO
-            string objectName;
-            using (var stream = file.OpenReadStream())
-            {
-                objectName = await _minioService.UploadFileAsync(stream, fileName, file.ContentType, userId);
-            }
+            memoryStream.Position = 0;
+            var objectName = await _minioService.UploadFileAsync(memoryStream, fileName, file.ContentType, userId);
 
             // Create file document entity
             var fileDocument = new FileDocument
@@ -98,17 +99,16 @@ public class FileDocumentService : IFileDocumentService
                 OriginalFileName = file.FileName,
                 FileType = fileType,
                 FileSizeBytes = file.Length,
-                StoragePath = objectName, // Store MinIO object name
+                StoragePath = objectName,
                 Status = FileProcessingStatus.Processing
             };
 
             await _unitOfWork.FileDocuments.AddAsync(fileDocument);
             await _unitOfWork.SaveChangesAsync();
 
-            // Download from MinIO to parse
-            using var fileStream = await _minioService.DownloadFileAsync(objectName);
-            _logger.LogWarning("[DEBUG] File {FileName}: type={FileType}, streamLength={StreamLen}, streamPos={StreamPos}",
-                file.FileName, fileType, fileStream.CanSeek ? fileStream.Length : -1, fileStream.CanSeek ? fileStream.Position : -1);
+            // Reuse buffered stream for parsing (no re-download needed)
+            memoryStream.Position = 0;
+            var fileStream = memoryStream;
 
             var debugInfo = new List<string> { $"FileType={fileType}" };
 
