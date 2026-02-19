@@ -87,11 +87,7 @@ public class FileDocumentService : IFileDocumentService
             using var memoryStream = new MemoryStream();
             await file.CopyToAsync(memoryStream, cancellationToken);
 
-            // Upload to MinIO
-            memoryStream.Position = 0;
-            var objectName = await _minioService.UploadFileAsync(memoryStream, fileName, file.ContentType, userId);
-
-            // Create file document entity
+            // Create file document entity (save early so we have an ID for Parquet naming)
             var fileDocument = new FileDocument
             {
                 UserId = userId,
@@ -99,27 +95,42 @@ public class FileDocumentService : IFileDocumentService
                 OriginalFileName = file.FileName,
                 FileType = fileType,
                 FileSizeBytes = file.Length,
-                StoragePath = objectName,
+                StoragePath = "", // Will be set after upload
                 Status = FileProcessingStatus.Processing
             };
 
             await _unitOfWork.FileDocuments.AddAsync(fileDocument);
             await _unitOfWork.SaveChangesAsync();
 
-            // Reuse buffered stream for parsing (no re-download needed)
-            memoryStream.Position = 0;
-            var fileStream = memoryStream;
-
             var debugInfo = new List<string> { $"FileType={fileType}" };
 
-            // For CSV/Excel: convert to Parquet via DuckDB (supports 500M+ rows)
+            // For CSV/Excel: upload original to R2 and convert to Parquet in parallel
             if (fileType == FileType.Csv || fileType == FileType.Excel)
             {
                 debugInfo.Add("Path=Parquet");
-                await ConvertToParquetAsync(fileDocument, fileStream, fileType, cancellationToken);
+
+                // Create two independent streams from the buffer
+                var uploadStream = new MemoryStream(memoryStream.GetBuffer(), 0, (int)memoryStream.Length, writable: false);
+                var parseStream = new MemoryStream(memoryStream.GetBuffer(), 0, (int)memoryStream.Length, writable: false);
+
+                // Run R2 upload and Parquet conversion in parallel
+                var uploadTask = _minioService.UploadFileAsync(uploadStream, fileName, file.ContentType, userId);
+                var convertTask = ConvertToParquetAsync(fileDocument, parseStream, fileType, cancellationToken);
+
+                await Task.WhenAll(uploadTask, convertTask);
+
+                fileDocument.StoragePath = await uploadTask;
+                uploadStream.Dispose();
+                parseStream.Dispose();
             }
             else
             {
+                // Non-tabular: upload first, then parse
+                memoryStream.Position = 0;
+                var objectName = await _minioService.UploadFileAsync(memoryStream, fileName, file.ContentType, userId);
+                fileDocument.StoragePath = objectName;
+                memoryStream.Position = 0;
+                var fileStream = (Stream)memoryStream;
                 // Non-tabular files: use legacy parsing
                 var availableParsers = _fileParsers.Select(p => p.GetType().Name).ToList();
                 debugInfo.Add($"AvailableParsers=[{string.Join(",", availableParsers)}]");

@@ -49,12 +49,13 @@ public class ParquetConversionService : IParquetConversionService
                 await cmd.ExecuteNonQueryAsync();
             }
 
-            // Get row count
+            // Get row count from Parquet metadata (no full scan needed)
             long rowCount;
             await using (var cmd = connection.CreateCommand())
             {
-                cmd.CommandText = $"SELECT COUNT(*) FROM read_parquet('{escapedParquet}')";
-                rowCount = (long)(await cmd.ExecuteScalarAsync() ?? 0);
+                cmd.CommandText = $"SELECT num_rows FROM parquet_metadata('{escapedParquet}')";
+                var result = await cmd.ExecuteScalarAsync();
+                rowCount = result != null ? Convert.ToInt64(result) : 0;
             }
 
             // Get schema info
@@ -169,7 +170,7 @@ public class ParquetConversionService : IParquetConversionService
                 }
                 lastColNum = actualLastCol;
 
-                await using var csvWriter = new StreamWriter(tempCsvPath, false, Encoding.UTF8);
+                await using var csvWriter = new StreamWriter(tempCsvPath, false, Encoding.UTF8, bufferSize: 65536);
 
                 // Write header row
                 var headerValues = new List<string>();
@@ -183,28 +184,48 @@ public class ParquetConversionService : IParquetConversionService
                 }
                 await csvWriter.WriteLineAsync(string.Join(",", headerValues));
 
-                // Write data rows (starting after header)
+                // Write data rows in batches for performance
+                var sb = new StringBuilder(8192);
                 var dataRowCount = 0;
                 for (var row = headerRowNumber + 1; row <= lastRowNum; row++)
                 {
-                    var values = new List<string>();
                     var hasData = false;
+                    var first = true;
                     for (var col = firstColNum; col <= lastColNum; col++)
                     {
+                        if (!first) sb.Append(',');
+                        first = false;
                         var cell = worksheet.Cell(row, col);
                         var value = cell.IsEmpty() ? "" : cell.GetFormattedString();
                         if (!string.IsNullOrWhiteSpace(value)) hasData = true;
                         if (value.Contains(',') || value.Contains('\n') || value.Contains('"'))
-                            value = "\"" + value.Replace("\"", "\"\"") + "\"";
-                        values.Add(value);
+                        {
+                            sb.Append('"');
+                            sb.Append(value.Replace("\"", "\"\""));
+                            sb.Append('"');
+                        }
+                        else
+                        {
+                            sb.Append(value);
+                        }
                     }
 
-                    // Skip completely empty rows
-                    if (!hasData) continue;
+                    if (!hasData) { sb.Clear(); continue; }
 
-                    await csvWriter.WriteLineAsync(string.Join(",", values));
+                    sb.Append('\n');
                     dataRowCount++;
+
+                    // Flush buffer every 1000 rows
+                    if (dataRowCount % 1000 == 0)
+                    {
+                        await csvWriter.WriteAsync(sb);
+                        sb.Clear();
+                    }
                 }
+
+                // Flush remaining rows
+                if (sb.Length > 0)
+                    await csvWriter.WriteAsync(sb);
             }
 
             // Now convert the temp CSV to Parquet using the CSV method
@@ -227,11 +248,13 @@ public class ParquetConversionService : IParquetConversionService
                 await cmd.ExecuteNonQueryAsync();
             }
 
+            // Get row count from Parquet metadata (no full scan)
             long parquetRowCount;
             await using (var cmd = connection.CreateCommand())
             {
-                cmd.CommandText = $"SELECT COUNT(*) FROM read_parquet('{escapedParquet}')";
-                parquetRowCount = (long)(await cmd.ExecuteScalarAsync() ?? 0);
+                cmd.CommandText = $"SELECT num_rows FROM parquet_metadata('{escapedParquet}')";
+                var result = await cmd.ExecuteScalarAsync();
+                parquetRowCount = result != null ? Convert.ToInt64(result) : 0;
             }
 
             var schemaJson = await GetParquetSchemaAsync(outputPath, connection);
