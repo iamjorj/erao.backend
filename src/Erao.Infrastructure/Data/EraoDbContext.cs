@@ -124,6 +124,12 @@ public class EraoDbContext : DbContext
             entity.Property(e => e.ConnectorType).HasConversion<int>();
             entity.Property(e => e.EncryptedCredentials).IsRequired();
             entity.Property(e => e.SchemaContext).HasColumnType("text");
+            entity.Property(e => e.SyncStatus).HasConversion<int>().HasDefaultValue(ConnectorSyncStatus.Idle);
+            entity.Property(e => e.SyncErrorMessage).HasColumnType("text");
+            entity.Property(e => e.ParquetStoragePaths).HasColumnType("text");
+            entity.Property(e => e.SchemaInfo).HasColumnType("text");
+            entity.Property(e => e.SampleDataJson).HasColumnType("text");
+            entity.Property(e => e.TableRowCounts).HasColumnType("text");
 
             entity.HasOne(e => e.User)
                 .WithMany()

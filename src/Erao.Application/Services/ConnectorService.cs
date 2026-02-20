@@ -1,9 +1,11 @@
+using System.Net.Http.Headers;
 using System.Text.Json;
 using AutoMapper;
 using Erao.Core.DTOs.Connector;
 using Erao.Core.Entities;
 using Erao.Core.Enums;
 using Erao.Core.Interfaces;
+using Microsoft.Extensions.Logging;
 
 namespace Erao.Application.Services;
 
@@ -14,20 +16,44 @@ public interface IConnectorService
     Task<AppConnectorDto> CreateConnectorAsync(Guid userId, CreateConnectorRequest request);
     Task<AppConnectorDto> UpdateConnectorAsync(Guid userId, Guid connectorId, UpdateConnectorRequest request);
     Task DeleteConnectorAsync(Guid userId, Guid connectorId);
+    Task<ConnectionTestResult> TestConnectionAsync(int connectorType, Dictionary<string, string> credentials);
+    Task<AppConnectorDto> SyncConnectorAsync(Guid connectorId, Guid userId);
     List<ConnectorMetadataDto> GetAllMetadata();
+}
+
+public class ConnectionTestResult
+{
+    public bool Success { get; set; }
+    public string Message { get; set; } = string.Empty;
+    public string? AccountName { get; set; } // e.g. shop name, Stripe account name
 }
 
 public class ConnectorService : IConnectorService
 {
     private readonly IUnitOfWork _unitOfWork;
     private readonly IEncryptionService _encryptionService;
+    private readonly IConnectorSyncService _connectorSyncService;
+    private readonly IMinioService _minioService;
     private readonly IMapper _mapper;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly ILogger<ConnectorService> _logger;
 
-    public ConnectorService(IUnitOfWork unitOfWork, IEncryptionService encryptionService, IMapper mapper)
+    public ConnectorService(
+        IUnitOfWork unitOfWork,
+        IEncryptionService encryptionService,
+        IConnectorSyncService connectorSyncService,
+        IMinioService minioService,
+        IMapper mapper,
+        IHttpClientFactory httpClientFactory,
+        ILogger<ConnectorService> logger)
     {
         _unitOfWork = unitOfWork;
         _encryptionService = encryptionService;
+        _connectorSyncService = connectorSyncService;
+        _minioService = minioService;
         _mapper = mapper;
+        _httpClientFactory = httpClientFactory;
+        _logger = logger;
     }
 
     public async Task<IEnumerable<AppConnectorDto>> GetConnectorsAsync(Guid userId)
@@ -55,6 +81,13 @@ public class ConnectorService : IConnectorService
 
         var connectorType = (ConnectorType)request.ConnectorType;
 
+        // Test connection before saving
+        var testResult = await TestConnectionAsync(request.ConnectorType, request.Credentials);
+        if (!testResult.Success)
+        {
+            throw new InvalidOperationException(testResult.Message);
+        }
+
         // Encrypt credentials as JSON
         var credentialsJson = JsonSerializer.Serialize(request.Credentials);
         var encryptedCredentials = _encryptionService.Encrypt(credentialsJson);
@@ -73,6 +106,160 @@ public class ConnectorService : IConnectorService
         await _unitOfWork.SaveChangesAsync();
 
         return _mapper.Map<AppConnectorDto>(connector);
+    }
+
+    public async Task<ConnectionTestResult> TestConnectionAsync(int connectorType, Dictionary<string, string> credentials)
+    {
+        if (!Enum.IsDefined(typeof(ConnectorType), connectorType))
+        {
+            return new ConnectionTestResult { Success = false, Message = "Invalid connector type" };
+        }
+
+        var type = (ConnectorType)connectorType;
+
+        try
+        {
+            return type switch
+            {
+                ConnectorType.Shopify => await TestShopifyAsync(credentials),
+                ConnectorType.Stripe => await TestStripeAsync(credentials),
+                // Coming soon connectors — skip live test, just validate fields exist
+                _ => ValidateCredentialFields(type, credentials)
+            };
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogWarning(ex, "Connection test failed for {Type}", type);
+            return new ConnectionTestResult
+            {
+                Success = false,
+                Message = $"Could not reach {type} API. Check your credentials and try again."
+            };
+        }
+        catch (TaskCanceledException)
+        {
+            return new ConnectionTestResult
+            {
+                Success = false,
+                Message = $"Connection to {type} timed out. Please try again."
+            };
+        }
+    }
+
+    private async Task<ConnectionTestResult> TestShopifyAsync(Dictionary<string, string> credentials)
+    {
+        if (!credentials.TryGetValue("storeUrl", out var storeUrl) || string.IsNullOrWhiteSpace(storeUrl))
+            return new ConnectionTestResult { Success = false, Message = "Store URL is required" };
+        if (!credentials.TryGetValue("apiKey", out var apiKey) || string.IsNullOrWhiteSpace(apiKey))
+            return new ConnectionTestResult { Success = false, Message = "API Key is required" };
+
+        // Normalize store URL
+        storeUrl = storeUrl.Trim().TrimEnd('/');
+        if (!storeUrl.Contains('.'))
+            storeUrl += ".myshopify.com";
+        if (!storeUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            storeUrl = "https://" + storeUrl;
+
+        var client = _httpClientFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.Add("X-Shopify-Access-Token", apiKey.Trim());
+
+        var response = await client.GetAsync($"{storeUrl}/admin/api/2024-01/shop.json");
+
+        if (response.IsSuccessStatusCode)
+        {
+            var json = await response.Content.ReadAsStringAsync();
+            var doc = JsonDocument.Parse(json);
+            var shopName = doc.RootElement.GetProperty("shop").GetProperty("name").GetString();
+            return new ConnectionTestResult
+            {
+                Success = true,
+                Message = $"Connected to {shopName}",
+                AccountName = shopName
+            };
+        }
+
+        return response.StatusCode switch
+        {
+            System.Net.HttpStatusCode.Unauthorized =>
+                new ConnectionTestResult { Success = false, Message = "Invalid API key. Check your Shopify Admin API access token." },
+            System.Net.HttpStatusCode.NotFound =>
+                new ConnectionTestResult { Success = false, Message = "Store not found. Check your store URL." },
+            System.Net.HttpStatusCode.Forbidden =>
+                new ConnectionTestResult { Success = false, Message = "Access denied. Your API key may not have the required permissions." },
+            _ =>
+                new ConnectionTestResult { Success = false, Message = $"Shopify returned {(int)response.StatusCode}. Check your credentials." }
+        };
+    }
+
+    private async Task<ConnectionTestResult> TestStripeAsync(Dictionary<string, string> credentials)
+    {
+        if (!credentials.TryGetValue("secretKey", out var secretKey) || string.IsNullOrWhiteSpace(secretKey))
+            return new ConnectionTestResult { Success = false, Message = "Secret Key is required" };
+
+        var client = _httpClientFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", secretKey.Trim());
+
+        var response = await client.GetAsync("https://api.stripe.com/v1/balance");
+
+        if (response.IsSuccessStatusCode)
+        {
+            // Get account name from /v1/account
+            string? accountName = null;
+            try
+            {
+                var acctResponse = await client.GetAsync("https://api.stripe.com/v1/account");
+                if (acctResponse.IsSuccessStatusCode)
+                {
+                    var acctJson = await acctResponse.Content.ReadAsStringAsync();
+                    var doc = JsonDocument.Parse(acctJson);
+                    if (doc.RootElement.TryGetProperty("settings", out var settings) &&
+                        settings.TryGetProperty("dashboard", out var dashboard) &&
+                        dashboard.TryGetProperty("display_name", out var displayName))
+                    {
+                        accountName = displayName.GetString();
+                    }
+                }
+            }
+            catch { /* best effort */ }
+
+            return new ConnectionTestResult
+            {
+                Success = true,
+                Message = accountName != null ? $"Connected to {accountName}" : "Connected to Stripe",
+                AccountName = accountName
+            };
+        }
+
+        return response.StatusCode switch
+        {
+            System.Net.HttpStatusCode.Unauthorized =>
+                new ConnectionTestResult { Success = false, Message = "Invalid secret key. Check your Stripe API key." },
+            System.Net.HttpStatusCode.Forbidden =>
+                new ConnectionTestResult { Success = false, Message = "Access denied. Your key may be restricted." },
+            _ =>
+                new ConnectionTestResult { Success = false, Message = $"Stripe returned {(int)response.StatusCode}. Check your credentials." }
+        };
+    }
+
+    private static ConnectionTestResult ValidateCredentialFields(ConnectorType type, Dictionary<string, string> credentials)
+    {
+        // For coming-soon connectors, just ensure credentials aren't empty
+        if (credentials.Count == 0)
+            return new ConnectionTestResult { Success = false, Message = "Credentials are required" };
+
+        foreach (var (key, value) in credentials)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return new ConnectionTestResult { Success = false, Message = $"{key} is required" };
+        }
+
+        return new ConnectionTestResult
+        {
+            Success = true,
+            Message = $"Credentials saved for {type} (connection test will run when data sync is available)"
+        };
     }
 
     public async Task<AppConnectorDto> UpdateConnectorAsync(Guid userId, Guid connectorId, UpdateConnectorRequest request)
@@ -102,12 +289,49 @@ public class ConnectorService : IConnectorService
         return _mapper.Map<AppConnectorDto>(connector);
     }
 
+    public async Task<AppConnectorDto> SyncConnectorAsync(Guid connectorId, Guid userId)
+    {
+        var connector = await _unitOfWork.AppConnectors.GetByIdAsync(connectorId);
+        if (connector == null || connector.UserId != userId)
+            throw new InvalidOperationException("Connector not found");
+
+        if (connector.ConnectorType != ConnectorType.Shopify && connector.ConnectorType != ConnectorType.Stripe)
+            throw new InvalidOperationException($"Sync is not yet supported for {connector.ConnectorType}");
+
+        await _connectorSyncService.SyncAsync(connectorId, userId);
+
+        // Reload to get updated sync fields
+        connector = await _unitOfWork.AppConnectors.GetByIdAsync(connectorId);
+        return _mapper.Map<AppConnectorDto>(connector!);
+    }
+
     public async Task DeleteConnectorAsync(Guid userId, Guid connectorId)
     {
         var connector = await _unitOfWork.AppConnectors.GetByIdAsync(connectorId);
         if (connector == null || connector.UserId != userId)
         {
             throw new InvalidOperationException("Connector not found");
+        }
+
+        // Clean up R2 Parquet files
+        if (!string.IsNullOrEmpty(connector.ParquetStoragePaths))
+        {
+            try
+            {
+                var paths = JsonSerializer.Deserialize<Dictionary<string, string>>(connector.ParquetStoragePaths);
+                if (paths != null)
+                {
+                    foreach (var (_, objectKey) in paths)
+                    {
+                        try { await _minioService.DeleteFileAsync(objectKey); }
+                        catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete Parquet file: {Key}", objectKey); }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to parse ParquetStoragePaths for cleanup");
+            }
         }
 
         await _unitOfWork.AppConnectors.DeleteAsync(connector);

@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using Erao.Application.Services;
 using Erao.Core.DTOs.Common;
 using Erao.Core.DTOs.Connector;
+using ConnectionTestResult = Erao.Application.Services.ConnectionTestResult;
 
 namespace Erao.API.Controllers;
 
@@ -65,6 +66,25 @@ public class ConnectorsController : ControllerBase
         }
     }
 
+    [HttpPost("test")]
+    public async Task<ActionResult<ApiResponse<ConnectionTestResult>>> TestConnection([FromBody] CreateConnectorRequest request)
+    {
+        try
+        {
+            var result = await _connectorService.TestConnectionAsync(request.ConnectorType, request.Credentials);
+            if (result.Success)
+            {
+                return Ok(ApiResponse<ConnectionTestResult>.SuccessResponse(result, result.Message));
+            }
+            return BadRequest(ApiResponse<ConnectionTestResult>.ErrorResponse(result.Message));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error testing connector connection");
+            return StatusCode(500, ApiResponse<ConnectionTestResult>.ErrorResponse("Connection test failed"));
+        }
+    }
+
     [HttpPost]
     public async Task<ActionResult<ApiResponse<AppConnectorDto>>> Create([FromBody] CreateConnectorRequest request)
     {
@@ -103,6 +123,26 @@ public class ConnectorsController : ControllerBase
         {
             _logger.LogError(ex, "Error updating connector {Id}", id);
             return StatusCode(500, ApiResponse<AppConnectorDto>.ErrorResponse("An error occurred"));
+        }
+    }
+
+    [HttpPost("{id}/sync")]
+    public async Task<ActionResult<ApiResponse<AppConnectorDto>>> Sync(Guid id)
+    {
+        try
+        {
+            var userId = GetUserId();
+            var connector = await _connectorService.SyncConnectorAsync(id, userId);
+            return Ok(ApiResponse<AppConnectorDto>.SuccessResponse(connector, "Sync completed"));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(ApiResponse<AppConnectorDto>.ErrorResponse(ex.Message));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error syncing connector {Id}", id);
+            return StatusCode(500, ApiResponse<AppConnectorDto>.ErrorResponse("Sync failed: " + ex.Message));
         }
     }
 

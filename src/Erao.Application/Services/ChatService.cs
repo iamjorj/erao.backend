@@ -18,14 +18,20 @@ public class ChatService : IChatService
     private readonly IOllamaService _ollamaService;
     private readonly IDatabaseQueryService _databaseQueryService;
     private readonly IFileQueryService _fileQueryService;
+    private readonly IConnectorQueryService _connectorQueryService;
+    private readonly IConnectorSyncService _connectorSyncService;
     private readonly IEncryptionService _encryptionService;
     private readonly IMapper _mapper;
+
+    private static readonly TimeSpan ConnectorSyncStaleThreshold = TimeSpan.FromHours(1);
 
     public ChatService(
         IUnitOfWork unitOfWork,
         IOllamaService ollamaService,
         IDatabaseQueryService databaseQueryService,
         IFileQueryService fileQueryService,
+        IConnectorQueryService connectorQueryService,
+        IConnectorSyncService connectorSyncService,
         IEncryptionService encryptionService,
         IMapper mapper)
     {
@@ -33,6 +39,8 @@ public class ChatService : IChatService
         _ollamaService = ollamaService;
         _databaseQueryService = databaseQueryService;
         _fileQueryService = fileQueryService;
+        _connectorQueryService = connectorQueryService;
+        _connectorSyncService = connectorSyncService;
         _encryptionService = encryptionService;
         _mapper = mapper;
     }
@@ -99,7 +107,39 @@ public class ChatService : IChatService
             appConnector = await _unitOfWork.AppConnectors.GetByIdAsync(conversation.AppConnectorId.Value);
             if (appConnector != null)
             {
-                schemaContext = appConnector.SchemaContext;
+                // Auto re-sync if data is stale (older than threshold) or never synced
+                if (appConnector.SyncStatus != ConnectorSyncStatus.Syncing &&
+                    (appConnector.ConnectorType == ConnectorType.Shopify || appConnector.ConnectorType == ConnectorType.Stripe))
+                {
+                    var isStale = appConnector.LastSyncedAt == null ||
+                                  (DateTime.UtcNow - appConnector.LastSyncedAt.Value) > ConnectorSyncStaleThreshold;
+
+                    if (isStale)
+                    {
+                        try
+                        {
+                            await _connectorSyncService.SyncAsync(appConnector.Id, userId);
+                            // Reload connector to get updated fields
+                            appConnector = await _unitOfWork.AppConnectors.GetByIdAsync(appConnector.Id);
+                        }
+                        catch
+                        {
+                            // Sync failure is non-blocking — continue with existing data
+                        }
+                    }
+                }
+
+                // Use real schema from synced data if available, otherwise fall back to static template
+                if (appConnector != null &&
+                    appConnector.SyncStatus == ConnectorSyncStatus.Completed &&
+                    !string.IsNullOrEmpty(appConnector.ParquetStoragePaths))
+                {
+                    schemaContext = _connectorQueryService.BuildConnectorSchemaDescription(appConnector);
+                }
+                else if (appConnector != null)
+                {
+                    schemaContext = appConnector.SchemaContext;
+                }
             }
         }
         else if (conversation.DatabaseConnectionId.HasValue)
@@ -197,7 +237,9 @@ public class ChatService : IChatService
         string systemPrompt;
         if (appConnector != null)
         {
-            systemPrompt = BuildConnectorSystemPrompt(schemaContext, appConnector.ConnectorType, appConnector.Name);
+            var hasSyncedData = appConnector.SyncStatus == ConnectorSyncStatus.Completed &&
+                                !string.IsNullOrEmpty(appConnector.ParquetStoragePaths);
+            systemPrompt = BuildConnectorSystemPrompt(schemaContext, appConnector.ConnectorType, appConnector.Name, hasSyncedData);
         }
         else if (fileDocument != null)
         {
@@ -486,6 +528,101 @@ public class ChatService : IChatService
                 {
                     queryResult = ExtractDataContextAsResult(aiResponse);
                 }
+            }
+        }
+        else if (appConnector != null && request.ExecuteQuery
+            && appConnector.SyncStatus == ConnectorSyncStatus.Completed
+            && !string.IsNullOrEmpty(appConnector.ParquetStoragePaths))
+        {
+            // Connector mode: extract SQL and execute via DuckDB (multi-table Parquet views)
+            var sqlQueries = ExtractAllSqlFromResponse(aiResponse);
+
+            if (sqlQueries.Count > 0)
+            {
+                // Layer 1: Schema pre-validation
+                if (schemaLookup.Count > 0)
+                {
+                    var combinedSql = string.Join("\n", sqlQueries);
+                    var validation = SqlSchemaValidator.Validate(combinedSql, schemaLookup);
+                    if (!validation.IsValid)
+                    {
+                        var correctionHint = validation.BuildCorrectionHint();
+                        var fixPrompt = BuildSqlRetryPrompt(combinedSql, correctionHint, schemaContext, null, false, true);
+                        var (fixResponse, fixTokens) = await _ollamaService.ChatAsync(
+                            $"Fix schema issues: {correctionHint}", new List<(string, string)>(), fixPrompt);
+                        tokensUsed += fixTokens;
+
+                        var fixedQueries = ExtractAllSqlFromResponse(fixResponse);
+                        if (fixedQueries.Count > 0)
+                        {
+                            sqlQueries = fixedQueries;
+                            aiResponse = fixResponse;
+                        }
+                    }
+                }
+
+                sqlQuery = string.Join("\n\n-- Next Query --\n\n", sqlQueries);
+
+                const int maxRetries = 2;
+                for (var attempt = 0; attempt <= maxRetries; attempt++)
+                {
+                    try
+                    {
+                        if (sqlQueries.Count == 1)
+                        {
+                            queryResult = await _connectorQueryService.ExecuteQueryForConnectorAsync(
+                                appConnector.Id, sqlQueries[0]);
+                        }
+                        else
+                        {
+                            var results = await _connectorQueryService.ExecuteQueriesForConnectorAsync(
+                                appConnector.Id, sqlQueries);
+                            var allResults = new List<object>();
+                            foreach (var result in results)
+                            {
+                                if (!string.IsNullOrEmpty(result))
+                                {
+                                    var parsed = System.Text.Json.JsonSerializer.Deserialize<object>(result);
+                                    allResults.Add(parsed!);
+                                }
+                            }
+                            queryResult = System.Text.Json.JsonSerializer.Serialize(new { tables = allResults });
+                        }
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        if (attempt < maxRetries)
+                        {
+                            var failedSql = string.Join("\n\n", sqlQueries);
+                            var retryPrompt = BuildSqlRetryPrompt(failedSql, ex.Message, schemaContext, null, false, true);
+                            var (retryResponse, retryTokens) = await _ollamaService.ChatAsync(
+                                $"Fix this SQL error: {ex.Message}", new List<(string role, string content)>(), retryPrompt);
+                            tokensUsed += retryTokens;
+
+                            var retrySqlQueries = ExtractAllSqlFromResponse(retryResponse);
+                            if (retrySqlQueries.Count > 0)
+                            {
+                                sqlQueries = retrySqlQueries;
+                                sqlQuery = string.Join("\n\n-- Next Query --\n\n", sqlQueries);
+                                aiResponse = retryResponse;
+                            }
+                            else
+                            {
+                                queryResult = $"Error executing query: {ex.Message}";
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            queryResult = $"Error executing query: {ex.Message}";
+                        }
+                    }
+                }
+            }
+            else
+            {
+                queryResult = ExtractDataContextAsResult(aiResponse);
             }
         }
 
@@ -1285,7 +1422,7 @@ Use EXACT column names in double quotes. Never invent columns.
         return prompt;
     }
 
-    private static string BuildConnectorSystemPrompt(string? schemaContext, ConnectorType connectorType, string connectorName)
+    private static string BuildConnectorSystemPrompt(string? schemaContext, ConnectorType connectorType, string connectorName, bool hasSyncedData = false)
     {
         var appName = connectorType switch
         {
@@ -1301,6 +1438,11 @@ Use EXACT column names in double quotes. Never invent columns.
             ConnectorType.GoogleSheets => "Google Sheets",
             _ => connectorName
         };
+
+        if (hasSyncedData)
+        {
+            return BuildSyncedConnectorSystemPrompt(schemaContext, appName, connectorName);
+        }
 
         return $@"You are Erao, an expert data analyst specializing in {appName} data. The user connected their {appName} account ""{connectorName}"".
 
@@ -1353,6 +1495,73 @@ valueColumns:
 - [ ] SELECT only
 - [ ] Has GROUP BY if using aggregates
 - [ ] LIMIT present";
+    }
+
+    private static string BuildSyncedConnectorSystemPrompt(string? schemaContext, string appName, string connectorName)
+    {
+        return $@"You are Erao, an expert data analyst specializing in {appName} data. The user's {appName} account ""{connectorName}"" is synced — you have REAL data to query.
+
+## 1. RESPONSE FORMAT
+
+Classify the user's intent, then follow the matching format:
+
+**DATA** (DEFAULT — use this for almost everything):
+- This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, and ANY request that could involve querying the data.
+- ALWAYS start with 1-3 sentences explaining your thinking — what you're looking at, how you're approaching it, and why.
+- THEN include ```sql + ```viz blocks. The ```sql block is MANDATORY — without it, the user sees nothing.
+- You MUST write fresh SQL for EVERY request. [DATA_CONTEXT] tags in history are past references only — never mention them.
+
+**SHOW SQL** (""show me the sql"", ""show me sql"", ""give me the query""):
+- Write the SQL inside a ```text block (NOT ```sql). Explain what each part does. No execution.
+
+**EXPLANATION** (conceptual questions, follow-ups about previous results):
+- Write like a knowledgeable colleague — conversational, clear, concise.
+- No SQL blocks. No filler.
+
+**OFF-TOPIC** (greetings, general knowledge, unrelated):
+- One sentence decline. Mention what {appName} data is available.
+
+## 2. SQL RULES
+
+A. **Dialect**: DuckDB (PostgreSQL-compatible). Double-quote ALL identifiers: ""table_name"", ""column_name"". Column and table names are CASE-SENSITIVE — use exact names from the schema.
+B. **Multi-table**: Data is organized in multiple tables. You can JOIN across tables (e.g., JOIN ""customers"" ON ""orders"".""customer_id"" = ""customers"".""id"").
+C. **Data cleaning**: Filter NULL/empty before numeric ops. COALESCE computed scores to 0. Use NULLIF(x, 0) in denominators. ROUND(value, N) works directly. ILIKE for case-insensitive. TRY_CAST() for safe conversion.
+D. **Monetary values**: All amounts are in dollars (already converted from cents for Stripe). ROUND to 2 decimal places.
+E. **Rankings**: ORDER BY DESC + LIMIT 20 default unless user specifies.
+F. **Structure**: Use CTEs for multi-step queries. Use window functions for comparisons.
+G. **Smart mapping**: ""revenue"" → amount/total_price. ""my""/""our"" → all data. Map user language to actual column names.
+
+## 3. VISUALIZATION
+
+Output a ```viz block after every ```sql block:
+
+| User asks | chart | group |
+|---|---|---|
+| ""top 10"", ""best"", ""worst"" | ""bar"" | entity name |
+| ""over time"", ""by month"", ""trend"" | ""line"" | date column |
+| ""breakdown"", ""distribution"" (2-8 items) | ""pie"" | category |
+| ""by category"", ""by status"" | ""bar"" | GROUP BY column |
+| ""compare trends"" | ""area"" | date column |
+| detailed list, many columns | ""table"" | first column |
+
+Format: ```viz\n{{""chart"":""bar"",""group"":""Column"",""values"":[{{""col"":""Metric"",""agg"":""NONE""}}]}}\n```
+
+## 4. CHECKLIST
+1. Table and column names match schema exactly (double-quoted, case-sensitive).
+2. All numeric ops preceded by NULL filtering.
+3. Rankings: ORDER BY DESC + LIMIT 20.
+4. viz group = entity name for rankings, category for aggregations, date for time series.
+
+## 5. CLARIFICATION (use RARELY)
+
+Only if ALL: no matching column, 2+ valid interpretations, no context clues.
+```clarification
+{{""question"":""..."",""options"":[{{""label"":""..."",""value"":""...""}},{{""label"":""Something else"",""value"":""Let me clarify""}}]}}
+```
+
+## Schema (REAL synced data — ONLY these tables/columns exist)
+
+{schemaContext ?? "No schema available."}";
     }
 
     private static string BuildDocumentSystemPrompt(string? schemaContext, string fileName, int? rowCount, string? parsedContent, FileType fileType)

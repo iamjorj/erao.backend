@@ -34,7 +34,16 @@ public class MappingProfile : Profile
         // AppConnector mappings
         CreateMap<AppConnector, AppConnectorDto>()
             .ForMember(dest => dest.ConnectorType,
-                opt => opt.MapFrom(src => (int)src.ConnectorType));
+                opt => opt.MapFrom(src => (int)src.ConnectorType))
+            .ForMember(dest => dest.SyncStatus,
+                opt => opt.MapFrom(src => (int)src.SyncStatus))
+            .ForMember(dest => dest.HasSyncedData,
+                opt => opt.MapFrom(src => src.SyncStatus == Erao.Core.Enums.ConnectorSyncStatus.Completed
+                    && !string.IsNullOrEmpty(src.ParquetStoragePaths)))
+            .ForMember(dest => dest.TableRowCounts,
+                opt => opt.MapFrom(src => string.IsNullOrEmpty(src.TableRowCounts)
+                    ? null
+                    : System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, long>>(src.TableRowCounts, (System.Text.Json.JsonSerializerOptions?)null)));
 
         // Message mappings
         CreateMap<Message, MessageDto>();
