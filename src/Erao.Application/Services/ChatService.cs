@@ -88,12 +88,21 @@ public class ChatService : IChatService
         };
         await _unitOfWork.Messages.AddAsync(userMessage);
 
-        // Get schema context if database connection or file is set
+        // Get schema context if database connection, file, or app connector is set
         string? schemaContext = null;
         DatabaseConnection? dbConnection = null;
         FileDocument? fileDocument = null;
+        AppConnector? appConnector = null;
 
-        if (conversation.DatabaseConnectionId.HasValue)
+        if (conversation.AppConnectorId.HasValue)
+        {
+            appConnector = await _unitOfWork.AppConnectors.GetByIdAsync(conversation.AppConnectorId.Value);
+            if (appConnector != null)
+            {
+                schemaContext = appConnector.SchemaContext;
+            }
+        }
+        else if (conversation.DatabaseConnectionId.HasValue)
         {
             dbConnection = await _unitOfWork.DatabaseConnections.GetByIdAsync(conversation.DatabaseConnectionId.Value);
             if (dbConnection != null)
@@ -184,9 +193,13 @@ public class ChatService : IChatService
             })
             .ToList();
 
-        // Build system prompt - different for database vs file
+        // Build system prompt - different for database vs file vs connector
         string systemPrompt;
-        if (fileDocument != null)
+        if (appConnector != null)
+        {
+            systemPrompt = BuildConnectorSystemPrompt(schemaContext, appConnector.ConnectorType, appConnector.Name);
+        }
+        else if (fileDocument != null)
         {
             var isDocumentType = fileDocument.FileType == FileType.Word || fileDocument.FileType == FileType.Text;
             var effectiveRowCountForPrompt = fileDocument.UsesParquet
@@ -1270,6 +1283,76 @@ Use EXACT column names in double quotes. Never invent columns.
         }
 
         return prompt;
+    }
+
+    private static string BuildConnectorSystemPrompt(string? schemaContext, ConnectorType connectorType, string connectorName)
+    {
+        var appName = connectorType switch
+        {
+            ConnectorType.Shopify => "Shopify",
+            ConnectorType.Stripe => "Stripe",
+            ConnectorType.WooCommerce => "WooCommerce",
+            ConnectorType.QuickBooks => "QuickBooks",
+            ConnectorType.HubSpot => "HubSpot",
+            ConnectorType.Salesforce => "Salesforce",
+            ConnectorType.GoogleAnalytics => "Google Analytics",
+            ConnectorType.Notion => "Notion",
+            ConnectorType.Airtable => "Airtable",
+            ConnectorType.GoogleSheets => "Google Sheets",
+            _ => connectorName
+        };
+
+        return $@"You are Erao, an expert data analyst specializing in {appName} data. The user connected their {appName} account ""{connectorName}"".
+
+## IMPORTANT: DATA SYNC NOT YET ACTIVE
+
+The user's {appName} data has NOT been synced yet — live data sync is coming soon. You CANNOT run queries or return actual numbers. NEVER fabricate, estimate, or hallucinate data values.
+
+Instead, for every data question:
+1. Explain clearly what the query would return once data sync is live.
+2. Show the exact SQL query that will answer their question (so they can see Erao understands their {appName} data model).
+3. Describe the expected shape of the results (columns, typical patterns for {appName} stores).
+
+## SCHEMA (will be queryable once data sync is live)
+
+{schemaContext ?? "No schema available."}
+
+## 1. RESPONSE FORMAT
+
+**DATA** (DEFAULT — use for almost every question):
+Start with: ""Once your {appName} data syncs, here's exactly how I'll answer this:""
+Then provide the SQL query in a ```sql code block. After the query, briefly describe what the results would look like and what business insights the user could expect.
+
+**CONVERSATIONAL** (ONLY for greetings, thanks, or off-topic):
+Reply naturally in 1-2 sentences. Mention you're ready to analyze their {appName} data once sync is live.
+
+## 2. SQL RULES
+
+A. **Dialect**: PostgreSQL. Double-quote all identifiers.
+B. **Tables**: Only use tables and columns defined in the schema above.
+C. **SELECT only**: Never INSERT, UPDATE, DELETE, DROP, or ALTER.
+D. **Aggregations**: Use GROUP BY for any aggregate function.
+E. **Formatting**: ROUND monetary values to 2 decimal places.
+F. **Limits**: Default LIMIT 100 unless user specifies otherwise.
+
+## 3. VISUALIZATION HINT
+
+After the ```sql block, if the result is chartable, add a ```viz block:
+```viz
+chartType: bar | line | pie | area | table
+groupByColumn: <x-axis column>
+valueColumns:
+  - column: <y-axis column>
+    aggregation: SUM | AVG | COUNT | MIN | MAX | NONE
+```
+
+## 4. CHECKLIST
+- [ ] NEVER return fake data or made-up numbers
+- [ ] SQL uses only schema columns
+- [ ] All identifiers double-quoted
+- [ ] SELECT only
+- [ ] Has GROUP BY if using aggregates
+- [ ] LIMIT present";
     }
 
     private static string BuildDocumentSystemPrompt(string? schemaContext, string fileName, int? rowCount, string? parsedContent, FileType fileType)

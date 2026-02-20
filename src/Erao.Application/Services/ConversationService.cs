@@ -63,12 +63,23 @@ public class ConversationService : IConversationService
             }
         }
 
+        // Validate app connector if provided
+        if (request.AppConnectorId.HasValue)
+        {
+            var connector = await _unitOfWork.AppConnectors.GetByIdAsync(request.AppConnectorId.Value);
+            if (connector == null || connector.UserId != userId)
+            {
+                throw new InvalidOperationException("App connector not found");
+            }
+        }
+
         var conversation = new Conversation
         {
             UserId = userId,
             Title = request.Title ?? "New Chat",
             DatabaseConnectionId = request.DatabaseConnectionId,
-            FileDocumentId = request.FileDocumentId
+            FileDocumentId = request.FileDocumentId,
+            AppConnectorId = request.AppConnectorId
         };
 
         await _unitOfWork.Conversations.AddAsync(conversation);

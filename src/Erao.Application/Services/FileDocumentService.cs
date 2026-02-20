@@ -106,13 +106,9 @@ public class FileDocumentService : IFileDocumentService
             await _unitOfWork.FileDocuments.AddAsync(fileDocument);
             await _unitOfWork.SaveChangesAsync();
 
-            var debugInfo = new List<string> { $"FileType={fileType}" };
-
             // For CSV/Excel: upload original to R2 and convert to Parquet in parallel
             if (fileType == FileType.Csv || fileType == FileType.Excel)
             {
-                debugInfo.Add("Path=Parquet");
-
                 // Create two independent streams from the buffer
                 var uploadStream = new MemoryStream(memoryStream.GetBuffer(), 0, (int)memoryStream.Length, writable: false);
                 var parseStream = new MemoryStream(memoryStream.GetBuffer(), 0, (int)memoryStream.Length, writable: false);
@@ -137,29 +133,11 @@ public class FileDocumentService : IFileDocumentService
                 fileDocument.StoragePath = objectName;
                 memoryStream.Position = 0;
                 var fileStream = (Stream)memoryStream;
-                // Non-tabular files: use legacy parsing
-                var availableParsers = _fileParsers.Select(p => p.GetType().Name).ToList();
-                debugInfo.Add($"AvailableParsers=[{string.Join(",", availableParsers)}]");
-
                 var parser = _fileParsers.FirstOrDefault(p => p.CanParse(fileType));
-                debugInfo.Add($"MatchedParser={parser?.GetType().Name ?? "NONE"}");
-                _logger.LogWarning("[DEBUG] Parsers: [{Parsers}], matched: {Matched}",
-                    string.Join(", ", availableParsers), parser?.GetType().Name ?? "NONE");
 
                 if (parser != null)
                 {
                     var parseResult = await parser.ParseAsync(fileStream, file.FileName, cancellationToken);
-                    debugInfo.Add($"ParseSuccess={parseResult.Success}");
-                    debugInfo.Add($"ParseRows={parseResult.RowCount}");
-                    debugInfo.Add($"ParseColumns={parseResult.Columns?.Count ?? 0}");
-                    debugInfo.Add($"SchemaInfoLength={parseResult.SchemaInfoJson?.Length ?? 0}");
-                    debugInfo.Add($"ParsedContentLength={parseResult.ParsedContentJson?.Length ?? 0}");
-                    debugInfo.Add($"ParseError={parseResult.ErrorMessage ?? "null"}");
-
-                    _logger.LogWarning("[DEBUG] Parse result: success={Success}, rows={Rows}, cols={Cols}, schemaLen={SchemaLen}, contentLen={ContentLen}, error={Error}",
-                        parseResult.Success, parseResult.RowCount, parseResult.Columns?.Count ?? 0,
-                        parseResult.SchemaInfoJson?.Length ?? 0, parseResult.ParsedContentJson?.Length ?? 0,
-                        parseResult.ErrorMessage ?? "null");
 
                     if (parseResult.Success)
                     {
@@ -167,10 +145,6 @@ public class FileDocumentService : IFileDocumentService
                         fileDocument.SchemaInfo = parseResult.SchemaInfoJson;
                         fileDocument.RowCount = parseResult.RowCount;
                         fileDocument.Status = FileProcessingStatus.Completed;
-
-                        // Log first 200 chars of schema for debugging
-                        _logger.LogWarning("[DEBUG] SchemaInfo preview: {Schema}",
-                            parseResult.SchemaInfoJson?.Substring(0, Math.Min(200, parseResult.SchemaInfoJson?.Length ?? 0)) ?? "null");
                     }
                     else
                     {
@@ -182,7 +156,6 @@ public class FileDocumentService : IFileDocumentService
                 {
                     fileDocument.Status = FileProcessingStatus.Failed;
                     fileDocument.ErrorMessage = $"No parser available for file type: {fileType}";
-                    debugInfo.Add($"Error=NoParser");
                 }
             }
 
@@ -192,13 +165,12 @@ public class FileDocumentService : IFileDocumentService
             _logger.LogInformation("[TIMING] Total server-side processing: {Ms}ms", sw.ElapsedMilliseconds);
             _logger.LogInformation("File {FileName} uploaded for user {UserId}", file.FileName, userId);
 
-            var debugString = string.Join(" | ", debugInfo);
             return new FileUploadResponse
             {
                 Success = true,
                 Message = fileDocument.Status == FileProcessingStatus.Completed
-                    ? $"File uploaded and processed successfully. [DEBUG: {debugString}]"
-                    : $"File uploaded but processing failed: {fileDocument.ErrorMessage}. [DEBUG: {debugString}]",
+                    ? "File uploaded and processed successfully."
+                    : $"File uploaded but processing failed: {fileDocument.ErrorMessage}",
                 File = MapToDto(fileDocument)
             };
         }
@@ -577,11 +549,6 @@ public class FileDocumentService : IFileDocumentService
             Columns = columns,
             CreatedAt = file.CreatedAt,
             UpdatedAt = file.UpdatedAt,
-            // Debug fields
-            DebugSchemaInfo = file.SchemaInfo,
-            DebugParsedContentPreview = file.ParsedContent != null
-                ? file.ParsedContent.Substring(0, Math.Min(500, file.ParsedContent.Length))
-                : null
         };
     }
 }

@@ -119,12 +119,50 @@ public class ParquetConversionService : IParquetConversionService
 
             tempCsvPath = Path.GetTempFileName() + ".csv";
 
-            // Single-pass streaming read with ExcelDataReader (no DOM, no stream reset)
+            // Two-pass read: first find best sheet, then parse it
             var config = new ExcelReaderConfiguration { LeaveOpen = true };
+
+            // Pass 1: scan all sheets to find the one with the most columns (= actual data sheet)
+            int bestSheetIndex = 0;
+            string bestSheetName = "";
+            int bestSheetCols = 0;
+            {
+                using var scanReader = ExcelReaderFactory.CreateReader(excelStream, config);
+                var sheetIndex = 0;
+                do
+                {
+                    var cols = scanReader.FieldCount;
+                    var name = scanReader.Name ?? $"Sheet{sheetIndex + 1}";
+
+                    // Read first row to check if it has actual data spread across columns
+                    var nonEmptyCols = 0;
+                    if (scanReader.Read())
+                    {
+                        for (var c = 0; c < cols; c++)
+                        {
+                            if (!scanReader.IsDBNull(c)) nonEmptyCols++;
+                        }
+                    }
+
+                    // Prefer sheets with more columns; break ties with more non-empty cells
+                    if (cols > bestSheetCols || (cols == bestSheetCols && nonEmptyCols > 0))
+                    {
+                        bestSheetCols = cols;
+                        bestSheetIndex = sheetIndex;
+                        bestSheetName = name;
+                    }
+                    sheetIndex++;
+                } while (scanReader.NextResult());
+
+            }
+
+            // Reset stream for pass 2
+            excelStream.Position = 0;
+
             using (var reader = ExcelReaderFactory.CreateReader(excelStream, config))
             {
-                // Skip sheets with 0 columns (cover pages)
-                while (reader.FieldCount == 0 && reader.NextResult()) { }
+                // Navigate to the best sheet
+                for (var s = 0; s < bestSheetIndex; s++) reader.NextResult();
 
                 var fieldCount = reader.FieldCount;
                 if (fieldCount == 0)
@@ -132,9 +170,9 @@ public class ParquetConversionService : IParquetConversionService
                     return new ParquetConversionResult { Success = false, ErrorMessage = "Excel file has no data" };
                 }
 
-                // Smart header detection: read first 10 rows, pick the one with most unique non-empty values
+                // Smart header detection: read first 20 rows, pick the one with most unique non-empty values
                 var headerCandidates = new List<string[]>();
-                for (var i = 0; i < 10 && reader.Read(); i++)
+                for (var i = 0; i < 20 && reader.Read(); i++)
                 {
                     var row = new string[fieldCount];
                     for (var c = 0; c < fieldCount; c++)
@@ -154,8 +192,6 @@ public class ParquetConversionService : IParquetConversionService
                     var unique = headerCandidates[i].Where(v => !string.IsNullOrWhiteSpace(v)).Distinct(StringComparer.OrdinalIgnoreCase).Count();
                     if (unique > bestUnique && unique >= 2) { bestUnique = unique; headerRowIndex = i; }
                 }
-
-                _logger.LogInformation("[TIMING] ExcelDataReader header scan: {Ms}ms", sw.ElapsedMilliseconds);
 
                 await using var csvWriter = new StreamWriter(tempCsvPath, false, Encoding.UTF8, bufferSize: 65536);
 

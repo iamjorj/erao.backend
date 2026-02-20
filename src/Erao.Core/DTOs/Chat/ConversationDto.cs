@@ -8,6 +8,8 @@ public class ConversationDto
     public string? DatabaseConnectionName { get; set; }
     public Guid? FileDocumentId { get; set; }
     public string? FileDocumentName { get; set; }
+    public Guid? AppConnectorId { get; set; }
+    public string? AppConnectorName { get; set; }
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
     public DateTime? LastMessageAt { get; set; }

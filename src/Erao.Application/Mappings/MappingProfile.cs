@@ -1,6 +1,7 @@
 using AutoMapper;
 using Erao.Core.DTOs;
 using Erao.Core.DTOs.Chat;
+using Erao.Core.DTOs.Connector;
 using Erao.Core.DTOs.Database;
 using Erao.Core.DTOs.Usage;
 using Erao.Core.Entities;
@@ -23,10 +24,17 @@ public class MappingProfile : Profile
                 opt => opt.MapFrom(src => src.DatabaseConnection != null ? src.DatabaseConnection.Name : null))
             .ForMember(dest => dest.FileDocumentName,
                 opt => opt.MapFrom(src => src.FileDocument != null ? src.FileDocument.OriginalFileName : null))
+            .ForMember(dest => dest.AppConnectorName,
+                opt => opt.MapFrom(src => src.AppConnector != null ? src.AppConnector.Name : null))
             .ForMember(dest => dest.LastMessageAt,
                 opt => opt.MapFrom(src => src.Messages.Any() ? src.Messages.Max(m => m.CreatedAt) : (DateTime?)null))
             .ForMember(dest => dest.Messages,
                 opt => opt.MapFrom(src => src.Messages.OrderBy(m => m.CreatedAt)));
+
+        // AppConnector mappings
+        CreateMap<AppConnector, AppConnectorDto>()
+            .ForMember(dest => dest.ConnectorType,
+                opt => opt.MapFrom(src => (int)src.ConnectorType));
 
         // Message mappings
         CreateMap<Message, MessageDto>();

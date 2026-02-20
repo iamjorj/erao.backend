@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Erao.Core.Entities;
+using Erao.Core.Enums;
 
 namespace Erao.Infrastructure.Data;
 
@@ -15,6 +16,7 @@ public class EraoDbContext : DbContext
     public DbSet<Message> Messages { get; set; }
     public DbSet<UsageLog> UsageLogs { get; set; }
     public DbSet<FileDocument> FileDocuments { get; set; }
+    public DbSet<AppConnector> AppConnectors { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -93,6 +95,11 @@ public class EraoDbContext : DbContext
                 .WithMany(f => f.Conversations)
                 .HasForeignKey(e => e.FileDocumentId)
                 .OnDelete(DeleteBehavior.SetNull);
+
+            entity.HasOne(e => e.AppConnector)
+                .WithMany(a => a.Conversations)
+                .HasForeignKey(e => e.AppConnectorId)
+                .OnDelete(DeleteBehavior.SetNull);
         });
 
         // Message configuration
@@ -106,6 +113,21 @@ public class EraoDbContext : DbContext
             entity.HasOne(e => e.Conversation)
                 .WithMany(c => c.Messages)
                 .HasForeignKey(e => e.ConversationId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // AppConnector configuration
+        modelBuilder.Entity<AppConnector>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Name).IsRequired().HasMaxLength(255);
+            entity.Property(e => e.ConnectorType).HasConversion<int>();
+            entity.Property(e => e.EncryptedCredentials).IsRequired();
+            entity.Property(e => e.SchemaContext).HasColumnType("text");
+
+            entity.HasOne(e => e.User)
+                .WithMany()
+                .HasForeignKey(e => e.UserId)
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
