@@ -108,8 +108,7 @@ public class ChatService : IChatService
             if (appConnector != null)
             {
                 // Auto re-sync if data is stale (older than threshold) or never synced
-                if (appConnector.SyncStatus != ConnectorSyncStatus.Syncing &&
-                    (appConnector.ConnectorType == ConnectorType.Shopify || appConnector.ConnectorType == ConnectorType.Stripe))
+                if (appConnector.SyncStatus != ConnectorSyncStatus.Syncing)
                 {
                     var isStale = appConnector.LastSyncedAt == null ||
                                   (DateTime.UtcNow - appConnector.LastSyncedAt.Value) > ConnectorSyncStaleThreshold;
@@ -1441,8 +1440,10 @@ Use EXACT column names in double quotes. Never invent columns.
 
         if (hasSyncedData)
         {
-            return BuildSyncedConnectorSystemPrompt(schemaContext, appName, connectorName);
+            return BuildSyncedConnectorSystemPrompt(schemaContext, appName, connectorName, connectorType);
         }
+
+        var domainGuidance = GetConnectorDomainGuidance(connectorType);
 
         return $@"You are Erao, an expert data analyst specializing in {appName} data. The user connected their {appName} account ""{connectorName}"".
 
@@ -1458,6 +1459,8 @@ Instead, for every data question:
 ## SCHEMA (will be queryable once data sync is live)
 
 {schemaContext ?? "No schema available."}
+
+{domainGuidance}
 
 ## 1. RESPONSE FORMAT
 
@@ -1497,8 +1500,282 @@ valueColumns:
 - [ ] LIMIT present";
     }
 
-    private static string BuildSyncedConnectorSystemPrompt(string? schemaContext, string appName, string connectorName)
+    private static string GetConnectorDomainGuidance(ConnectorType connectorType) => connectorType switch
     {
+        ConnectorType.Shopify => @"## DOMAIN KNOWLEDGE — Shopify
+
+### Vocabulary Mappings
+- ""revenue"" / ""sales"" → SUM(""total_price"") WHERE ""financial_status"" = 'paid'
+- ""AOV"" (average order value) → AVG(""total_price"") WHERE ""financial_status"" = 'paid'
+- ""repeat customers"" → customers WHERE ""orders_count"" > 1
+- ""new customers"" → customers WHERE ""orders_count"" = 1
+- ""refunds"" → orders WHERE ""financial_status"" = 'refunded' OR 'partially_refunded'
+- ""unfulfilled orders"" → orders WHERE ""fulfillment_status"" IS NULL (NULL = unfulfilled, not empty string)
+- ""products sold"" → SUM(""quantity"") from line_items
+
+### Table Relationships
+- ""orders"" → ""customers"" via ""customer_id""
+- ""orders"" → ""line_items"" via ""order_id""
+- ""line_items"" → ""products"" via ""product_id""
+- ""products"" → ""variants"" via ""product_id""
+
+### Data Quirks
+- Timestamps: ""created_at"", ""updated_at"", ""closed_at"", ""cancelled_at""
+- ""fulfillment_status"": NULL (unfulfilled), 'partial', 'fulfilled' — NULL is the default, not an error
+- ""financial_status"": 'pending', 'authorized', 'paid', 'partially_paid', 'refunded', 'partially_refunded', 'voided'
+- ""total_price"" is already in the store's currency (no cents conversion needed)
+- ""discount_codes"" may be a comma-separated string — use LIKE for matching
+
+### Common Metrics
+- Revenue: SELECT SUM(""total_price"") FROM ""orders"" WHERE ""financial_status"" = 'paid'
+- AOV: SELECT ROUND(AVG(""total_price""), 2) FROM ""orders"" WHERE ""financial_status"" = 'paid'
+- Repeat rate: SELECT ROUND(COUNT(*) FILTER (WHERE ""orders_count"" > 1) * 100.0 / COUNT(*), 1) FROM ""customers""",
+
+        ConnectorType.Stripe => @"## DOMAIN KNOWLEDGE — Stripe
+
+### Vocabulary Mappings
+- ""revenue"" / ""sales"" → SUM(""amount"") from charges/payments WHERE ""status"" = 'succeeded'
+- ""MRR"" → SUM(""plan_amount"") from subscriptions WHERE ""status"" = 'active' AND ""interval"" = 'month'
+- ""ARR"" → MRR * 12
+- ""churn"" → subscriptions WHERE ""status"" = 'canceled'
+- ""failed payments"" → charges WHERE ""status"" = 'failed'
+- ""disputes"" → disputes table, ""reason"" column
+
+### Table Relationships
+- ""charges"" / ""payments"" → ""customers"" via ""customer_id""
+- ""subscriptions"" → ""customers"" via ""customer_id""
+- ""subscriptions"" → ""plans"" / ""prices"" via ""plan_id"" or ""price_id""
+- ""invoices"" → ""customers"" via ""customer_id""
+- ""invoices"" → ""subscriptions"" via ""subscription_id""
+
+### Data Quirks
+- **Amounts are already in DOLLARS** (converted from cents during sync) — do NOT divide by 100
+- ID columns have prefixes: ch_ (charges), sub_ (subscriptions), cus_ (customers), in_ (invoices)
+- Timestamps: ""created"" (Unix epoch in some cases) — check schema for actual format
+- ""status"" values for subscriptions: 'active', 'past_due', 'canceled', 'unpaid', 'trialing', 'incomplete'
+- ""status"" values for charges: 'succeeded', 'pending', 'failed'
+
+### Common Metrics
+- MRR: SELECT SUM(""plan_amount"") FROM ""subscriptions"" WHERE ""status"" = 'active' AND ""interval"" = 'month'
+- Churn rate: canceled in period / active at start of period * 100
+- ARPU: SUM(""amount"") / COUNT(DISTINCT ""customer_id"") for succeeded charges",
+
+        ConnectorType.WooCommerce => @"## DOMAIN KNOWLEDGE — WooCommerce
+
+### Vocabulary Mappings
+- ""revenue"" / ""sales"" → SUM(""total"") WHERE ""status"" IN ('wc-processing', 'wc-completed')
+- ""AOV"" → AVG(""total"") for valid statuses
+- ""refunds"" → orders WHERE ""status"" = 'wc-refunded'
+- ""coupons"" / ""discounts"" → ""coupons"" table or ""discount_total"" column on orders
+
+### Table Relationships
+- ""orders"" → ""customers"" via ""customer_id""
+- ""orders"" → ""order_items"" / ""line_items"" via ""order_id""
+- ""order_items"" → ""products"" via ""product_id""
+- ""products"" → ""categories"" via ""category_id"" or category mapping table
+
+### Data Quirks
+- Timestamp column: ""date_created"" (NOT ""created_at"" — differs from Shopify!)
+- Also has ""date_modified"", ""date_completed"", ""date_paid""
+- Order statuses are prefixed: 'wc-pending', 'wc-processing', 'wc-on-hold', 'wc-completed', 'wc-cancelled', 'wc-refunded', 'wc-failed'
+- ""total"" is the order total in store currency (no cents conversion)
+- ""discount_total"" is per-order discount amount
+
+### Common Metrics
+- Revenue: SELECT SUM(""total"") FROM ""orders"" WHERE ""status"" IN ('wc-processing', 'wc-completed')
+- AOV: SELECT ROUND(AVG(""total""), 2) FROM ""orders"" WHERE ""status"" IN ('wc-processing', 'wc-completed')",
+
+        ConnectorType.QuickBooks => @"## DOMAIN KNOWLEDGE — QuickBooks
+
+### Vocabulary Mappings
+- ""revenue"" / ""income"" → ""total_income"" from profit_and_loss
+- ""expenses"" → ""total_expenses"" from profit_and_loss
+- ""net income"" / ""profit"" → ""net_income"" from profit_and_loss
+- ""COGS"" / ""cost of goods"" → ""cost_of_goods_sold"" from profit_and_loss
+- ""gross profit"" → ""gross_profit"" from profit_and_loss
+- ""accounts receivable"" / ""AR"" → invoices/customers WHERE balance > 0
+- ""accounts payable"" / ""AP"" → bills WHERE balance > 0
+
+### Table Relationships
+- ""invoices"" → ""customers"" via ""customer_id""
+- ""bills"" / ""expenses"" → ""vendors"" via ""vendor_id""
+- ""journal_entries"" → ""accounts"" via ""account_id""
+
+### Data Quirks
+- **""profit_and_loss"" is a MONTHLY SUMMARY table** — each row is one month's totals
+  - Do NOT re-aggregate (no SUM of monthly totals unless computing annual total)
+  - To get ""Q1 revenue"": filter months 1-3 and SUM ""total_income""
+  - Column ""period"" or ""month"" identifies the time period
+- Amounts are in the company's base currency
+- ""balance"" columns represent outstanding amounts
+
+### Common Metrics
+- Monthly revenue: SELECT ""period"", ""total_income"" FROM ""profit_and_loss"" ORDER BY ""period""
+- Annual net income: SELECT SUM(""net_income"") FROM ""profit_and_loss"" WHERE EXTRACT(YEAR FROM ""period"") = <year>
+- Gross margin: ROUND(""gross_profit"" * 100.0 / NULLIF(""total_income"", 0), 1)",
+
+        ConnectorType.HubSpot => @"## DOMAIN KNOWLEDGE — HubSpot
+
+### Vocabulary Mappings
+- ""pipeline"" / ""deals by stage"" → GROUP BY ""deal_stage"" from deals
+- ""win rate"" → COUNT(won deals) / COUNT(closed deals) * 100
+- ""deal value"" → ""amount"" column (can be NULL for early-stage deals)
+- ""lifecycle"" / ""funnel"" → contacts grouped by ""lifecycle_stage""
+- ""leads"" → contacts WHERE ""lifecycle_stage"" = 'lead'
+- ""MQLs"" → contacts WHERE ""lifecycle_stage"" = 'marketingqualifiedlead'
+- ""SQLs"" → contacts WHERE ""lifecycle_stage"" = 'salesqualifiedlead'
+
+### Table Relationships
+- ""deals"" → ""contacts"" via ""contact_id"" or association table
+- ""deals"" → ""companies"" via ""company_id""
+- ""contacts"" → ""companies"" via ""company_id""
+
+### Data Quirks
+- Deal stages are **lowercase**: 'appointmentscheduled', 'qualifiedtobuy', 'presentationscheduled', 'decisionmakerboughtin', 'contractsent', 'closedwon', 'closedlost'
+- Lifecycle stages are **lowercase concatenated**: 'subscriber', 'lead', 'marketingqualifiedlead', 'salesqualifiedlead', 'opportunity', 'customer', 'evangelist'
+- ""amount"" can be NULL for deals without a value set — always COALESCE or filter
+- Timestamps: ""created_at"", ""updated_at"", ""closed_at""
+
+### Common Metrics
+- Pipeline value: SELECT ""deal_stage"", COUNT(*), SUM(COALESCE(""amount"", 0)) FROM ""deals"" GROUP BY ""deal_stage""
+- Win rate: SELECT ROUND(COUNT(*) FILTER (WHERE ""deal_stage"" = 'closedwon') * 100.0 / NULLIF(COUNT(*) FILTER (WHERE ""deal_stage"" IN ('closedwon', 'closedlost')), 0), 1) FROM ""deals""
+- Lifecycle funnel: SELECT ""lifecycle_stage"", COUNT(*) FROM ""contacts"" GROUP BY ""lifecycle_stage""",
+
+        ConnectorType.Salesforce => @"## DOMAIN KNOWLEDGE — Salesforce
+
+### Vocabulary Mappings
+- ""pipeline"" / ""deals by stage"" → GROUP BY ""stage_name"" from opportunities
+- ""win rate"" → COUNT(closed-won) / COUNT(all closed) * 100
+- ""forecast"" → SUM(""amount"" * ""probability"" / 100) for open opportunities
+- ""deal value"" → ""amount"" column on opportunities
+- ""lead conversion"" → leads WHERE ""converted_at"" IS NOT NULL
+- ""activities"" → tasks + events tables
+
+### Table Relationships
+- ""opportunities"" → ""accounts"" via ""account_id""
+- ""opportunities"" → ""contacts"" via contact roles or ""contact_id""
+- ""leads"" → ""accounts"" via conversion (""converted_account_id"")
+- ""contacts"" → ""accounts"" via ""account_id""
+- ""tasks"" / ""events"" → ""opportunities"" or ""contacts"" via ""related_to_id""
+
+### Data Quirks
+- Opportunity stages are **Title Case**: 'Prospecting', 'Qualification', 'Needs Analysis', 'Proposal/Price Quote', 'Negotiation/Review', 'Closed Won', 'Closed Lost'
+- ""probability"" is 0-100 (integer percentage), NOT a decimal 0-1
+- Lead conversion: ""is_converted"" boolean, ""converted_at"" timestamp, ""converted_account_id"", ""converted_contact_id""
+- Timestamps: ""created_date"", ""last_modified_date"", ""close_date""
+
+### Common Metrics
+- Pipeline: SELECT ""stage_name"", COUNT(*), SUM(""amount"") FROM ""opportunities"" WHERE ""is_closed"" = false GROUP BY ""stage_name""
+- Weighted forecast: SELECT SUM(""amount"" * ""probability"" / 100) FROM ""opportunities"" WHERE ""is_closed"" = false
+- Win rate: SELECT ROUND(COUNT(*) FILTER (WHERE ""stage_name"" = 'Closed Won') * 100.0 / NULLIF(COUNT(*) FILTER (WHERE ""is_closed"" = true), 0), 1) FROM ""opportunities""",
+
+        ConnectorType.GoogleAnalytics => @"## DOMAIN KNOWLEDGE — Google Analytics
+
+### Vocabulary Mappings
+- ""traffic"" / ""visits"" → ""sessions"" column in ""sessions"" table (YES, column name = table name)
+- ""sources"" / ""where traffic comes from"" → ""session_source"" and ""session_medium"" columns
+- ""bounce rate"" → ""bounce_rate"" column (value is 0-1 RATIO, multiply by 100 for percentage)
+- ""pages"" / ""top pages"" → ""page_path"" or ""page_title"" columns
+- ""users"" / ""visitors"" → ""total_users"" or ""active_users"" columns
+- ""session duration"" → ""average_session_duration"" (in SECONDS — divide by 60 for minutes)
+- ""conversions"" → ""conversions"" or ""goal_completions"" column
+
+### Table Relationships
+- Typically flat/denormalized tables — JOINs are rare
+- Main tables: ""sessions"", ""pages"", ""events"" (check schema for exact names)
+
+### Data Quirks
+- **COLUMN AMBIGUITY**: The ""sessions"" table has a ""sessions"" column — always qualify: ""sessions"".""sessions""
+- Date column: ""date"" stored as 'YYYYMMDD' STRING format — use CAST or string functions for date filtering
+  - Example: WHERE ""date"" >= '20240101' AND ""date"" <= '20240131'
+- ""bounce_rate"" is 0-1 (ratio), NOT 0-100 — display as ROUND(""bounce_rate"" * 100, 1) for percentage
+- ""average_session_duration"" is in seconds — ROUND(""average_session_duration"" / 60, 1) for minutes
+- ""new_users"" vs ""total_users"": new_users are first-time, total_users includes returning
+
+### Common Metrics
+- Total sessions: SELECT SUM(""sessions"".""sessions"") FROM ""sessions""
+- Traffic sources: SELECT ""session_source"", SUM(""sessions"") FROM ""sessions"" GROUP BY ""session_source"" ORDER BY SUM(""sessions"") DESC
+- Bounce rate: SELECT ROUND(AVG(""bounce_rate"") * 100, 1) AS bounce_pct FROM ""sessions""",
+
+        ConnectorType.Notion => @"## DOMAIN KNOWLEDGE — Notion
+
+### CRITICAL LIMITATION
+This connector provides **METADATA ONLY** — workspace structure (pages, databases, parent-child relationships, titles, created/edited timestamps).
+
+**You CANNOT see page content, block text, or rich text.** If the user asks about what's written inside a page, explain this limitation clearly:
+""I can see your Notion workspace structure (page names, databases, hierarchy, timestamps) but I cannot access the actual content inside pages. This is a metadata-level integration.""
+
+### What You CAN Query
+- Page/database titles and hierarchy
+- Created and last edited timestamps
+- Parent-child relationships between pages
+- Database names and structure
+
+### What You CANNOT Query
+- Page body content, text blocks, headings
+- Database row data / property values
+- Comments, mentions, or embedded content",
+
+        ConnectorType.Airtable => @"## DOMAIN KNOWLEDGE — Airtable
+
+### Dynamic Schema
+Airtable bases have user-defined tables and columns — there is NO fixed schema. Read the schema section carefully to understand this specific base's structure.
+
+### Data Quirks
+- Every table has system columns: ""id"" (record ID) and ""created_time""
+- **Multi-select fields** are stored as comma-separated strings — use LIKE '%value%' or string_split for filtering
+- **Linked records** (references to other tables) may appear as record IDs or display values depending on sync
+- **Attachment fields** contain URLs, not file content
+- **Formula/rollup/lookup fields** are computed — treat as read-only values
+- Column names are exactly as the user defined them (may contain spaces, special characters)
+
+### Query Tips
+- Always check the schema for exact column names — they are user-defined and unpredictable
+- Multi-select filter: WHERE ""Tags"" LIKE '%Marketing%'
+- Date fields: typically ISO 8601 format ('2024-01-15T10:30:00.000Z')",
+
+        ConnectorType.GoogleSheets => @"## DOMAIN KNOWLEDGE — Google Sheets
+
+### Dynamic Schema
+Google Sheets have user-defined columns from the header row — there is NO fixed schema. Read the schema section carefully.
+
+### Data Quirks
+- **No ID column** — rows have no unique identifier unless the user created one
+- **Dates may be stored as text** — '1/15/2024', 'January 15, 2024', '2024-01-15' are all possible. Use TRY_CAST for safe conversion.
+- **Boolean-like values are STRINGS**: 'Yes'/'No', 'TRUE'/'FALSE', 'Y'/'N' — use string comparison, NOT boolean operators
+- **Numbers may be stored as text** with formatting: '$1,234.56', '50%' — may need REPLACE and CAST
+- **Empty cells** may be NULL or empty string '' — check both: WHERE ""col"" IS NOT NULL AND ""col"" != ''
+- Column names come from the header row — may contain spaces, special characters, or be very long
+
+### Query Tips
+- Always check schema for exact column names
+- Use TRY_CAST(""col"" AS DOUBLE) for numeric operations on potentially text columns
+- For date filtering: TRY_CAST(""Date"" AS DATE) to safely handle mixed formats
+- Empty check: WHERE ""col"" IS NOT NULL AND TRIM(""col"") != ''",
+
+        _ => ""
+    };
+
+    private static string GetConnectorSmartMapping(ConnectorType connectorType) => connectorType switch
+    {
+        ConnectorType.Shopify => @"""revenue"" → SUM(""total_price"") WHERE ""financial_status""='paid'. ""AOV"" → AVG(""total_price""). ""my""/""our"" → all data. ""repeat customers"" → ""orders_count"">1. Map user language to actual column names.",
+        ConnectorType.Stripe => @"""revenue"" → SUM(""amount"") WHERE ""status""='succeeded'. ""MRR"" → SUM(""plan_amount"") for active monthly subs. ""ARR"" → MRR*12. Amounts are already in dollars. Map user language to actual column names.",
+        ConnectorType.WooCommerce => @"""revenue"" → SUM(""total"") WHERE ""status"" IN ('wc-processing','wc-completed'). ""AOV"" → AVG(""total""). ""my""/""our"" → all data. Map user language to actual column names.",
+        ConnectorType.QuickBooks => @"""revenue"" → ""total_income"" from profit_and_loss. ""expenses"" → ""total_expenses"". ""net income"" → ""net_income"". Do NOT re-aggregate monthly summary rows unless computing period totals. Map user language to actual column names.",
+        ConnectorType.HubSpot => @"""pipeline"" → deals grouped by ""deal_stage"". ""win rate"" → closed-won/all-closed*100. ""revenue"" → SUM(""amount"") WHERE stage='closedwon'. Stages are lowercase. Map user language to actual column names.",
+        ConnectorType.Salesforce => @"""pipeline"" → opportunities grouped by ""stage_name"". ""win rate"" → Closed Won/all closed*100. ""forecast"" → SUM(""amount""*""probability""/100). Stages are Title Case. Map user language to actual column names.",
+        ConnectorType.GoogleAnalytics => @"""traffic"" → ""sessions"" column (qualify as ""sessions"".""sessions"" to avoid ambiguity). ""bounce rate"" is 0-1 ratio (multiply by 100). Duration is in seconds. Dates are 'YYYYMMDD' strings. Map user language to actual column names.",
+        ConnectorType.Notion => @"METADATA ONLY — can query page titles, hierarchy, timestamps. Cannot access page content. Map user questions about structure to available columns.",
+        ConnectorType.Airtable => @"Dynamic schema — read the schema carefully. Multi-select fields are comma-separated strings. ""id"" and ""created_time"" are system columns. Map user language to the actual column names shown in the schema.",
+        ConnectorType.GoogleSheets => @"Dynamic schema — read the schema carefully. No ID column. Dates/booleans/numbers may be stored as text strings. Use TRY_CAST for safe conversion. Map user language to the actual column names shown in the schema.",
+        _ => @"""revenue"" → amount/total_price. ""my""/""our"" → all data. Map user language to actual column names."
+    };
+
+    private static string BuildSyncedConnectorSystemPrompt(string? schemaContext, string appName, string connectorName, ConnectorType connectorType)
+    {
+        var domainGuidance = GetConnectorDomainGuidance(connectorType);
+        var smartMapping = GetConnectorSmartMapping(connectorType);
+
         return $@"You are Erao, an expert data analyst specializing in {appName} data. The user's {appName} account ""{connectorName}"" is synced — you have REAL data to query.
 
 ## 1. RESPONSE FORMAT
@@ -1521,6 +1798,8 @@ Classify the user's intent, then follow the matching format:
 **OFF-TOPIC** (greetings, general knowledge, unrelated):
 - One sentence decline. Mention what {appName} data is available.
 
+{domainGuidance}
+
 ## 2. SQL RULES
 
 A. **Dialect**: DuckDB (PostgreSQL-compatible). Double-quote ALL identifiers: ""table_name"", ""column_name"". Column and table names are CASE-SENSITIVE — use exact names from the schema.
@@ -1529,7 +1808,7 @@ C. **Data cleaning**: Filter NULL/empty before numeric ops. COALESCE computed sc
 D. **Monetary values**: All amounts are in dollars (already converted from cents for Stripe). ROUND to 2 decimal places.
 E. **Rankings**: ORDER BY DESC + LIMIT 20 default unless user specifies.
 F. **Structure**: Use CTEs for multi-step queries. Use window functions for comparisons.
-G. **Smart mapping**: ""revenue"" → amount/total_price. ""my""/""our"" → all data. Map user language to actual column names.
+G. **Smart mapping**: {smartMapping}
 
 ## 3. VISUALIZATION
 

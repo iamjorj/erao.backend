@@ -14,11 +14,11 @@ public static class ConnectorMetadataRegistry
             Category = "E-Commerce",
             Description = "Connect your Shopify store to analyze orders, products, customers, and inventory data.",
             IconSlug = "shopify",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
                 new() { Key = "storeUrl", Label = "Store URL", Type = "url", Placeholder = "mystore.myshopify.com", Required = true, HelpText = "Your Shopify store domain" },
-                new() { Key = "adminApiToken", Label = "Admin API Token", Type = "password", Placeholder = "shpat_...", Required = true, HelpText = "Found in Settings > Apps > Develop apps" }
+                new() { Key = "apiKey", Label = "Admin API Token", Type = "password", Placeholder = "shpat_...", Required = true, HelpText = "Found in Settings > Apps > Develop apps" }
             },
             DataTables = new() { "Orders", "Products", "Customers", "Inventory" }
         },
@@ -29,7 +29,7 @@ public static class ConnectorMetadataRegistry
             Category = "Payments",
             Description = "Connect Stripe to analyze payments, subscriptions, customers, and invoices.",
             IconSlug = "stripe",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
                 new() { Key = "secretKey", Label = "Secret Key", Type = "password", Placeholder = "sk_live_...", Required = true, HelpText = "Found in Developers > API keys" }
@@ -43,7 +43,7 @@ public static class ConnectorMetadataRegistry
             Category = "E-Commerce",
             Description = "Connect your WooCommerce store to analyze orders, products, customers, and coupons.",
             IconSlug = "woocommerce",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
                 new() { Key = "storeUrl", Label = "Store URL", Type = "url", Placeholder = "https://mystore.com", Required = true, HelpText = "Your WordPress/WooCommerce site URL" },
@@ -59,11 +59,10 @@ public static class ConnectorMetadataRegistry
             Category = "Accounting",
             Description = "Connect QuickBooks to analyze invoices, expenses, accounts, and profit & loss data.",
             IconSlug = "quickbooks",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
-                new() { Key = "clientId", Label = "Client ID", Type = "text", Placeholder = "AB1cDe2fGh...", Required = true, HelpText = "From your QuickBooks Developer app" },
-                new() { Key = "clientSecret", Label = "Client Secret", Type = "password", Placeholder = "...", Required = true },
+                new() { Key = "accessToken", Label = "Access Token", Type = "password", Placeholder = "eyJ0eXAi...", Required = true, HelpText = "OAuth access token from QuickBooks Developer playground" },
                 new() { Key = "realmId", Label = "Realm ID (Company ID)", Type = "text", Placeholder = "123456789", Required = true, HelpText = "Found in your QuickBooks company URL" }
             },
             DataTables = new() { "Invoices", "Expenses", "Accounts", "Profit & Loss" }
@@ -75,7 +74,7 @@ public static class ConnectorMetadataRegistry
             Category = "CRM",
             Description = "Connect HubSpot to analyze contacts, deals, companies, and support tickets.",
             IconSlug = "hubspot",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
                 new() { Key = "privateAppToken", Label = "Private App Token", Type = "password", Placeholder = "pat-na1-...", Required = true, HelpText = "Found in Settings > Integrations > Private Apps" }
@@ -89,7 +88,7 @@ public static class ConnectorMetadataRegistry
             Category = "CRM",
             Description = "Connect Salesforce to analyze leads, opportunities, accounts, and cases.",
             IconSlug = "salesforce",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
                 new() { Key = "instanceUrl", Label = "Instance URL", Type = "url", Placeholder = "https://mycompany.salesforce.com", Required = true, HelpText = "Your Salesforce org URL" },
@@ -104,7 +103,7 @@ public static class ConnectorMetadataRegistry
             Category = "Analytics",
             Description = "Connect Google Analytics to analyze sessions, pageviews, and conversion data.",
             IconSlug = "google-analytics",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
                 new() { Key = "propertyId", Label = "Property ID", Type = "text", Placeholder = "123456789", Required = true, HelpText = "GA4 property ID from Admin > Property Settings" },
@@ -119,7 +118,7 @@ public static class ConnectorMetadataRegistry
             Category = "Productivity",
             Description = "Connect Notion to analyze databases and pages in your workspace.",
             IconSlug = "notion",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
                 new() { Key = "integrationToken", Label = "Integration Token", Type = "password", Placeholder = "secret_...", Required = true, HelpText = "Found in Settings > Connections > Develop or manage integrations" }
@@ -133,7 +132,7 @@ public static class ConnectorMetadataRegistry
             Category = "Databases",
             Description = "Connect Airtable to analyze bases, tables, and records.",
             IconSlug = "airtable",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
                 new() { Key = "personalAccessToken", Label = "Personal Access Token", Type = "password", Placeholder = "pat...", Required = true, HelpText = "Found in Account > Developer hub" },
@@ -148,7 +147,7 @@ public static class ConnectorMetadataRegistry
             Category = "Spreadsheets",
             Description = "Connect Google Sheets to analyze spreadsheet data.",
             IconSlug = "google-sheets",
-            IsAvailable = false,
+            IsAvailable = true,
             CredentialFields = new()
             {
                 new() { Key = "spreadsheetId", Label = "Spreadsheet ID", Type = "text", Placeholder = "1BxiMVs0XRA...", Required = true, HelpText = "Found in the spreadsheet URL between /d/ and /edit" },

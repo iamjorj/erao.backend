@@ -123,7 +123,14 @@ public class ConnectorService : IConnectorService
             {
                 ConnectorType.Shopify => await TestShopifyAsync(credentials),
                 ConnectorType.Stripe => await TestStripeAsync(credentials),
-                // Coming soon connectors — skip live test, just validate fields exist
+                ConnectorType.WooCommerce => await TestWooCommerceAsync(credentials),
+                ConnectorType.HubSpot => await TestHubSpotAsync(credentials),
+                ConnectorType.Notion => await TestNotionAsync(credentials),
+                ConnectorType.Airtable => await TestAirtableAsync(credentials),
+                ConnectorType.Salesforce => await TestSalesforceAsync(credentials),
+                ConnectorType.QuickBooks => await TestQuickBooksAsync(credentials),
+                ConnectorType.GoogleAnalytics => await TestGoogleConnectorAsync(type, credentials),
+                ConnectorType.GoogleSheets => await TestGoogleConnectorAsync(type, credentials),
                 _ => ValidateCredentialFields(type, credentials)
             };
         }
@@ -243,6 +250,178 @@ public class ConnectorService : IConnectorService
         };
     }
 
+    private async Task<ConnectionTestResult> TestWooCommerceAsync(Dictionary<string, string> credentials)
+    {
+        var storeUrl = (credentials.GetValueOrDefault("storeUrl", "") ?? "").Trim().TrimEnd('/');
+        var consumerKey = credentials.GetValueOrDefault("consumerKey", "") ?? "";
+        var consumerSecret = credentials.GetValueOrDefault("consumerSecret", "") ?? "";
+
+        if (string.IsNullOrWhiteSpace(storeUrl)) return new ConnectionTestResult { Success = false, Message = "Store URL is required" };
+        if (string.IsNullOrWhiteSpace(consumerKey)) return new ConnectionTestResult { Success = false, Message = "Consumer Key is required" };
+        if (string.IsNullOrWhiteSpace(consumerSecret)) return new ConnectionTestResult { Success = false, Message = "Consumer Secret is required" };
+
+        if (!storeUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase)) storeUrl = "https://" + storeUrl;
+
+        var client = _httpClientFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(10);
+        var url = $"{storeUrl}/wp-json/wc/v3/system_status?consumer_key={Uri.EscapeDataString(consumerKey)}&consumer_secret={Uri.EscapeDataString(consumerSecret)}";
+
+        var response = await client.GetAsync(url);
+        if (response.IsSuccessStatusCode)
+        {
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var storeName = doc.RootElement.TryGetProperty("environment", out var env) && env.TryGetProperty("site_url", out var su) ? su.GetString() : storeUrl;
+            return new ConnectionTestResult { Success = true, Message = $"Connected to {storeName}", AccountName = storeName };
+        }
+
+        return new ConnectionTestResult { Success = false, Message = $"WooCommerce returned {(int)response.StatusCode}. Check your credentials." };
+    }
+
+    private async Task<ConnectionTestResult> TestHubSpotAsync(Dictionary<string, string> credentials)
+    {
+        var token = credentials.GetValueOrDefault("privateAppToken", "") ?? "";
+        if (string.IsNullOrWhiteSpace(token)) return new ConnectionTestResult { Success = false, Message = "Private App Token is required" };
+
+        var client = _httpClientFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        var response = await client.GetAsync("https://api.hubapi.com/crm/v3/objects/contacts?limit=1");
+        if (response.IsSuccessStatusCode)
+            return new ConnectionTestResult { Success = true, Message = "Connected to HubSpot", AccountName = "HubSpot CRM" };
+
+        return response.StatusCode == System.Net.HttpStatusCode.Unauthorized
+            ? new ConnectionTestResult { Success = false, Message = "Invalid token. Check your HubSpot Private App Token." }
+            : new ConnectionTestResult { Success = false, Message = $"HubSpot returned {(int)response.StatusCode}. Check your credentials." };
+    }
+
+    private async Task<ConnectionTestResult> TestNotionAsync(Dictionary<string, string> credentials)
+    {
+        var token = credentials.GetValueOrDefault("integrationToken", "") ?? "";
+        if (string.IsNullOrWhiteSpace(token)) return new ConnectionTestResult { Success = false, Message = "Integration Token is required" };
+
+        var client = _httpClientFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        client.DefaultRequestHeaders.Add("Notion-Version", "2022-06-28");
+
+        var response = await client.GetAsync("https://api.notion.com/v1/users/me");
+        if (response.IsSuccessStatusCode)
+        {
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var name = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() : null;
+            return new ConnectionTestResult { Success = true, Message = $"Connected as {name ?? "Notion Integration"}", AccountName = name };
+        }
+
+        return new ConnectionTestResult { Success = false, Message = $"Notion returned {(int)response.StatusCode}. Check your integration token." };
+    }
+
+    private async Task<ConnectionTestResult> TestAirtableAsync(Dictionary<string, string> credentials)
+    {
+        var token = credentials.GetValueOrDefault("personalAccessToken", "") ?? "";
+        var baseId = credentials.GetValueOrDefault("baseId", "") ?? "";
+
+        if (string.IsNullOrWhiteSpace(token)) return new ConnectionTestResult { Success = false, Message = "Personal Access Token is required" };
+        if (string.IsNullOrWhiteSpace(baseId)) return new ConnectionTestResult { Success = false, Message = "Base ID is required" };
+
+        var client = _httpClientFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        var response = await client.GetAsync($"https://api.airtable.com/v0/meta/bases/{baseId}/tables");
+        if (response.IsSuccessStatusCode)
+        {
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var tableCount = doc.RootElement.TryGetProperty("tables", out var t) && t.ValueKind == JsonValueKind.Array ? t.GetArrayLength() : 0;
+            return new ConnectionTestResult { Success = true, Message = $"Connected to base with {tableCount} tables", AccountName = baseId };
+        }
+
+        return new ConnectionTestResult { Success = false, Message = $"Airtable returned {(int)response.StatusCode}. Check your token and base ID." };
+    }
+
+    private async Task<ConnectionTestResult> TestSalesforceAsync(Dictionary<string, string> credentials)
+    {
+        var instanceUrl = (credentials.GetValueOrDefault("instanceUrl", "") ?? "").Trim().TrimEnd('/');
+        var accessToken = credentials.GetValueOrDefault("accessToken", "") ?? "";
+
+        if (string.IsNullOrWhiteSpace(instanceUrl)) return new ConnectionTestResult { Success = false, Message = "Instance URL is required" };
+        if (string.IsNullOrWhiteSpace(accessToken)) return new ConnectionTestResult { Success = false, Message = "Access Token is required" };
+
+        var client = _httpClientFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+        var response = await client.GetAsync($"{instanceUrl}/services/data/v59.0/sobjects");
+        if (response.IsSuccessStatusCode)
+        {
+            // Try to get org name
+            string? orgName = null;
+            try
+            {
+                var orgResponse = await client.GetAsync($"{instanceUrl}/services/data/v59.0/query?q={Uri.EscapeDataString("SELECT Name FROM Organization LIMIT 1")}");
+                if (orgResponse.IsSuccessStatusCode)
+                {
+                    var orgJson = await orgResponse.Content.ReadAsStringAsync();
+                    using var orgDoc = JsonDocument.Parse(orgJson);
+                    if (orgDoc.RootElement.TryGetProperty("records", out var recs) && recs.GetArrayLength() > 0)
+                        orgName = recs[0].TryGetProperty("Name", out var n) ? n.GetString() : null;
+                }
+            }
+            catch { /* best effort */ }
+
+            return new ConnectionTestResult
+            {
+                Success = true,
+                Message = orgName != null ? $"Connected to {orgName}" : "Connected to Salesforce",
+                AccountName = orgName
+            };
+        }
+
+        return response.StatusCode == System.Net.HttpStatusCode.Unauthorized
+            ? new ConnectionTestResult { Success = false, Message = "Invalid access token. Check your Salesforce credentials." }
+            : new ConnectionTestResult { Success = false, Message = $"Salesforce returned {(int)response.StatusCode}. Check your instance URL and access token." };
+    }
+
+    private async Task<ConnectionTestResult> TestQuickBooksAsync(Dictionary<string, string> credentials)
+    {
+        var accessToken = credentials.GetValueOrDefault("accessToken", "") ?? "";
+        var realmId = credentials.GetValueOrDefault("realmId", "") ?? "";
+
+        if (string.IsNullOrWhiteSpace(accessToken)) return new ConnectionTestResult { Success = false, Message = "Access Token is required" };
+        if (string.IsNullOrWhiteSpace(realmId)) return new ConnectionTestResult { Success = false, Message = "Realm ID is required" };
+
+        var client = _httpClientFactory.CreateClient();
+        client.Timeout = TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        var response = await client.GetAsync($"https://quickbooks.api.intuit.com/v3/company/{realmId}/companyinfo/{realmId}");
+        if (response.IsSuccessStatusCode)
+        {
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+            var companyName = doc.RootElement.TryGetProperty("CompanyInfo", out var ci)
+                ? (ci.TryGetProperty("CompanyName", out var cn) ? cn.GetString() : null) : null;
+            return new ConnectionTestResult
+            {
+                Success = true,
+                Message = companyName != null ? $"Connected to {companyName}" : "Connected to QuickBooks",
+                AccountName = companyName
+            };
+        }
+
+        return new ConnectionTestResult { Success = false, Message = $"QuickBooks returned {(int)response.StatusCode}. Check your access token and realm ID." };
+    }
+
+    private async Task<ConnectionTestResult> TestGoogleConnectorAsync(ConnectorType type, Dictionary<string, string> credentials)
+    {
+        var (success, message, accountName) = await _connectorSyncService.TestGoogleConnectionAsync(type, credentials);
+        return new ConnectionTestResult { Success = success, Message = message, AccountName = accountName };
+    }
+
     private static ConnectionTestResult ValidateCredentialFields(ConnectorType type, Dictionary<string, string> credentials)
     {
         // For coming-soon connectors, just ensure credentials aren't empty
@@ -294,9 +473,6 @@ public class ConnectorService : IConnectorService
         var connector = await _unitOfWork.AppConnectors.GetByIdAsync(connectorId);
         if (connector == null || connector.UserId != userId)
             throw new InvalidOperationException("Connector not found");
-
-        if (connector.ConnectorType != ConnectorType.Shopify && connector.ConnectorType != ConnectorType.Stripe)
-            throw new InvalidOperationException($"Sync is not yet supported for {connector.ConnectorType}");
 
         await _connectorSyncService.SyncAsync(connectorId, userId);
 
