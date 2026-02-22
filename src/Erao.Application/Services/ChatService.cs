@@ -643,6 +643,35 @@ public class ChatService : IChatService
             }
         }
 
+        // Layer 4: Post-query insight generation — interpret results for non-technical users
+        string? insight = null;
+        List<string>? followUpQuestions = null;
+        if (!string.IsNullOrEmpty(queryResult) && !queryResult.StartsWith("Error", StringComparison.Ordinal) && sqlQuery != null)
+        {
+            var (insightIsEmpty, _, insightRowCount) = AnalyzeQueryResult(queryResult);
+            // Only generate insight when result has actual data rows
+            if (!insightIsEmpty && insightRowCount > 0)
+            {
+                try
+                {
+                    var resultSummary = BuildResultSummary(queryResult);
+                    var insightPrompt = BuildInsightPrompt(request.Message, sqlQuery, resultSummary);
+                    var (insightResponse, insightTokens) = await _ollamaService.ChatAsync(
+                        "Generate insight", new List<(string, string)>(), insightPrompt);
+                    tokensUsed += insightTokens;
+
+                    if (!string.IsNullOrWhiteSpace(insightResponse))
+                    {
+                        (insight, followUpQuestions) = ExtractInsightAndFollowUps(insightResponse);
+                    }
+                }
+                catch
+                {
+                    // Non-blocking — insight failure doesn't break the response
+                }
+            }
+        }
+
         // Clean the response - remove code blocks that are now in queryResult
         var cleanedContent = StripCodeBlocks(aiResponse);
 
@@ -693,7 +722,9 @@ public class ChatService : IChatService
             AssistantMessage = assistantDto,
             QueryResult = queryResult,
             TokensUsed = tokensUsed,
-            VisualizationHint = visualizationHint
+            VisualizationHint = visualizationHint,
+            Insight = insight,
+            FollowUpQuestions = followUpQuestions
         };
     }
 
@@ -822,7 +853,7 @@ Classify the user's intent, then follow the matching format:
 
 **DATA** (DEFAULT — use this for almost everything):
 - This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, and ANY request that could involve querying the database.
-- ALWAYS start with 1-3 sentences explaining your thinking — what you're looking at, how you're approaching it, and why. Even for simple questions, show you're thinking. The user needs to feel you're analyzing, not just running a blind query.
+- Start with 1 sentence framing the business question — what the data will reveal about their business, not what you're about to do. Example: 'Revenue concentration among your top customers will show if there's a dependency risk.' Never say 'I'll look at...' or 'Let me query...'.
 - THEN include ```sql + ```viz blocks. The ```sql block is MANDATORY — without it, the user sees nothing.
 - For complex concepts (""best"", ""most valuable""): explain what factors you chose and why.
 - You MUST write fresh SQL for EVERY request. [DATA_CONTEXT] tags in history are past references only — never mention them.
@@ -1316,7 +1347,7 @@ Classify the user's intent, then follow the matching format:
 
 **DATA** (DEFAULT — use this for almost everything):
 - This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, and ANY request that could involve querying the data.
-- ALWAYS start with 1-3 sentences explaining your thinking — what you're looking at, how you're approaching it, and why. Even for simple questions, show you're thinking. The user needs to feel you're analyzing, not just running a blind query.
+- Start with 1 sentence framing the business question — what the data will reveal about their business, not what you're about to do. Example: 'Revenue concentration among your top customers will show if there's a dependency risk.' Never say 'I'll look at...' or 'Let me query...'.
 - THEN include ```sql + ```viz blocks. The ```sql block is MANDATORY — without it, the user sees nothing.
 - For complex concepts (""most productive"", ""healthiest""): explain what factors you chose and why.
 - You MUST write fresh SQL for EVERY request. [DATA_CONTEXT] tags in history are past references only — never mention them.
@@ -1784,7 +1815,7 @@ Classify the user's intent, then follow the matching format:
 
 **DATA** (DEFAULT — use this for almost everything):
 - This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, and ANY request that could involve querying the data.
-- ALWAYS start with 1-3 sentences explaining your thinking — what you're looking at, how you're approaching it, and why.
+- Start with 1 sentence framing the business question — what the data will reveal about their business, not what you're about to do. Never say 'I'll look at...' or 'Let me query...'.
 - THEN include ```sql + ```viz blocks. The ```sql block is MANDATORY — without it, the user sees nothing.
 - You MUST write fresh SQL for EVERY request. [DATA_CONTEXT] tags in history are past references only — never mention them.
 
@@ -2093,6 +2124,12 @@ Rules:
         content = System.Text.RegularExpressions.Regex.Replace(
             content, @"```clarification[\s\S]*?```", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
+        // Remove insight/followups code blocks (safety — these come from separate AI call)
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"```insight[\s\S]*?```", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"```followups[\s\S]*?```", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
         // Remove empty markdown headers (e.g., "**Top 5 Sales:**" followed by empty line or end)
         // These appear when JSON blocks are stripped but headers remain
         // Only match headers followed by empty line or end, not headers with content after
@@ -2264,5 +2301,164 @@ Be concise and helpful. Do not include SQL code. Do not use markdown headers.";
         }
 
         return prompt;
+    }
+
+    private static string BuildInsightPrompt(string userQuestion, string sqlQuery, string resultSummary)
+    {
+        return $@"You are a business analyst explaining query results to a non-technical business owner.
+
+User question: {userQuestion}
+SQL executed: {sqlQuery}
+Result summary:
+{resultSummary}
+
+Instructions:
+1. Write 2-3 sentences answering ""so what?"" in plain English. No jargon, no markdown, no bullet points. Focus on the business implication — what this means for their business, not what the numbers are.
+2. Suggest exactly 3 short follow-up questions (under 10 words each) the user might naturally ask next.
+
+Format your response EXACTLY like this:
+```insight
+Your plain-English interpretation here.
+```
+
+```followups
+Question one?
+Question two?
+Question three?
+```";
+    }
+
+    private static string BuildResultSummary(string queryResultJson)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(queryResultJson);
+            var root = doc.RootElement;
+
+            // Handle multi-table format
+            if (root.TryGetProperty("tables", out var tablesArray))
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var table in tablesArray.EnumerateArray())
+                {
+                    AppendTableSummary(sb, table);
+                    sb.AppendLine();
+                }
+                return sb.ToString().Trim();
+            }
+
+            // Single table format
+            var singleSb = new System.Text.StringBuilder();
+            AppendTableSummary(singleSb, root);
+            return singleSb.ToString().Trim();
+        }
+        catch
+        {
+            // Fallback: return truncated raw JSON
+            return queryResultJson.Length > 500 ? queryResultJson[..500] + "..." : queryResultJson;
+        }
+    }
+
+    private static void AppendTableSummary(System.Text.StringBuilder sb, System.Text.Json.JsonElement table)
+    {
+        if (table.TryGetProperty("columns", out var cols) && cols.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            var columnNames = new List<string>();
+            foreach (var col in cols.EnumerateArray())
+            {
+                columnNames.Add(col.GetString() ?? "?");
+            }
+            sb.AppendLine($"Columns: {string.Join(", ", columnNames)}");
+        }
+
+        if (table.TryGetProperty("rows", out var rows) && rows.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            var rowCount = rows.GetArrayLength();
+            sb.AppendLine($"Total rows: {rowCount}");
+
+            var shown = 0;
+            foreach (var row in rows.EnumerateArray())
+            {
+                if (shown >= 10) break;
+                var pairs = new List<string>();
+                foreach (var prop in row.EnumerateObject())
+                {
+                    var val = prop.Value.ValueKind switch
+                    {
+                        System.Text.Json.JsonValueKind.String => prop.Value.GetString(),
+                        System.Text.Json.JsonValueKind.Number => prop.Value.GetRawText(),
+                        System.Text.Json.JsonValueKind.True => "true",
+                        System.Text.Json.JsonValueKind.False => "false",
+                        System.Text.Json.JsonValueKind.Null => "null",
+                        _ => prop.Value.GetRawText()
+                    };
+                    pairs.Add($"{prop.Name}={val}");
+                }
+                sb.AppendLine($"  Row {shown + 1}: {string.Join(", ", pairs)}");
+                shown++;
+            }
+            if (rowCount > 10)
+            {
+                sb.AppendLine($"  ... ({rowCount - 10} more rows)");
+            }
+        }
+    }
+
+    private static (string? insight, List<string>? followUps) ExtractInsightAndFollowUps(string response)
+    {
+        string? insight = null;
+        List<string>? followUps = null;
+
+        try
+        {
+            // Extract ```insight block
+            var insightStart = response.IndexOf("```insight", StringComparison.OrdinalIgnoreCase);
+            if (insightStart != -1)
+            {
+                var contentStart = response.IndexOf('\n', insightStart);
+                if (contentStart != -1)
+                {
+                    contentStart++;
+                    var insightEnd = response.IndexOf("```", contentStart);
+                    if (insightEnd != -1)
+                    {
+                        insight = response.Substring(contentStart, insightEnd - contentStart).Trim();
+                        if (string.IsNullOrWhiteSpace(insight)) insight = null;
+                    }
+                }
+            }
+
+            // Extract ```followups block
+            var followStart = response.IndexOf("```followups", StringComparison.OrdinalIgnoreCase);
+            if (followStart != -1)
+            {
+                var contentStart = response.IndexOf('\n', followStart);
+                if (contentStart != -1)
+                {
+                    contentStart++;
+                    var followEnd = response.IndexOf("```", contentStart);
+                    if (followEnd != -1)
+                    {
+                        var block = response.Substring(contentStart, followEnd - contentStart).Trim();
+                        if (!string.IsNullOrWhiteSpace(block))
+                        {
+                            followUps = block
+                                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                .Select(q => q.Trim().TrimStart('-', '*', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ')').Trim())
+                                .Where(q => !string.IsNullOrWhiteSpace(q))
+                                .Take(3)
+                                .ToList();
+                            if (followUps.Count == 0) followUps = null;
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Parsing failed — non-critical
+        }
+
+        return (insight, followUps);
     }
 }

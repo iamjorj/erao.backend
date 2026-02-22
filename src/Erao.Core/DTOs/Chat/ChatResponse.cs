@@ -16,4 +16,14 @@ public class ChatResponse
     /// Clarification request when AI needs user to disambiguate intent
     /// </summary>
     public ClarificationRequest? Clarification { get; set; }
+
+    /// <summary>
+    /// Plain-English insight interpreting the query results for non-technical users
+    /// </summary>
+    public string? Insight { get; set; }
+
+    /// <summary>
+    /// Suggested follow-up questions the user might want to ask next
+    /// </summary>
+    public List<string>? FollowUpQuestions { get; set; }
 }
