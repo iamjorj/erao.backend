@@ -625,8 +625,12 @@ public class ChatService : IChatService
             }
         }
 
+        // Check if queryResult contains an error (either string prefix or JSON "error" field)
+        bool hasQueryError = !string.IsNullOrEmpty(queryResult) &&
+            (queryResult.StartsWith("Error", StringComparison.Ordinal) || HasJsonError(queryResult));
+
         // Layer 3: Empty/suspicious result handling — explain why query returned no data
-        if (!string.IsNullOrEmpty(queryResult) && !queryResult.StartsWith("Error", StringComparison.Ordinal) && sqlQuery != null)
+        if (!string.IsNullOrEmpty(queryResult) && !hasQueryError && sqlQuery != null)
         {
             var (isEmpty, isSuspicious, rowCount) = AnalyzeQueryResult(queryResult);
             if (isEmpty || isSuspicious)
@@ -646,7 +650,7 @@ public class ChatService : IChatService
         // Layer 4: Post-query insight generation — interpret results for non-technical users
         string? insight = null;
         List<string>? followUpQuestions = null;
-        if (!string.IsNullOrEmpty(queryResult) && !queryResult.StartsWith("Error", StringComparison.Ordinal) && sqlQuery != null)
+        if (!string.IsNullOrEmpty(queryResult) && !hasQueryError && sqlQuery != null)
         {
             var (insightIsEmpty, _, insightRowCount) = AnalyzeQueryResult(queryResult);
             // Only generate insight when result has actual data rows
@@ -893,7 +897,7 @@ D. **Rankings**: ORDER BY score DESC. LIMIT 20 default unless user specifies. Fo
 
 E. **Output columns**: Final SELECT MUST include real entity attributes alongside the computed score. Alias clearly. Never return only name + score.
 
-F. **Structure**: Use CTEs for multi-step queries. Use window functions for comparisons.
+F. **Structure**: Use CTEs for multi-step queries. Use window functions for comparisons. CRITICAL: When a CTE or subquery aliases a column (e.g., SUM(""Revenue"") AS ""Total Revenue""), the outer query MUST reference the alias (""Total Revenue""), NOT the original expression or column name. This applies to SELECT, WHERE, ORDER BY, and HAVING.
 
 G. **Smart mapping**: ""revenue"" → amount/price/total. ""my""/""our"" → all data. Integer enum columns (Status, Type) — return as numbers.
 
@@ -929,6 +933,7 @@ Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAUL
 4. viz group = individual entity name for rankings. Category only for ""by X"" aggregations. Date only for time series.
 5. Final SELECT has real data columns, not just name + score.
 6. Return ONLY the columns the user asked about. Do NOT add extra analytical columns (row counts, averages, breakdowns) unless explicitly requested. ""Revenue year by year"" = Year + Revenue only. Keep output clean for non-technical users.
+7. Outer query references CTE/subquery column ALIASES, not original column names or expressions.
 
 ## 5. CLARIFICATION (use RARELY — only when you truly cannot proceed)
 
@@ -1003,6 +1008,7 @@ RULES:
 - Return ONLY the fixed SQL in a ```sql code block.
 - Keep the same intent/logic — just fix the syntax or dialect issue.
 - SELECT queries only.
+- If using CTEs/subqueries: outer query must reference column ALIASES, not original column names or expressions.
 - Also include the original ```viz block if the query had visualization intent.";
 
         if (isDuckDBFile)
@@ -1389,7 +1395,7 @@ D. **Rankings**: ORDER BY score DESC. LIMIT 20 default unless user specifies. Fo
 
 E. **Output columns**: Final SELECT MUST include real entity attributes alongside the computed score. Alias clearly. Never return only name + score.
 
-F. **Structure**: Use CTEs for multi-step queries. Use window functions for comparisons.
+F. **Structure**: Use CTEs for multi-step queries. Use window functions for comparisons. CRITICAL: When a CTE or subquery aliases a column (e.g., SUM(""Revenue"") AS ""Total Revenue""), the outer query MUST reference the alias (""Total Revenue""), NOT the original expression or column name. This applies to SELECT, WHERE, ORDER BY, and HAVING.
 
 G. **Smart mapping**: Map user language to columns (""revenue"" → amount/price/total). ""my""/""our"" → all data.
 
@@ -1425,6 +1431,7 @@ Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAUL
 4. viz group = individual entity name for rankings. Category only for ""by X"" aggregations. Date only for time series.
 5. Final SELECT has real data columns, not just name + score.
 6. Return ONLY the columns the user asked about. Do NOT add extra analytical columns (row counts, averages, breakdowns) unless explicitly requested. ""Revenue year by year"" = Year + Revenue only. Keep output clean for non-technical users.
+7. Outer query references CTE/subquery column ALIASES, not original column names or expressions.
 
 ## 5. CLARIFICATION (use RARELY — only when you truly cannot proceed)
 
@@ -1848,7 +1855,7 @@ B. **Multi-table**: Data is organized in multiple tables. You can JOIN across ta
 C. **Data cleaning**: Filter NULL/empty before numeric ops. COALESCE computed scores to 0. Use NULLIF(x, 0) in denominators. ROUND(value, N) works directly. ILIKE for case-insensitive. TRY_CAST() for safe conversion.
 D. **Monetary values**: All amounts are in dollars (already converted from cents for Stripe). ROUND to 2 decimal places.
 E. **Rankings**: ORDER BY DESC + LIMIT 20 default unless user specifies.
-F. **Structure**: Use CTEs for multi-step queries. Use window functions for comparisons.
+F. **Structure**: Use CTEs for multi-step queries. Use window functions for comparisons. CRITICAL: When a CTE or subquery aliases a column (e.g., SUM(""Revenue"") AS ""Total Revenue""), the outer query MUST reference the alias (""Total Revenue""), NOT the original expression or column name. This applies to SELECT, WHERE, ORDER BY, and HAVING.
 G. **Smart mapping**: {smartMapping}
 
 ## 3. VISUALIZATION
@@ -1872,6 +1879,7 @@ Format: ```viz\n{{""chart"":""bar"",""group"":""Column"",""values"":[{{""col"":"
 3. Rankings: ORDER BY DESC + LIMIT 20.
 4. viz group = entity name for rankings, category for aggregations, date for time series.
 5. Return ONLY the columns the user asked about. No extra analytical columns (row counts, averages) unless explicitly requested. Keep output clean for non-technical users.
+6. Outer query references CTE/subquery column ALIASES, not original column names or expressions.
 
 ## 5. CLARIFICATION (use RARELY)
 
@@ -2204,6 +2212,25 @@ Rules:
         }
     }
 
+    private static bool HasJsonError(string queryResult)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(queryResult);
+            if (doc.RootElement.TryGetProperty("error", out var errorProp) &&
+                errorProp.ValueKind == System.Text.Json.JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(errorProp.GetString()))
+            {
+                return true;
+            }
+        }
+        catch
+        {
+            // Not valid JSON — not a JSON error
+        }
+        return false;
+    }
+
     private static (bool isEmpty, bool isSuspicious, int rowCount) AnalyzeQueryResult(string? queryResultJson)
     {
         if (string.IsNullOrEmpty(queryResultJson))
@@ -2462,6 +2489,59 @@ Question three?
                                 .ToList();
                             if (followUps.Count == 0) followUps = null;
                         }
+                    }
+                }
+            }
+
+            // Fallback: AI didn't use code blocks — parse plain text
+            if (insight == null && followUps == null && !string.IsNullOrWhiteSpace(response))
+            {
+                // Strip any stray code blocks
+                var cleaned = System.Text.RegularExpressions.Regex.Replace(response, @"```[\s\S]*?```", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim();
+                if (!string.IsNullOrWhiteSpace(cleaned))
+                {
+                    var lines = cleaned.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                        .Select(l => l.Trim())
+                        .Where(l => !string.IsNullOrWhiteSpace(l))
+                        .ToList();
+
+                    // Separate insight lines from follow-up question lines
+                    var insightLines = new List<string>();
+                    var questionLines = new List<string>();
+
+                    foreach (var line in lines)
+                    {
+                        // Detect follow-up question lines: start with number/bullet/dash and end with ?
+                        var stripped = line.TrimStart('-', '*', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ')', ' ');
+                        if (stripped.EndsWith('?') && (line.StartsWith('-') || line.StartsWith('*') || line.StartsWith("1") || line.StartsWith("2") || line.StartsWith("3")))
+                        {
+                            questionLines.Add(stripped);
+                        }
+                        // Also catch lines that are just questions (end with ?) after we've found some insight text
+                        else if (stripped.EndsWith('?') && insightLines.Count > 0)
+                        {
+                            questionLines.Add(stripped);
+                        }
+                        else if (questionLines.Count == 0)
+                        {
+                            // Skip header-like lines (e.g., "Insight:", "Follow-up questions:")
+                            if (System.Text.RegularExpressions.Regex.IsMatch(line, @"^(insight|follow[- ]?up|questions?|suggestions?)\s*:?\s*$", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                                continue;
+                            insightLines.Add(line);
+                        }
+                    }
+
+                    if (insightLines.Count > 0)
+                    {
+                        insight = string.Join(" ", insightLines);
+                        // Clean up any leftover markdown bold/italic
+                        insight = insight.Replace("**", "").Replace("__", "");
+                        if (string.IsNullOrWhiteSpace(insight)) insight = null;
+                    }
+
+                    if (questionLines.Count > 0)
+                    {
+                        followUps = questionLines.Take(3).ToList();
                     }
                 }
             }
