@@ -785,7 +785,8 @@ PostgreSQL-specific rules (CRITICAL — violating these causes runtime errors):
 - ROUND(double precision, N) does NOT exist. You MUST cast to numeric first: ROUND(value::numeric, N). This applies to ANY expression with floating point results (divisions, AVG, PERCENT_RANK, etc.).
 - String concatenation uses || operator, not CONCAT (though CONCAT also works).
 - Boolean values: use TRUE/FALSE, not 1/0.
-- ILIKE for case-insensitive LIKE.",
+- ILIKE for case-insensitive LIKE.
+- For DATE/TIMESTAMP columns, use ONLY IS NOT NULL — NEVER compare to empty string (!=''). PostgreSQL cannot cast '' to a timestamp.",
             DatabaseType.Redshift => @"
 Amazon Redshift-specific rules (PostgreSQL-based):
 - ROUND(double precision, N) does NOT exist. You MUST cast to numeric first: ROUND(value::numeric, N).
@@ -837,7 +838,8 @@ DuckDB-specific rules:
 - Use ROUND(value, N) directly — works on all numeric types.
 - ILIKE for case-insensitive matching.
 - String concatenation uses || operator.
-- Supports LIMIT N.",
+- Supports LIMIT N.
+- For DATE/TIMESTAMP columns, use ONLY IS NOT NULL — NEVER compare to empty string (!=''). DuckDB cannot cast '' to a timestamp.",
             DatabaseType.Snowflake => @"
 Snowflake-specific rules:
 - Use ROUND(value, N) directly.
@@ -1016,7 +1018,8 @@ RULES:
             prompt += @"
 - DuckDB dialect (PostgreSQL-compatible). Table is ""data"". Double-quote all identifiers.
 - ROUND(value, N) works directly. ILIKE for case-insensitive. TRY_CAST() for safe conversion.
-- RIGHT JOIN and FULL OUTER JOIN work. UNION ALL + ORDER BY works directly.";
+- RIGHT JOIN and FULL OUTER JOIN work. UNION ALL + ORDER BY works directly.
+- For DATE/TIMESTAMP columns: use ONLY IS NOT NULL — NEVER compare to '' (empty string causes conversion error).";
         }
         else if (isFile)
         {
@@ -1033,6 +1036,7 @@ RULES:
 - Use double-quote identifiers: ""TableName"".
 - ILIKE for case-insensitive matching.
 - Boolean: TRUE/FALSE not 1/0.
+- For DATE/TIMESTAMP columns: use ONLY IS NOT NULL — NEVER compare to '' (causes conversion error).
 - String concat: || operator.",
                 DatabaseType.Redshift => @"
 - Redshift (PostgreSQL-based): ROUND() requires numeric type — use ROUND(value::numeric, N).
@@ -1345,7 +1349,8 @@ SCHEMA:
             : @"A. **Dialect**: SQLite. Table is always ""data"". Double-quote ALL identifiers: SELECT ""Column Name"" FROM ""data"". Column names are CASE-SENSITIVE — use exact names from the schema. Date functions: DATE('now'), STRFTIME(). No RIGHT JOIN or FULL OUTER JOIN. SELECT only. UNION ALL + ORDER BY: SQLite cannot use complex expressions (CASE, functions) in ORDER BY after UNION ALL. Instead, wrap the UNION ALL in a subquery first: SELECT * FROM (...UNION ALL...) ORDER BY ...;";
 
         var dataCleaning = usesParquet
-            ? @"B. **Data cleaning**: Before ANY numeric operation on text columns, filter out junk: WHERE ""Col"" IS NOT NULL AND ""Col"" != '' AND ""Col"" NOT IN ('Not Mentioned', 'N/A', '-', 'null'). COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: TRY_CAST(REPLACE(""Col"", ',', '') AS DOUBLE). When a column mixes numbers with text placeholders: filter non-numeric rows in a CTE first, TRY_CAST to DOUBLE, then rank."
+            ? @"B. **Data cleaning**: Before ANY numeric operation on text columns, filter out junk: WHERE ""Col"" IS NOT NULL AND ""Col"" != '' AND ""Col"" NOT IN ('Not Mentioned', 'N/A', '-', 'null'). COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: TRY_CAST(REPLACE(""Col"", ',', '') AS DOUBLE). When a column mixes numbers with text placeholders: filter non-numeric rows in a CTE first, TRY_CAST to DOUBLE, then rank.
+IMPORTANT: For DATE/TIMESTAMP columns, use ONLY ""Col"" IS NOT NULL — NEVER compare to empty string (!=''). DuckDB cannot cast '' to a timestamp and will throw a conversion error."
             : @"B. **Data cleaning**: Before ANY numeric operation on text columns, filter out junk: WHERE ""Col"" IS NOT NULL AND ""Col"" != '' AND ""Col"" NOT IN ('Not Mentioned', 'N/A', '-', 'null'). COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: CAST(REPLACE(""Col"", ',', '') AS REAL). When a column mixes numbers with text placeholders: filter non-numeric rows in a CTE first, CAST to REAL, then rank.";
 
         var prompt = $@"You are Erao, an expert data analyst. The user uploaded '{fileName}'{rowInfo}. Data is in a {dialect} table called ""data"". You can ONLY answer questions about THIS file's columns. If a question matches any column, ALWAYS query it. Only refuse for topics with no matching column.
