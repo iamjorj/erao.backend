@@ -936,6 +936,7 @@ Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAUL
 5. Final SELECT has real data columns, not just name + score.
 6. Return ONLY the columns the user asked about. Do NOT add extra analytical columns (row counts, averages, breakdowns) unless explicitly requested. ""Revenue year by year"" = Year + Revenue only. Keep output clean for non-technical users.
 7. Outer query references CTE/subquery column ALIASES, not original column names or expressions.
+8. Apostrophes inside SQL strings are DOUBLED: '%bo''lim%' not '%bo'lim%'. One unescaped apostrophe breaks the whole query.
 
 ## 5. CLARIFICATION (use RARELY — only when you truly cannot proceed)
 
@@ -1349,8 +1350,7 @@ SCHEMA:
             : @"A. **Dialect**: SQLite. Table is always ""data"". Double-quote ALL identifiers: SELECT ""Column Name"" FROM ""data"". Column names are CASE-SENSITIVE — use exact names from the schema. Date functions: DATE('now'), STRFTIME(). No RIGHT JOIN or FULL OUTER JOIN. SELECT only. UNION ALL + ORDER BY: SQLite cannot use complex expressions (CASE, functions) in ORDER BY after UNION ALL. Instead, wrap the UNION ALL in a subquery first: SELECT * FROM (...UNION ALL...) ORDER BY ...;";
 
         var dataCleaning = usesParquet
-            ? @"B. **Data cleaning**: Before ANY numeric operation on text columns, filter out junk: WHERE ""Col"" IS NOT NULL AND ""Col"" != '' AND ""Col"" NOT IN ('Not Mentioned', 'N/A', '-', 'null'). COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: TRY_CAST(REPLACE(""Col"", ',', '') AS DOUBLE). When a column mixes numbers with text placeholders: filter non-numeric rows in a CTE first, TRY_CAST to DOUBLE, then rank.
-IMPORTANT: For DATE/TIMESTAMP columns, use ONLY ""Col"" IS NOT NULL — NEVER compare to empty string (!=''). DuckDB cannot cast '' to a timestamp and will throw a conversion error."
+            ? @"B. **Data cleaning**: The != '' and NOT IN ('Not Mentioned', 'N/A', '-', 'null') filters are ONLY for VARCHAR/text columns. For columns already typed as INTEGER, BIGINT, DOUBLE, BOOLEAN, DATE, or TIMESTAMP, use ONLY ""Col"" IS NOT NULL — NEVER compare them to '' or text literals like 'N/A'. DuckDB throws a conversion error when comparing non-text types to string literals. For VARCHAR columns that hold numbers: filter junk first (IS NOT NULL AND != '' AND NOT IN ('Not Mentioned', 'N/A', '-', 'null')), then TRY_CAST to DOUBLE. COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: TRY_CAST(REPLACE(""Col"", ',', '') AS DOUBLE)."
             : @"B. **Data cleaning**: Before ANY numeric operation on text columns, filter out junk: WHERE ""Col"" IS NOT NULL AND ""Col"" != '' AND ""Col"" NOT IN ('Not Mentioned', 'N/A', '-', 'null'). COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. For columns with commas in numbers: CAST(REPLACE(""Col"", ',', '') AS REAL). When a column mixes numbers with text placeholders: filter non-numeric rows in a CTE first, CAST to REAL, then rank.";
 
         var prompt = $@"You are Erao, an expert data analyst. The user uploaded '{fileName}'{rowInfo}. Data is in a {dialect} table called ""data"". You can ONLY answer questions about THIS file's columns. If a question matches any column, ALWAYS query it. Only refuse for topics with no matching column.
@@ -1437,6 +1437,7 @@ Output a ```viz block after every ```sql block. Pick the MOST appropriate DEFAUL
 5. Final SELECT has real data columns, not just name + score.
 6. Return ONLY the columns the user asked about. Do NOT add extra analytical columns (row counts, averages, breakdowns) unless explicitly requested. ""Revenue year by year"" = Year + Revenue only. Keep output clean for non-technical users.
 7. Outer query references CTE/subquery column ALIASES, not original column names or expressions.
+8. Apostrophes inside SQL strings are DOUBLED: '%bo''lim%' not '%bo'lim%'. One unescaped apostrophe breaks the whole query.
 
 ## 5. CLARIFICATION (use RARELY — only when you truly cannot proceed)
 
@@ -1931,6 +1932,7 @@ SELECT ""content"" FROM ""data"" WHERE ""type"" = 'heading'
 Rules:
 - Table is always ""data"". Double-quote ALL identifiers.
 - Use LIKE for text search: WHERE ""content"" LIKE '%keyword%'
+- **Apostrophe escaping**: Inside SQL strings, ALWAYS escape apostrophes by doubling them: '%bo''lim%' NOT '%bo'lim%'. A single unescaped apostrophe BREAKS the entire query. This applies to all languages (Uzbek bo'lim/mas'ul, French l'homme, English it's, etc.). Write ONLY the correctly escaped form — never include an unescaped variant.
 - Available types: 'heading', 'paragraph', 'list', 'table_row'
 - Include a ```viz block after SQL: {{""chart"":""table"",""group"":""content"",""values"":[{{""col"":""type"",""agg"":""NONE""}}]}}
 

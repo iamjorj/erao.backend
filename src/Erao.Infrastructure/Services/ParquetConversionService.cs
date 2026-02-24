@@ -1,30 +1,19 @@
-using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using DuckDB.NET.Data;
 using Erao.Core.Interfaces;
 using ExcelDataReader;
-using Microsoft.Extensions.Logging;
 
 namespace Erao.Infrastructure.Services;
 
 public class ParquetConversionService : IParquetConversionService
 {
-    private readonly ILogger<ParquetConversionService> _logger;
-
-    public ParquetConversionService(ILogger<ParquetConversionService> logger)
-    {
-        _logger = logger;
-    }
-
     public async Task<ParquetConversionResult> ConvertCsvToParquetAsync(Stream csvStream, string outputPath)
     {
         string? tempCsvPath = null;
-        var sw = Stopwatch.StartNew();
         try
         {
-            // Save stream to temp file (DuckDB reads from file path)
             tempCsvPath = Path.GetTempFileName() + ".csv";
 
             await using (var fileStream = File.Create(tempCsvPath))
@@ -32,33 +21,37 @@ public class ParquetConversionService : IParquetConversionService
                 await csvStream.CopyToAsync(fileStream);
             }
 
-            _logger.LogInformation("[TIMING] CSV stream → temp file: {Ms}ms", sw.ElapsedMilliseconds);
-
-            // Ensure output directory exists
             var outputDir = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(outputDir))
                 Directory.CreateDirectory(outputDir);
 
-            // Use DuckDB to convert CSV → Parquet
+            var (hasHeader, delimiter, columnCount) = await DetectCsvStructureAsync(tempCsvPath);
+
             await using var connection = new DuckDBConnection("DataSource=:memory:");
             await connection.OpenAsync();
 
             var escapedCsv = EscapePath(tempCsvPath);
             var escapedParquet = EscapePath(outputPath);
 
-            // COPY CSV to Parquet with ZSTD compression
-            // sample_size=20000 is enough for accurate type inference — avoids full-file scan
-            // Use explicit delim/quote/escape to avoid auto-detection failures on unusual data
-            var copySql = $"COPY (SELECT * FROM read_csv('{escapedCsv}', header=true, delim=',', quote='\"', escape='\"', sample_size=20000, null_padding=true, ignore_errors=true, strict_mode=false, max_line_size=10000000)) TO '{escapedParquet}' (FORMAT PARQUET, COMPRESSION ZSTD)";
+            var delimStr = delimiter == '\t' ? "\\t" : delimiter.ToString();
+            string headerOption;
+            if (hasHeader)
+            {
+                headerOption = "header=true";
+            }
+            else
+            {
+                var names = string.Join(", ", Enumerable.Range(1, columnCount).Select(i => $"'Column{i}'"));
+                headerOption = $"header=false, names=[{names}]";
+            }
+
+            var copySql = $"COPY (SELECT * FROM read_csv('{escapedCsv}', {headerOption}, delim='{delimStr}', quote='\"', escape='\"', sample_size=20000, null_padding=true, ignore_errors=true, strict_mode=false, max_line_size=10000000)) TO '{escapedParquet}' (FORMAT PARQUET, COMPRESSION ZSTD)";
             await using (var cmd = connection.CreateCommand())
             {
                 cmd.CommandText = copySql;
                 await cmd.ExecuteNonQueryAsync();
             }
 
-            _logger.LogInformation("[TIMING] DuckDB CSV → Parquet: {Ms}ms", sw.ElapsedMilliseconds);
-
-            // Get row count from Parquet metadata (no full scan needed)
             long rowCount;
             await using (var cmd = connection.CreateCommand())
             {
@@ -67,14 +60,8 @@ public class ParquetConversionService : IParquetConversionService
                 rowCount = result != null ? Convert.ToInt64(result) : 0;
             }
 
-            // Get schema info
             var schemaJson = await GetParquetSchemaAsync(outputPath, connection);
-
-            // Get sample data (first 100 rows)
             var sampleJson = await GetSampleDataAsync(outputPath, 100, connection);
-
-            _logger.LogInformation("[TIMING] Metadata + schema + sample: {Ms}ms (total)", sw.ElapsedMilliseconds);
-            _logger.LogInformation("Converted CSV to Parquet: {RowCount} rows at {Path}", rowCount, outputPath);
 
             return new ParquetConversionResult
             {
@@ -87,8 +74,6 @@ public class ParquetConversionService : IParquetConversionService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to convert CSV to Parquet: {OutputPath}", outputPath);
-            // Clean up partial Parquet file on failure
             if (File.Exists(outputPath))
             {
                 try { File.Delete(outputPath); } catch { /* best effort */ }
@@ -111,21 +96,14 @@ public class ParquetConversionService : IParquetConversionService
     public async Task<ParquetConversionResult> ConvertExcelToParquetAsync(Stream excelStream, string outputPath)
     {
         string? tempCsvPath = null;
-        var sw = Stopwatch.StartNew();
         try
         {
-            // Register encoding provider for ExcelDataReader (required for .NET Core)
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
-
             tempCsvPath = Path.GetTempFileName() + ".csv";
-
-            // Two-pass read: first find best sheet, then parse it
             var config = new ExcelReaderConfiguration { LeaveOpen = true };
 
-            // Pass 1: scan all sheets to find the one with the most columns (= actual data sheet)
-            int bestSheetIndex = 0;
-            string bestSheetName = "";
-            int bestSheetCols = 0;
+            // Pass 1: scan ALL sheets to identify data sheets
+            var sheetInfos = new List<(int index, string name, int colCount)>();
             {
                 using var scanReader = ExcelReaderFactory.CreateReader(excelStream, config);
                 var sheetIndex = 0;
@@ -133,124 +111,138 @@ public class ParquetConversionService : IParquetConversionService
                 {
                     var cols = scanReader.FieldCount;
                     var name = scanReader.Name ?? $"Sheet{sheetIndex + 1}";
-
-                    // Read first row to check if it has actual data spread across columns
-                    var nonEmptyCols = 0;
-                    if (scanReader.Read())
-                    {
-                        for (var c = 0; c < cols; c++)
-                        {
-                            if (!scanReader.IsDBNull(c)) nonEmptyCols++;
-                        }
-                    }
-
-                    // Prefer sheets with more columns; break ties with more non-empty cells
-                    if (cols > bestSheetCols || (cols == bestSheetCols && nonEmptyCols > 0))
-                    {
-                        bestSheetCols = cols;
-                        bestSheetIndex = sheetIndex;
-                        bestSheetName = name;
-                    }
+                    if (cols >= 2)
+                        sheetInfos.Add((sheetIndex, name, cols));
                     sheetIndex++;
                 } while (scanReader.NextResult());
-
             }
 
-            // Reset stream for pass 2
-            excelStream.Position = 0;
+            if (sheetInfos.Count == 0)
+                return new ParquetConversionResult { Success = false, ErrorMessage = "Excel file has no data" };
 
+            // Find all sheets with the same (best) column count → merge them
+            var bestColCount = sheetInfos.Max(s => s.colCount);
+            var sheetsToProcess = sheetInfos.Where(s => s.colCount == bestColCount).ToList();
+            var addSheetColumn = sheetsToProcess.Count > 1;
+            var processIndices = new HashSet<int>(sheetsToProcess.Select(s => s.index));
+
+            // Pass 2: read matching sheets and write combined CSV
+            excelStream.Position = 0;
             using (var reader = ExcelReaderFactory.CreateReader(excelStream, config))
             {
-                // Navigate to the best sheet
-                for (var s = 0; s < bestSheetIndex; s++) reader.NextResult();
-
-                var fieldCount = reader.FieldCount;
-                if (fieldCount == 0)
-                {
-                    return new ParquetConversionResult { Success = false, ErrorMessage = "Excel file has no data" };
-                }
-
-                // Smart header detection: read first 20 rows, pick the one with most unique non-empty values
-                var headerCandidates = new List<string[]>();
-                for (var i = 0; i < 20 && reader.Read(); i++)
-                {
-                    var row = new string[fieldCount];
-                    for (var c = 0; c < fieldCount; c++)
-                        row[c] = reader.IsDBNull(c) ? "" : FormatCellValue(reader, c);
-                    headerCandidates.Add(row);
-                }
-
-                if (headerCandidates.Count == 0)
-                {
-                    return new ParquetConversionResult { Success = false, ErrorMessage = "Excel file has no data" };
-                }
-
-                var headerRowIndex = 0;
-                var bestUnique = 0;
-                for (var i = 0; i < headerCandidates.Count; i++)
-                {
-                    var unique = headerCandidates[i].Where(v => !string.IsNullOrWhiteSpace(v)).Distinct(StringComparer.OrdinalIgnoreCase).Count();
-                    if (unique > bestUnique && unique >= 2) { bestUnique = unique; headerRowIndex = i; }
-                }
-
                 await using var csvWriter = new StreamWriter(tempCsvPath, false, Encoding.UTF8, bufferSize: 65536);
-
-                // Write header
-                var headers = headerCandidates[headerRowIndex];
-                for (var c = 0; c < fieldCount; c++)
-                {
-                    if (c > 0) await csvWriter.WriteAsync(',');
-                    var h = string.IsNullOrWhiteSpace(headers[c]) ? $"Column{c + 1}" : headers[c].Trim();
-                    await csvWriter.WriteAsync(CsvEscape(h));
-                }
-                await csvWriter.WriteLineAsync();
-
-                // Write buffered rows (after header)
                 var sb = new StringBuilder(65536);
                 var dataRowCount = 0;
-                for (var i = headerRowIndex + 1; i < headerCandidates.Count; i++)
-                {
-                    AppendCsvRow(sb, headerCandidates[i], fieldCount, ref dataRowCount);
-                }
+                var headerWritten = false;
+                var sheetIndex = 0;
 
-                // Stream remaining rows directly to CSV
-                while (reader.Read())
+                do
                 {
-                    var rowStart = sb.Length; // Mark start so we can undo just this row
-                    var hasData = false;
-                    var first = true;
-                    for (var c = 0; c < fieldCount; c++)
+                    if (!processIndices.Contains(sheetIndex)) { sheetIndex++; continue; }
+
+                    var sheetName = sheetsToProcess.First(s => s.index == sheetIndex).name;
+                    var fieldCount = reader.FieldCount;
+                    if (fieldCount == 0) { sheetIndex++; continue; }
+
+                    // Read first 20 rows for header detection
+                    var headerCandidates = new List<string[]>();
+                    for (var i = 0; i < 20 && reader.Read(); i++)
                     {
-                        if (!first) sb.Append(',');
-                        first = false;
-                        if (reader.IsDBNull(c))
+                        var row = new string[fieldCount];
+                        for (var c = 0; c < fieldCount; c++)
+                            row[c] = reader.IsDBNull(c) ? "" : FormatCellValue(reader, c);
+                        headerCandidates.Add(row);
+                    }
+
+                    if (headerCandidates.Count == 0) { sheetIndex++; continue; }
+
+                    // Pick candidate header row (most unique non-empty values)
+                    var headerRowIndex = 0;
+                    var bestUnique = 0;
+                    for (var i = 0; i < headerCandidates.Count; i++)
+                    {
+                        var unique = headerCandidates[i]
+                            .Where(v => !string.IsNullOrWhiteSpace(v))
+                            .Distinct(StringComparer.OrdinalIgnoreCase).Count();
+                        if (unique > bestUnique && unique >= 2) { bestUnique = unique; headerRowIndex = i; }
+                    }
+
+                    // Verify with DetectHasHeader heuristic
+                    bool hasHeader = true;
+                    if (headerCandidates.Count > headerRowIndex + 1)
+                    {
+                        var candidateHeader = headerCandidates[headerRowIndex].ToList();
+                        var candidateData = headerCandidates
+                            .Skip(headerRowIndex + 1).Take(10)
+                            .Select(r => r.ToList()).ToList();
+                        hasHeader = DetectHasHeader(candidateHeader, candidateData);
+                    }
+
+                    string[] headers;
+                    int dataStartIndex;
+                    if (hasHeader)
+                    {
+                        headers = headerCandidates[headerRowIndex];
+                        dataStartIndex = headerRowIndex + 1;
+                    }
+                    else
+                    {
+                        headers = Enumerable.Range(1, fieldCount).Select(i => $"Column{i}").ToArray();
+                        dataStartIndex = 0;
+                    }
+
+                    // Write CSV header (once, from the first sheet)
+                    if (!headerWritten)
+                    {
+                        if (addSheetColumn)
+                            await csvWriter.WriteAsync("Sheet,");
+                        for (var c = 0; c < fieldCount; c++)
                         {
-                            // empty
+                            if (c > 0) await csvWriter.WriteAsync(',');
+                            var h = string.IsNullOrWhiteSpace(headers[c]) ? $"Column{c + 1}" : headers[c].Trim();
+                            await csvWriter.WriteAsync(CsvEscape(h));
                         }
-                        else
+                        await csvWriter.WriteLineAsync();
+                        headerWritten = true;
+                    }
+
+                    // Write buffered data rows
+                    for (var i = dataStartIndex; i < headerCandidates.Count; i++)
+                    {
+                        WriteDataRow(sb, headerCandidates[i], fieldCount, addSheetColumn ? sheetName : null, ref dataRowCount);
+                    }
+
+                    // Stream remaining rows
+                    while (reader.Read())
+                    {
+                        var row = new string[fieldCount];
+                        var hasData = false;
+                        for (var c = 0; c < fieldCount; c++)
                         {
-                            hasData = true;
-                            sb.Append(CsvEscape(FormatCellValue(reader, c)));
+                            if (reader.IsDBNull(c))
+                                row[c] = "";
+                            else
+                            {
+                                row[c] = FormatCellValue(reader, c);
+                                hasData = true;
+                            }
+                        }
+                        if (hasData)
+                            WriteDataRow(sb, row, fieldCount, addSheetColumn ? sheetName : null, ref dataRowCount);
+
+                        if (dataRowCount % 5000 == 0 && sb.Length > 0)
+                        {
+                            await csvWriter.WriteAsync(sb);
+                            sb.Clear();
                         }
                     }
 
-                    if (!hasData) { sb.Length = rowStart; continue; } // Undo only this row, keep prior data
-                    sb.Append('\n');
-                    dataRowCount++;
-
-                    if (dataRowCount % 5000 == 0)
-                    {
-                        await csvWriter.WriteAsync(sb);
-                        sb.Clear();
-                    }
-                }
-
-                if (sb.Length > 0) await csvWriter.WriteAsync(sb);
-
-                _logger.LogInformation("[TIMING] Excel → temp CSV: {Ms}ms ({Rows} data rows)", sw.ElapsedMilliseconds, dataRowCount);
+                    if (sb.Length > 0) { await csvWriter.WriteAsync(sb); sb.Clear(); }
+                    sheetIndex++;
+                } while (reader.NextResult());
             }
 
-            // DuckDB: CSV → Parquet with explicit parsing options (no auto-detect issues)
+            // DuckDB: CSV → Parquet
             await using var connection = new DuckDBConnection("DataSource=:memory:");
             await connection.OpenAsync();
 
@@ -276,13 +268,8 @@ public class ParquetConversionService : IParquetConversionService
                 parquetRowCount = result != null ? Convert.ToInt64(result) : 0;
             }
 
-            _logger.LogInformation("[TIMING] DuckDB CSV → Parquet (Excel): {Ms}ms", sw.ElapsedMilliseconds);
-
             var schemaJson = await GetParquetSchemaAsync(outputPath, connection);
             var sampleJson = await GetSampleDataAsync(outputPath, 100, connection);
-
-            _logger.LogInformation("[TIMING] Total Excel conversion: {Ms}ms", sw.ElapsedMilliseconds);
-            _logger.LogInformation("Converted Excel to Parquet: {RowCount} rows at {Path}", parquetRowCount, outputPath);
 
             return new ParquetConversionResult
             {
@@ -295,7 +282,6 @@ public class ParquetConversionService : IParquetConversionService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to convert Excel to Parquet: {OutputPath}", outputPath);
             if (File.Exists(outputPath))
             {
                 try { File.Delete(outputPath); } catch { /* best effort */ }
@@ -315,7 +301,6 @@ public class ParquetConversionService : IParquetConversionService
         }
     }
 
-    /// <summary>Format a cell value as a clean CSV-compatible string using raw values (no locale formatting).</summary>
     private static string FormatCellValue(IExcelDataReader reader, int col)
     {
         var type = reader.GetFieldType(col);
@@ -335,10 +320,17 @@ public class ParquetConversionService : IParquetConversionService
         return value;
     }
 
-    private static void AppendCsvRow(StringBuilder sb, string[] values, int fieldCount, ref int rowCount)
+    private static void WriteDataRow(StringBuilder sb, string[] values, int fieldCount, string? sheetName, ref int rowCount)
     {
         var rowStart = sb.Length;
         var hasData = false;
+
+        if (sheetName != null)
+        {
+            sb.Append(CsvEscape(sheetName));
+            sb.Append(',');
+        }
+
         for (var c = 0; c < fieldCount; c++)
         {
             if (c > 0) sb.Append(',');
@@ -346,6 +338,7 @@ public class ParquetConversionService : IParquetConversionService
             if (!string.IsNullOrWhiteSpace(v)) hasData = true;
             sb.Append(CsvEscape(v));
         }
+
         if (!hasData) { sb.Length = rowStart; return; }
         sb.Append('\n');
         rowCount++;
@@ -369,18 +362,169 @@ public class ParquetConversionService : IParquetConversionService
     {
         if (File.Exists(parquetPath))
         {
-            try
-            {
-                File.Delete(parquetPath);
-                _logger.LogInformation("Deleted Parquet file: {Path}", parquetPath);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to delete Parquet file: {Path}", parquetPath);
-            }
+            try { File.Delete(parquetPath); } catch { /* best effort */ }
         }
         return Task.CompletedTask;
     }
+
+    // ─── CSV structure detection ──────────────────────────────────────────
+
+    private async Task<(bool hasHeader, char delimiter, int columnCount)> DetectCsvStructureAsync(string csvPath)
+    {
+        var lines = new List<string>();
+        using (var reader = new StreamReader(csvPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+        {
+            for (int i = 0; i < 20; i++)
+            {
+                var line = await reader.ReadLineAsync();
+                if (line == null) break;
+                if (!string.IsNullOrWhiteSpace(line))
+                    lines.Add(line);
+            }
+        }
+
+        if (lines.Count == 0)
+            return (true, ',', 0);
+
+        var delimiter = DetectDelimiter(lines[0]);
+        var firstRow = ParseCsvLine(lines[0], delimiter);
+        var columnCount = firstRow.Count;
+
+        if (lines.Count <= 1)
+            return (true, delimiter, columnCount);
+
+        if (firstRow.Count <= 1 && lines.Count > 1)
+        {
+            var secondDelimiter = DetectDelimiter(lines[1]);
+            var secondRow = ParseCsvLine(lines[1], secondDelimiter);
+            if (secondRow.Count > firstRow.Count)
+            {
+                delimiter = secondDelimiter;
+                firstRow = secondRow;
+                columnCount = secondRow.Count;
+                lines = lines.Skip(1).ToList();
+            }
+        }
+
+        var dataRows = lines.Skip(1).Select(l => ParseCsvLine(l, delimiter)).ToList();
+        var hasHeader = DetectHasHeader(firstRow, dataRows);
+
+        return (hasHeader, delimiter, columnCount);
+    }
+
+    private static bool DetectHasHeader(List<string> firstRow, List<List<string>> dataRows)
+    {
+        if (dataRows.Count == 0) return true;
+
+        int colCount = firstRow.Count;
+        int headerLikeScore = 0;
+        int dataLikeScore = 0;
+
+        for (int col = 0; col < colCount; col++)
+        {
+            string headerVal = firstRow[col].Trim();
+
+            bool headerIsNumeric = double.TryParse(headerVal,
+                NumberStyles.Any, CultureInfo.InvariantCulture, out _);
+
+            int numericDataCount = 0;
+            int totalDataCount = 0;
+            foreach (var row in dataRows)
+            {
+                if (col < row.Count && !string.IsNullOrWhiteSpace(row[col]))
+                {
+                    totalDataCount++;
+                    if (double.TryParse(row[col].Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out _))
+                        numericDataCount++;
+                }
+            }
+
+            double numericRate = totalDataCount > 0 ? (double)numericDataCount / totalDataCount : 0;
+
+            if (headerIsNumeric && numericRate > 0.5)
+                dataLikeScore++;
+            else if (!headerIsNumeric && numericRate > 0.5)
+                headerLikeScore++;
+            else if (headerIsNumeric && numericRate <= 0.5)
+                dataLikeScore++;
+            else
+            {
+                bool appearsInData = dataRows.Any(r => col < r.Count &&
+                    string.Equals(r[col].Trim(), headerVal, StringComparison.OrdinalIgnoreCase));
+                if (appearsInData)
+                    dataLikeScore++;
+                else
+                    headerLikeScore++;
+            }
+        }
+
+        var nonEmpty = firstRow
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Select(v => v.Trim().ToLowerInvariant())
+            .ToList();
+        if (nonEmpty.Count > 3 && nonEmpty.Distinct().Count() < nonEmpty.Count * 0.7)
+            dataLikeScore += 3;
+
+        return headerLikeScore >= dataLikeScore;
+    }
+
+    private static char DetectDelimiter(string line)
+    {
+        var delimiters = new[] { ',', ';', '\t', '|' };
+        var maxCount = 0;
+        var bestDelimiter = ',';
+
+        foreach (var d in delimiters)
+        {
+            var count = line.Count(c => c == d);
+            if (count > maxCount)
+            {
+                maxCount = count;
+                bestDelimiter = d;
+            }
+        }
+
+        return bestDelimiter;
+    }
+
+    private static List<string> ParseCsvLine(string line, char delimiter)
+    {
+        var values = new List<string>();
+        var current = new StringBuilder();
+        var inQuotes = false;
+
+        for (int i = 0; i < line.Length; i++)
+        {
+            var c = line[i];
+
+            if (c == '"')
+            {
+                if (inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+                {
+                    current.Append('"');
+                    i++;
+                }
+                else
+                {
+                    inQuotes = !inQuotes;
+                }
+            }
+            else if (c == delimiter && !inQuotes)
+            {
+                values.Add(current.ToString());
+                current.Clear();
+            }
+            else
+            {
+                current.Append(c);
+            }
+        }
+
+        values.Add(current.ToString());
+        return values;
+    }
+
+    // ─── Parquet helpers ──────────────────────────────────────────────────
 
     private static async Task<string> GetParquetSchemaAsync(string parquetPath, DuckDBConnection connection)
     {
@@ -451,7 +595,6 @@ public class ParquetConversionService : IParquetConversionService
 
     private static string EscapePath(string path)
     {
-        // DuckDB expects forward slashes and single-quote escaping
         return path.Replace("\\", "/").Replace("'", "''");
     }
 }

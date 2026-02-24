@@ -1,21 +1,15 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Erao.Core.DTOs.File;
 using Erao.Core.Enums;
 using Erao.Core.Interfaces;
-using Microsoft.Extensions.Logging;
 
 namespace Erao.Infrastructure.Services.Parsers;
 
 public class CsvFileParser : IFileParser
 {
-    private readonly ILogger<CsvFileParser> _logger;
     private const int MaxRowsToProcess = 100000;
-
-    public CsvFileParser(ILogger<CsvFileParser> logger)
-    {
-        _logger = logger;
-    }
 
     public bool CanParse(FileType fileType) => fileType == FileType.Csv;
 
@@ -27,7 +21,6 @@ public class CsvFileParser : IFileParser
         {
             using var reader = new StreamReader(fileStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
 
-            // Detect delimiter
             var firstLine = await reader.ReadLineAsync(cancellationToken);
             if (string.IsNullOrEmpty(firstLine))
             {
@@ -39,44 +32,55 @@ public class CsvFileParser : IFileParser
             }
 
             var delimiter = DetectDelimiter(firstLine);
+            var firstRowFields = ParseCsvLine(firstLine, delimiter);
 
-            // Smart header detection: skip title rows that have fewer fields than data rows
-            var headers = ParseCsvLine(firstLine, delimiter);
-
-            // If first line has only 1 field, it might be a title row — peek at next lines
-            if (headers.Count <= 1)
+            // If first line has only 1 field, it might be a title row — peek at next line
+            string? secondLine = null;
+            if (firstRowFields.Count <= 1)
             {
-                var nextLine = await reader.ReadLineAsync(cancellationToken);
-                if (!string.IsNullOrEmpty(nextLine))
+                secondLine = await reader.ReadLineAsync(cancellationToken);
+                if (!string.IsNullOrEmpty(secondLine))
                 {
-                    var nextDelimiter = DetectDelimiter(nextLine);
-                    var nextHeaders = ParseCsvLine(nextLine, nextDelimiter);
-
-                    if (nextHeaders.Count > headers.Count)
+                    var nextDelimiter = DetectDelimiter(secondLine);
+                    var nextFields = ParseCsvLine(secondLine, nextDelimiter);
+                    if (nextFields.Count > firstRowFields.Count)
                     {
-                        // Next line has more columns — it's the real header, first line was a title
-                        _logger.LogInformation("Skipping title row: \"{TitleRow}\", using row 2 as headers", firstLine);
-                        headers = nextHeaders;
+                        firstRowFields = nextFields;
                         delimiter = nextDelimiter;
+                        secondLine = null;
                     }
                 }
             }
 
-            var columnNames = new List<string>();
+            // Buffer next ~15 data lines to detect if first row is a header or data
+            var bufferedLines = new List<string>();
+            if (secondLine != null && !string.IsNullOrWhiteSpace(secondLine))
+                bufferedLines.Add(secondLine);
 
-            for (int i = 0; i < headers.Count; i++)
+            for (int i = bufferedLines.Count; i < 15; i++)
             {
-                var columnName = headers[i].Trim();
-                if (string.IsNullOrWhiteSpace(columnName))
-                    columnName = $"Column{i + 1}";
+                var line = await reader.ReadLineAsync(cancellationToken);
+                if (line == null) break;
+                if (!string.IsNullOrWhiteSpace(line))
+                    bufferedLines.Add(line);
+            }
 
-                var baseName = columnName;
-                var counter = 1;
-                while (columnNames.Contains(columnName))
-                {
-                    columnName = $"{baseName}_{counter++}";
-                }
-                columnNames.Add(columnName);
+            var bufferedRows = bufferedLines.Select(l => ParseCsvLine(l, delimiter)).ToList();
+            var hasHeader = DetectHasHeader(firstRowFields, bufferedRows);
+
+            List<string> columnNames;
+            List<List<string>> initialDataRows;
+
+            if (hasHeader)
+            {
+                columnNames = BuildColumnNames(firstRowFields);
+                initialDataRows = bufferedRows;
+            }
+            else
+            {
+                columnNames = Enumerable.Range(1, firstRowFields.Count).Select(i => $"Column{i}").ToList();
+                initialDataRows = new List<List<string>> { firstRowFields };
+                initialDataRows.AddRange(bufferedRows);
             }
 
             var columns = columnNames.Select(name => new ColumnInfo
@@ -88,38 +92,29 @@ public class CsvFileParser : IFileParser
 
             result.Columns = columns;
 
-            // Parse data rows
             var data = new List<Dictionary<string, object?>>();
             var rowCount = 0;
-            string? line;
 
-            while ((line = await reader.ReadLineAsync(cancellationToken)) != null && rowCount < MaxRowsToProcess)
+            foreach (var values in initialDataRows)
+            {
+                if (rowCount >= MaxRowsToProcess) break;
+                var rowData = BuildRowData(values, columnNames);
+                if (rowData != null)
+                {
+                    data.Add(rowData);
+                    rowCount++;
+                }
+            }
+
+            string? remainingLine;
+            while ((remainingLine = await reader.ReadLineAsync(cancellationToken)) != null && rowCount < MaxRowsToProcess)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (string.IsNullOrWhiteSpace(remainingLine)) continue;
 
-                if (string.IsNullOrWhiteSpace(line))
-                    continue;
-
-                var values = ParseCsvLine(line, delimiter);
-                var rowData = new Dictionary<string, object?>();
-                var hasData = false;
-
-                for (int i = 0; i < columnNames.Count; i++)
-                {
-                    var value = i < values.Count ? values[i].Trim() : null;
-
-                    if (!string.IsNullOrEmpty(value))
-                    {
-                        rowData[columnNames[i]] = ParseValue(value);
-                        hasData = true;
-                    }
-                    else
-                    {
-                        rowData[columnNames[i]] = null;
-                    }
-                }
-
-                if (hasData)
+                var values = ParseCsvLine(remainingLine, delimiter);
+                var rowData = BuildRowData(values, columnNames);
+                if (rowData != null)
                 {
                     data.Add(rowData);
                     rowCount++;
@@ -129,32 +124,116 @@ public class CsvFileParser : IFileParser
             result.Data = data;
             result.RowCount = rowCount;
 
-            // Infer data types
             InferDataTypes(result.Columns, data);
 
-            result.ParsedContentJson = JsonSerializer.Serialize(data, new JsonSerializerOptions
-            {
-                WriteIndented = false
-            });
-
-            result.SchemaInfoJson = JsonSerializer.Serialize(columns, new JsonSerializerOptions
-            {
-                WriteIndented = false
-            });
-
+            result.ParsedContentJson = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = false });
+            result.SchemaInfoJson = JsonSerializer.Serialize(columns, new JsonSerializerOptions { WriteIndented = false });
             result.Success = true;
-
-            _logger.LogInformation("Successfully parsed CSV file {FileName}: {RowCount} rows, {ColumnCount} columns",
-                fileName, rowCount, columns.Count);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error parsing CSV file {FileName}", fileName);
             result.Success = false;
             result.ErrorMessage = $"Failed to parse CSV file: {ex.Message}";
         }
 
         return result;
+    }
+
+    private static List<string> BuildColumnNames(List<string> headerFields)
+    {
+        var columnNames = new List<string>();
+        for (int i = 0; i < headerFields.Count; i++)
+        {
+            var name = headerFields[i].Trim();
+            if (string.IsNullOrWhiteSpace(name))
+                name = $"Column{i + 1}";
+
+            var baseName = name;
+            var counter = 1;
+            while (columnNames.Contains(name))
+                name = $"{baseName}_{counter++}";
+
+            columnNames.Add(name);
+        }
+        return columnNames;
+    }
+
+    private Dictionary<string, object?>? BuildRowData(List<string> values, List<string> columnNames)
+    {
+        var rowData = new Dictionary<string, object?>();
+        var hasData = false;
+
+        for (int i = 0; i < columnNames.Count; i++)
+        {
+            var value = i < values.Count ? values[i].Trim() : null;
+            if (!string.IsNullOrEmpty(value))
+            {
+                rowData[columnNames[i]] = ParseValue(value);
+                hasData = true;
+            }
+            else
+            {
+                rowData[columnNames[i]] = null;
+            }
+        }
+
+        return hasData ? rowData : null;
+    }
+
+    private static bool DetectHasHeader(List<string> firstRow, List<List<string>> dataRows)
+    {
+        if (dataRows.Count == 0) return true;
+
+        int colCount = firstRow.Count;
+        int headerLikeScore = 0;
+        int dataLikeScore = 0;
+
+        for (int col = 0; col < colCount; col++)
+        {
+            string headerVal = firstRow[col].Trim();
+
+            bool headerIsNumeric = double.TryParse(headerVal,
+                NumberStyles.Any, CultureInfo.InvariantCulture, out _);
+
+            int numericDataCount = 0;
+            int totalDataCount = 0;
+            foreach (var row in dataRows)
+            {
+                if (col < row.Count && !string.IsNullOrWhiteSpace(row[col]))
+                {
+                    totalDataCount++;
+                    if (double.TryParse(row[col].Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out _))
+                        numericDataCount++;
+                }
+            }
+
+            double numericRate = totalDataCount > 0 ? (double)numericDataCount / totalDataCount : 0;
+
+            if (headerIsNumeric && numericRate > 0.5)
+                dataLikeScore++;
+            else if (!headerIsNumeric && numericRate > 0.5)
+                headerLikeScore++;
+            else if (headerIsNumeric && numericRate <= 0.5)
+                dataLikeScore++;
+            else
+            {
+                bool appearsInData = dataRows.Any(r => col < r.Count &&
+                    string.Equals(r[col].Trim(), headerVal, StringComparison.OrdinalIgnoreCase));
+                if (appearsInData)
+                    dataLikeScore++;
+                else
+                    headerLikeScore++;
+            }
+        }
+
+        var nonEmpty = firstRow
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Select(v => v.Trim().ToLowerInvariant())
+            .ToList();
+        if (nonEmpty.Count > 3 && nonEmpty.Distinct().Count() < nonEmpty.Count * 0.7)
+            dataLikeScore += 3;
+
+        return headerLikeScore >= dataLikeScore;
     }
 
     private char DetectDelimiter(string line)
@@ -218,15 +297,12 @@ public class CsvFileParser : IFileParser
         if (string.IsNullOrWhiteSpace(value))
             return null;
 
-        // Try parse as number
         if (double.TryParse(value, out var doubleValue))
             return doubleValue;
 
-        // Try parse as boolean
         if (bool.TryParse(value, out var boolValue))
             return boolValue;
 
-        // Try parse as date
         if (DateTime.TryParse(value, out var dateValue))
             return dateValue.ToString("yyyy-MM-dd HH:mm:ss");
 
