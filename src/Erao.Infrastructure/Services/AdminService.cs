@@ -506,7 +506,7 @@ public class AdminService : IAdminService
         var conversation = await _db.Conversations
             .Where(c => c.Id == conversationId)
             .Include(c => c.User)
-            .Include(c => c.Messages.OrderBy(m => m.CreatedAt))
+            .Include(c => c.Messages.OrderBy(m => m.CreatedAt).ThenBy(m => m.Role))
             .Include(c => c.DatabaseConnection)
             .Include(c => c.FileDocument)
             .Include(c => c.AppConnector)
