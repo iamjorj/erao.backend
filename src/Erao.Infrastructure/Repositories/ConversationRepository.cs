@@ -25,7 +25,7 @@ public class ConversationRepository : Repository<Conversation>, IConversationRep
     public async Task<Conversation?> GetWithMessagesAsync(Guid id)
     {
         return await _dbSet
-            .Include(c => c.Messages.OrderBy(m => m.CreatedAt))
+            .Include(c => c.Messages.OrderBy(m => m.CreatedAt).ThenBy(m => m.Role))
             .Include(c => c.DatabaseConnection)
             .Include(c => c.FileDocument)
             .Include(c => c.AppConnector)

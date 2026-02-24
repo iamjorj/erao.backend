@@ -16,6 +16,7 @@ public class MessageRepository : Repository<Message>, IMessageRepository
         return await _dbSet
             .Where(m => m.ConversationId == conversationId)
             .OrderBy(m => m.CreatedAt)
+            .ThenBy(m => m.Role)
             .ToListAsync();
     }
 
@@ -25,6 +26,7 @@ public class MessageRepository : Repository<Message>, IMessageRepository
         var messages = await _dbSet
             .Where(m => m.ConversationId == conversationId)
             .OrderByDescending(m => m.CreatedAt)
+            .ThenByDescending(m => m.Role)
             .Take(count)
             .ToListAsync();
 
