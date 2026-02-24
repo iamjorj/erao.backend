@@ -465,6 +465,82 @@ public class AdminService : IAdminService
         return await GetUserByIdAsync(userId);
     }
 
+    // ─── Conversations ──────────────────────────────────────────────
+
+    public async Task<AdminConversationListDto> GetUserConversationsAsync(Guid userId)
+    {
+        var conversations = await _db.Conversations
+            .Where(c => c.UserId == userId)
+            .Include(c => c.DatabaseConnection)
+            .Include(c => c.FileDocument)
+            .Include(c => c.AppConnector)
+            .Include(c => c.Messages)
+            .OrderByDescending(c => c.UpdatedAt)
+            .Select(c => new AdminConversationDto
+            {
+                Id = c.Id,
+                Title = c.Title,
+                DataSourceName = c.DatabaseConnection != null ? c.DatabaseConnection.Name
+                    : c.FileDocument != null ? c.FileDocument.OriginalFileName
+                    : c.AppConnector != null ? c.AppConnector.Name
+                    : null,
+                DataSourceType = c.DatabaseConnectionId != null ? "Database"
+                    : c.FileDocumentId != null ? "File"
+                    : c.AppConnectorId != null ? "App"
+                    : null,
+                MessageCount = c.Messages.Count,
+                CreatedAt = c.CreatedAt,
+                UpdatedAt = c.UpdatedAt,
+            })
+            .ToListAsync();
+
+        return new AdminConversationListDto
+        {
+            Conversations = conversations,
+            TotalCount = conversations.Count,
+        };
+    }
+
+    public async Task<AdminConversationDetailDto> GetConversationDetailAsync(Guid conversationId)
+    {
+        var conversation = await _db.Conversations
+            .Where(c => c.Id == conversationId)
+            .Include(c => c.User)
+            .Include(c => c.Messages.OrderBy(m => m.CreatedAt))
+            .Include(c => c.DatabaseConnection)
+            .Include(c => c.FileDocument)
+            .Include(c => c.AppConnector)
+            .FirstOrDefaultAsync()
+            ?? throw new InvalidOperationException("Conversation not found.");
+
+        return new AdminConversationDetailDto
+        {
+            Id = conversation.Id,
+            Title = conversation.Title,
+            DataSourceName = conversation.DatabaseConnection?.Name
+                ?? conversation.FileDocument?.OriginalFileName
+                ?? conversation.AppConnector?.Name,
+            DataSourceType = conversation.DatabaseConnectionId != null ? "Database"
+                : conversation.FileDocumentId != null ? "File"
+                : conversation.AppConnectorId != null ? "App"
+                : null,
+            UserId = conversation.UserId,
+            UserEmail = conversation.User.Email,
+            Messages = conversation.Messages.Select(m => new AdminMessageDto
+            {
+                Id = m.Id,
+                Role = (int)m.Role,
+                Content = m.Content,
+                SqlQuery = m.SqlQuery,
+                QueryResult = m.QueryResult,
+                TokensUsed = m.TokensUsed,
+                CreatedAt = m.CreatedAt,
+            }).ToList(),
+            CreatedAt = conversation.CreatedAt,
+            UpdatedAt = conversation.UpdatedAt,
+        };
+    }
+
     // ─── Helpers ─────────────────────────────────────────────────────
 
     private static string GenerateOtp()

@@ -2154,6 +2154,14 @@ Rules:
         content = System.Text.RegularExpressions.Regex.Replace(
             content, @"```followups[\s\S]*?```", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
+        // Remove unclosed code blocks (AI didn't close with ```)
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"```(?:sql|json|viz|clarification|insight|followups)[\s\S]*$", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        // Remove inline viz JSON that leaked without code block wrapping
+        content = System.Text.RegularExpressions.Regex.Replace(
+            content, @"\{""chart""\s*:\s*""[^""]*""\s*,\s*""group""\s*:[\s\S]*?""agg""\s*:\s*""[^""]*""\s*\}\s*\]\s*\}?\s*\}?", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
         // Remove empty markdown headers (e.g., "**Top 5 Sales:**" followed by empty line or end)
         // These appear when JSON blocks are stripped but headers remain
         // Only match headers followed by empty line or end, not headers with content after

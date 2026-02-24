@@ -232,4 +232,44 @@ public class AdminController : ControllerBase
             return StatusCode(500, ApiResponse<AdminUserDto>.ErrorResponse("An error occurred."));
         }
     }
+
+    // ─── Conversations (admin only) ──────────────────────────────────
+
+    [HttpGet("users/{userId:guid}/conversations")]
+    [Authorize(Policy = "AdminOnly")]
+    [EnableRateLimiting("general")]
+    public async Task<ActionResult<ApiResponse<AdminConversationListDto>>> GetUserConversations(Guid userId)
+    {
+        try
+        {
+            var result = await _adminService.GetUserConversationsAsync(userId);
+            return Ok(ApiResponse<AdminConversationListDto>.SuccessResponse(result));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching conversations for user {UserId}", userId);
+            return StatusCode(500, ApiResponse<AdminConversationListDto>.ErrorResponse("An error occurred."));
+        }
+    }
+
+    [HttpGet("conversations/{conversationId:guid}")]
+    [Authorize(Policy = "AdminOnly")]
+    [EnableRateLimiting("general")]
+    public async Task<ActionResult<ApiResponse<AdminConversationDetailDto>>> GetConversationDetail(Guid conversationId)
+    {
+        try
+        {
+            var result = await _adminService.GetConversationDetailAsync(conversationId);
+            return Ok(ApiResponse<AdminConversationDetailDto>.SuccessResponse(result));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return NotFound(ApiResponse<AdminConversationDetailDto>.ErrorResponse(ex.Message));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching conversation {ConversationId}", conversationId);
+            return StatusCode(500, ApiResponse<AdminConversationDetailDto>.ErrorResponse("An error occurred."));
+        }
+    }
 }

@@ -19,4 +19,8 @@ public interface IAdminService
     Task<AdminUserListDto> GetUsersAsync(string? search, string? tier, int page, int pageSize);
     Task<AdminUserDto> GetUserByIdAsync(Guid userId);
     Task<AdminUserDto> UpdateUserAsync(Guid userId, AdminUpdateUserRequest request);
+
+    // Conversations
+    Task<AdminConversationListDto> GetUserConversationsAsync(Guid userId);
+    Task<AdminConversationDetailDto> GetConversationDetailAsync(Guid conversationId);
 }
