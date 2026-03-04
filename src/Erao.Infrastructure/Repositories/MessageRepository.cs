@@ -33,4 +33,11 @@ public class MessageRepository : Repository<Message>, IMessageRepository
         messages.Reverse();
         return messages;
     }
+
+    public async Task<int> GetCountAsync(Guid conversationId)
+    {
+        return await _dbSet
+            .Where(m => m.ConversationId == conversationId)
+            .CountAsync();
+    }
 }

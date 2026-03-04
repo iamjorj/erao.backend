@@ -13,5 +13,7 @@ public class ConversationDto
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
     public DateTime? LastMessageAt { get; set; }
+    public string? CustomInstructions { get; set; }
+    public bool HasContextSummary { get; set; }
     public List<MessageDto> Messages { get; set; } = new();
 }

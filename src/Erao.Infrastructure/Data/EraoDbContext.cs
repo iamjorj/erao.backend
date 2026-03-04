@@ -81,6 +81,10 @@ public class EraoDbContext : DbContext
             entity.HasKey(e => e.Id);
             entity.Property(e => e.Title).HasMaxLength(500);
 
+            entity.Property(e => e.ContextSummary).HasColumnType("text");
+            entity.Property(e => e.CustomInstructions).HasColumnType("text").HasMaxLength(2000);
+            entity.Property(e => e.SummarizedMessageCount).HasDefaultValue(0);
+
             entity.HasOne(e => e.User)
                 .WithMany(u => u.Conversations)
                 .HasForeignKey(e => e.UserId)

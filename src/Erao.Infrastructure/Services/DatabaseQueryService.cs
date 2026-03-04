@@ -1,6 +1,7 @@
 using System.Data;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Erao.Core.DTOs.Database;
 using Erao.Core.Enums;
 using Erao.Core.Interfaces;
@@ -23,9 +24,67 @@ public class DatabaseQueryService : IDatabaseQueryService
 {
     private readonly ILogger<DatabaseQueryService> _logger;
 
+    // Regex to reject non-read-only SQL statements (case-insensitive, word-boundary)
+    private static readonly Regex _dangerousSqlPattern = new(
+        @"\b(ALTER|DROP|DELETE|INSERT|UPDATE|TRUNCATE|CREATE|EXEC|EXECUTE|GRANT|REVOKE|MERGE|COPY|EXPORT|ATTACH|DETACH)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly HashSet<string> _allowedMongoDbCommands = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "find", "aggregate", "count", "countDocuments", "distinct",
+        "listCollections", "listDatabases", "dbStats", "collStats", "explain"
+    };
+
     public DatabaseQueryService(ILogger<DatabaseQueryService> logger)
     {
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Validates that the query is read-only (SELECT only). Throws if the query contains
+    /// dangerous SQL statements.
+    /// </summary>
+    private static void ValidateReadOnlyQuery(string query)
+    {
+        if (_dangerousSqlPattern.IsMatch(query))
+        {
+            throw new InvalidOperationException(
+                "Only SELECT queries are allowed. Data modification statements are not permitted.");
+        }
+    }
+
+    /// <summary>
+    /// Validates and sanitizes a SQL identifier (database name, table name, etc.)
+    /// to prevent SQL injection. Only allows alphanumeric characters, underscores, dots, and hyphens.
+    /// </summary>
+    private static string ValidateIdentifier(string identifier)
+    {
+        if (string.IsNullOrWhiteSpace(identifier))
+            throw new ArgumentException("Identifier cannot be null or empty", nameof(identifier));
+
+        var sanitized = Regex.Replace(identifier, @"[^a-zA-Z0-9_.\-]", "");
+        if (string.IsNullOrEmpty(sanitized))
+            throw new ArgumentException($"Invalid identifier: '{identifier}'", nameof(identifier));
+
+        return sanitized;
+    }
+
+    /// <summary>
+    /// Validates that a MongoDB command is read-only.
+    /// Only allows: find, aggregate, count, countDocuments, distinct,
+    /// listCollections, listDatabases, dbStats, collStats, explain.
+    /// </summary>
+    private static void ValidateMongoDbCommand(BsonDocument command)
+    {
+        if (command.ElementCount == 0)
+            throw new InvalidOperationException("Empty MongoDB command.");
+
+        var commandName = command.GetElement(0).Name;
+        if (!_allowedMongoDbCommands.Contains(commandName))
+        {
+            throw new InvalidOperationException(
+                $"MongoDB command '{commandName}' is not allowed. Only read-only commands are permitted: {string.Join(", ", _allowedMongoDbCommands)}");
+        }
     }
 
     public async Task<bool> TestConnectionAsync(DatabaseType dbType, string host, int port, string database, string username, string password)
@@ -188,17 +247,33 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     #region PostgreSQL
 
+    private static string BuildNpgsqlConnectionString(string host, int port, string database, string username, string password, bool readOnly = false)
+    {
+        var builder = new NpgsqlConnectionStringBuilder
+        {
+            Host = host,
+            Port = port,
+            Database = database,
+            Username = username,
+            Password = password,
+            SslMode = SslMode.Prefer,
+            TrustServerCertificate = true,
+            Timeout = 30
+        };
+        if (readOnly) builder.Options = "-c default_transaction_read_only=on";
+        return builder.ConnectionString;
+    }
+
     private async Task<bool> TestPostgreSqlConnectionAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true;Timeout=30";
-        await using var connection = new NpgsqlConnection(connectionString);
+        await using var connection = new NpgsqlConnection(BuildNpgsqlConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
         return true;
     }
 
     private async Task<string> GetPostgreSqlSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true";
+        var connectionString = BuildNpgsqlConnectionString(host, port, database, username, password);
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -305,11 +380,13 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecutePostgreSqlQueryAsync(string host, int port, string database, string username, string password, string query)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true;Options=-c default_transaction_read_only=on";
+        ValidateReadOnlyQuery(query);
+        var connectionString = BuildNpgsqlConnectionString(host, port, database, username, password, readOnly: true);
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
         await using var command = new NpgsqlCommand(query, connection);
+        command.CommandTimeout = 60;
         await using var reader = await command.ExecuteReaderAsync();
 
         return await DataReaderToJsonAsync(reader);
@@ -317,7 +394,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<string>> ExecutePostgreSqlQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true;Options=-c default_transaction_read_only=on";
+        var connectionString = BuildNpgsqlConnectionString(host, port, database, username, password, readOnly: true);
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -326,7 +403,9 @@ public class DatabaseQueryService : IDatabaseQueryService
         {
             try
             {
+                ValidateReadOnlyQuery(query);
                 await using var command = new NpgsqlCommand(query, connection);
+                command.CommandTimeout = 60;
                 await using var reader = await command.ExecuteReaderAsync();
                 results.Add(await DataReaderToJsonAsync(reader));
             }
@@ -340,7 +419,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<TableSchema>> GetPostgreSqlStructuredSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Prefer;Trust Server Certificate=true";
+        var connectionString = BuildNpgsqlConnectionString(host, port, database, username, password);
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -557,9 +636,24 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     #region MySQL
 
+    private static string BuildMySqlConnString(string host, int port, string database, string username, string password)
+    {
+        var builder = new MySqlConnectionStringBuilder
+        {
+            Server = host,
+            Port = (uint)port,
+            Database = database,
+            UserID = username,
+            Password = password,
+            SslMode = MySqlSslMode.Preferred,
+            ConnectionTimeout = 30
+        };
+        return builder.ConnectionString;
+    }
+
     private async Task<bool> TestMySqlConnectionAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred;Connection Timeout=30";
+        var connectionString = BuildMySqlConnString(host, port, database, username, password);
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
         return true;
@@ -567,7 +661,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> GetMySqlSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred";
+        var connectionString = BuildMySqlConnString(host, port, database, username, password);
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -575,8 +669,9 @@ public class DatabaseQueryService : IDatabaseQueryService
         schema.AppendLine("-- MySQL Database Schema");
         schema.AppendLine();
 
-        var tableQuery = $"SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{database}'";
+        var tableQuery = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = @database";
         await using var tableCmd = new MySqlCommand(tableQuery, connection);
+        tableCmd.Parameters.AddWithValue("@database", database);
         await using var tableReader = await tableCmd.ExecuteReaderAsync();
 
         var tables = new List<string>();
@@ -605,7 +700,8 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteMySqlQueryAsync(string host, int port, string database, string username, string password, string query)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred";
+        ValidateReadOnlyQuery(query);
+        var connectionString = BuildMySqlConnString(host, port, database, username, password);
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -616,6 +712,7 @@ public class DatabaseQueryService : IDatabaseQueryService
         }
 
         await using var command = new MySqlCommand(query, connection);
+        command.CommandTimeout = 60;
         await using var reader = await command.ExecuteReaderAsync();
 
         return await DataReaderToJsonAsync(reader);
@@ -623,16 +720,24 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<string>> ExecuteMySqlQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred";
+        var connectionString = BuildMySqlConnString(host, port, database, username, password);
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
+
+        // Set session to read-only to prevent destructive queries
+        await using (var roCmd = new MySqlCommand("SET SESSION TRANSACTION READ ONLY", connection))
+        {
+            await roCmd.ExecuteNonQueryAsync();
+        }
 
         var results = new List<string>();
         foreach (var query in queries)
         {
             try
             {
+                ValidateReadOnlyQuery(query);
                 await using var command = new MySqlCommand(query, connection);
+                command.CommandTimeout = 60;
                 await using var reader = await command.ExecuteReaderAsync();
                 results.Add(await DataReaderToJsonAsync(reader));
             }
@@ -646,15 +751,16 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<TableSchema>> GetMySqlStructuredSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Server={host};Port={port};Database={database};User={username};Password={password};SslMode=Preferred";
+        var connectionString = BuildMySqlConnString(host, port, database, username, password);
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync();
 
         var tables = new List<TableSchema>();
 
         // Get all tables
-        var tableQuery = $"SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{database}' AND TABLE_TYPE = 'BASE TABLE'";
+        var tableQuery = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = @database AND TABLE_TYPE = 'BASE TABLE'";
         await using var tableCmd = new MySqlCommand(tableQuery, connection);
+        tableCmd.Parameters.AddWithValue("@database", database);
         await using var tableReader = await tableCmd.ExecuteReaderAsync();
 
         var tableNames = new List<string>();
@@ -669,15 +775,17 @@ public class DatabaseQueryService : IDatabaseQueryService
             var table = new TableSchema { Name = tableName, Schema = database };
 
             // Get columns
-            var columnQuery = $@"
+            var columnQuery = @"
                 SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT,
                        CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE,
                        EXTRA
                 FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = '{database}' AND TABLE_NAME = '{tableName}'
+                WHERE TABLE_SCHEMA = @database AND TABLE_NAME = @tableName
                 ORDER BY ORDINAL_POSITION";
 
             await using var columnCmd = new MySqlCommand(columnQuery, connection);
+            columnCmd.Parameters.AddWithValue("@database", database);
+            columnCmd.Parameters.AddWithValue("@tableName", tableName);
             await using var columnReader = await columnCmd.ExecuteReaderAsync();
 
             while (await columnReader.ReadAsync())
@@ -697,14 +805,16 @@ public class DatabaseQueryService : IDatabaseQueryService
             await columnReader.CloseAsync();
 
             // Get primary keys
-            var pkQuery = $@"
+            var pkQuery = @"
                 SELECT CONSTRAINT_NAME, COLUMN_NAME
                 FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                WHERE TABLE_SCHEMA = '{database}' AND TABLE_NAME = '{tableName}'
+                WHERE TABLE_SCHEMA = @database AND TABLE_NAME = @tableName
                   AND CONSTRAINT_NAME = 'PRIMARY'
                 ORDER BY ORDINAL_POSITION";
 
             await using var pkCmd = new MySqlCommand(pkQuery, connection);
+            pkCmd.Parameters.AddWithValue("@database", database);
+            pkCmd.Parameters.AddWithValue("@tableName", tableName);
             await using var pkReader = await pkCmd.ExecuteReaderAsync();
 
             var pkColumns = new List<string>();
@@ -723,7 +833,7 @@ public class DatabaseQueryService : IDatabaseQueryService
             }
 
             // Get foreign keys
-            var fkQuery = $@"
+            var fkQuery = @"
                 SELECT
                     kcu.CONSTRAINT_NAME,
                     kcu.COLUMN_NAME,
@@ -735,11 +845,13 @@ public class DatabaseQueryService : IDatabaseQueryService
                 JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
                     ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
                     AND kcu.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA
-                WHERE kcu.TABLE_SCHEMA = '{database}'
-                    AND kcu.TABLE_NAME = '{tableName}'
+                WHERE kcu.TABLE_SCHEMA = @database
+                    AND kcu.TABLE_NAME = @tableName
                     AND kcu.REFERENCED_TABLE_NAME IS NOT NULL";
 
             await using var fkCmd = new MySqlCommand(fkQuery, connection);
+            fkCmd.Parameters.AddWithValue("@database", database);
+            fkCmd.Parameters.AddWithValue("@tableName", tableName);
             await using var fkReader = await fkCmd.ExecuteReaderAsync();
 
             while (await fkReader.ReadAsync())
@@ -760,14 +872,16 @@ public class DatabaseQueryService : IDatabaseQueryService
             await fkReader.CloseAsync();
 
             // Get indexes
-            var indexQuery = $@"
+            var indexQuery = @"
                 SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE
                 FROM INFORMATION_SCHEMA.STATISTICS
-                WHERE TABLE_SCHEMA = '{database}' AND TABLE_NAME = '{tableName}'
+                WHERE TABLE_SCHEMA = @database AND TABLE_NAME = @tableName
                   AND INDEX_NAME != 'PRIMARY'
                 ORDER BY INDEX_NAME, SEQ_IN_INDEX";
 
             await using var indexCmd = new MySqlCommand(indexQuery, connection);
+            indexCmd.Parameters.AddWithValue("@database", database);
+            indexCmd.Parameters.AddWithValue("@tableName", tableName);
             await using var indexReader = await indexCmd.ExecuteReaderAsync();
 
             var indexDict = new Dictionary<string, IndexInfo>();
@@ -793,8 +907,10 @@ public class DatabaseQueryService : IDatabaseQueryService
             table.Indexes = indexDict.Values.ToList();
 
             // Get row count
-            var countQuery = $"SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{database}' AND TABLE_NAME = '{tableName}'";
+            var countQuery = "SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = @database AND TABLE_NAME = @tableName";
             await using var countCmd = new MySqlCommand(countQuery, connection);
+            countCmd.Parameters.AddWithValue("@database", database);
+            countCmd.Parameters.AddWithValue("@tableName", tableName);
             var rowCount = await countCmd.ExecuteScalarAsync();
             table.RowCount = rowCount != null && rowCount != DBNull.Value ? Convert.ToInt64(rowCount) : null;
 
@@ -808,9 +924,23 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     #region SQL Server
 
+    private static string BuildSqlServerConnString(string host, int port, string database, string username, string password)
+    {
+        var builder = new SqlConnectionStringBuilder
+        {
+            DataSource = $"{host},{port}",
+            InitialCatalog = database,
+            UserID = username,
+            Password = password,
+            TrustServerCertificate = true,
+            ConnectTimeout = 30
+        };
+        return builder.ConnectionString;
+    }
+
     private async Task<bool> TestSqlServerConnectionAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Server={host},{port};Database={database};User Id={username};Password={password};TrustServerCertificate=True;Connection Timeout=30";
+        var connectionString = BuildSqlServerConnString(host, port, database, username, password);
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync();
         return true;
@@ -818,7 +948,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> GetSqlServerSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Server={host},{port};Database={database};User Id={username};Password={password};TrustServerCertificate=True";
+        var connectionString = BuildSqlServerConnString(host, port, database, username, password);
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -872,34 +1002,41 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteSqlServerQueryAsync(string host, int port, string database, string username, string password, string query)
     {
-        var connectionString = $"Server={host},{port};Database={database};User Id={username};Password={password};TrustServerCertificate=True";
+        ValidateReadOnlyQuery(query);
+        var connectionString = BuildSqlServerConnString(host, port, database, username, password);
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync();
 
-        // Set session to read-only to prevent destructive queries
-        await using (var roCmd = new SqlCommand("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN TRANSACTION; SET XACT_ABORT ON;", connection))
+        // Wrap in a transaction that is always rolled back to prevent any writes
+        var transaction = connection.BeginTransaction();
+        try
         {
-            await roCmd.ExecuteNonQueryAsync();
+            await using var command = new SqlCommand(query, connection, transaction);
+            command.CommandTimeout = 60;
+            await using var reader = await command.ExecuteReaderAsync();
+            return await DataReaderToJsonAsync(reader);
         }
-
-        await using var command = new SqlCommand(query, connection);
-        await using var reader = await command.ExecuteReaderAsync();
-
-        return await DataReaderToJsonAsync(reader);
+        finally
+        {
+            try { transaction.Rollback(); } catch { /* already closed */ }
+        }
     }
 
     private async Task<List<string>> ExecuteSqlServerQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
     {
-        var connectionString = $"Server={host},{port};Database={database};User Id={username};Password={password};TrustServerCertificate=True";
+        var connectionString = BuildSqlServerConnString(host, port, database, username, password);
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync();
 
         var results = new List<string>();
         foreach (var query in queries)
         {
+            var transaction = connection.BeginTransaction();
             try
             {
-                await using var command = new SqlCommand(query, connection);
+                ValidateReadOnlyQuery(query);
+                await using var command = new SqlCommand(query, connection, transaction);
+                command.CommandTimeout = 60;
                 await using var reader = await command.ExecuteReaderAsync();
                 results.Add(await DataReaderToJsonAsync(reader));
             }
@@ -907,13 +1044,17 @@ public class DatabaseQueryService : IDatabaseQueryService
             {
                 results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
             }
+            finally
+            {
+                try { transaction.Rollback(); } catch { /* already closed */ }
+            }
         }
         return results;
     }
 
     private async Task<List<TableSchema>> GetSqlServerStructuredSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = $"Server={host},{port};Database={database};User Id={username};Password={password};TrustServerCertificate=True";
+        var connectionString = BuildSqlServerConnString(host, port, database, username, password);
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync();
 
@@ -1115,11 +1256,20 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     #region MongoDB
 
+    private static string BuildMongoDbConnectionString(string host, int port, string username, string password)
+    {
+        if (string.IsNullOrEmpty(username))
+            return $"mongodb://{host}:{port}";
+
+        // URL-encode username and password to handle special characters safely
+        var encodedUsername = Uri.EscapeDataString(username);
+        var encodedPassword = Uri.EscapeDataString(password);
+        return $"mongodb://{encodedUsername}:{encodedPassword}@{host}:{port}";
+    }
+
     private async Task<bool> TestMongoDbConnectionAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = string.IsNullOrEmpty(username)
-            ? $"mongodb://{host}:{port}"
-            : $"mongodb://{username}:{password}@{host}:{port}";
+        var connectionString = BuildMongoDbConnectionString(host, port, username, password);
 
         var client = new MongoClient(connectionString);
         var db = client.GetDatabase(database);
@@ -1129,9 +1279,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> GetMongoDbSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = string.IsNullOrEmpty(username)
-            ? $"mongodb://{host}:{port}"
-            : $"mongodb://{username}:{password}@{host}:{port}";
+        var connectionString = BuildMongoDbConnectionString(host, port, username, password);
 
         var client = new MongoClient(connectionString);
         var db = client.GetDatabase(database);
@@ -1167,9 +1315,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteMongoDbQueryAsync(string host, int port, string database, string username, string password, string query)
     {
-        var connectionString = string.IsNullOrEmpty(username)
-            ? $"mongodb://{host}:{port}"
-            : $"mongodb://{username}:{password}@{host}:{port}";
+        var connectionString = BuildMongoDbConnectionString(host, port, username, password);
 
         var client = new MongoClient(connectionString);
         var db = client.GetDatabase(database);
@@ -1177,6 +1323,10 @@ public class DatabaseQueryService : IDatabaseQueryService
         // Parse the query (expected format: collectionName.find({...}) or similar)
         // For simplicity, we'll use RunCommandAsync
         var command = BsonDocument.Parse(query);
+
+        // Validate that the command is read-only
+        ValidateMongoDbCommand(command);
+
         var result = await db.RunCommandAsync<BsonDocument>(command);
 
         return result.ToJson();
@@ -1184,9 +1334,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<List<TableSchema>> GetMongoDbStructuredSchemaAsync(string host, int port, string database, string username, string password)
     {
-        var connectionString = string.IsNullOrEmpty(username)
-            ? $"mongodb://{host}:{port}"
-            : $"mongodb://{username}:{password}@{host}:{port}";
+        var connectionString = BuildMongoDbConnectionString(host, port, username, password);
 
         var client = new MongoClient(connectionString);
         var db = client.GetDatabase(database);
@@ -1279,7 +1427,11 @@ public class DatabaseQueryService : IDatabaseQueryService
     #region Oracle
 
     private static string BuildOracleConnectionString(string host, int port, string database, string username, string password)
-        => $"Data Source=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT={port}))(CONNECT_DATA=(SERVICE_NAME={database})));User Id={username};Password={password};Connection Timeout=30";
+    {
+        // Sanitize values by removing semicolons and parentheses to prevent connection string injection
+        static string Sanitize(string value) => value?.Replace(";", "").Replace("(", "").Replace(")", "") ?? "";
+        return $"Data Source=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={Sanitize(host)})(PORT={port}))(CONNECT_DATA=(SERVICE_NAME={Sanitize(database)})));User Id={Sanitize(username)};Password={Sanitize(password)};Connection Timeout=30";
+    }
 
     private async Task<bool> TestOracleConnectionAsync(string host, int port, string database, string username, string password)
     {
@@ -1308,7 +1460,8 @@ public class DatabaseQueryService : IDatabaseQueryService
         {
             schema.AppendLine($"CREATE TABLE \"{table}\" (");
             await using var colCmd = new OracleCommand(
-                $"SELECT column_name, data_type, nullable FROM user_tab_columns WHERE table_name = '{table}' ORDER BY column_id", connection);
+                "SELECT column_name, data_type, nullable FROM user_tab_columns WHERE table_name = :tableName ORDER BY column_id", connection);
+            colCmd.Parameters.Add(new OracleParameter("tableName", table));
             await using var colReader = await colCmd.ExecuteReaderAsync();
 
             var cols = new List<string>();
@@ -1349,7 +1502,8 @@ public class DatabaseQueryService : IDatabaseQueryService
 
             // Columns
             await using var colCmd = new OracleCommand(
-                $"SELECT column_name, data_type, nullable, data_default, char_length, data_precision, data_scale FROM user_tab_columns WHERE table_name = '{tableName}' ORDER BY column_id", connection);
+                "SELECT column_name, data_type, nullable, data_default, char_length, data_precision, data_scale FROM user_tab_columns WHERE table_name = :tableName ORDER BY column_id", connection);
+            colCmd.Parameters.Add(new OracleParameter("tableName", tableName));
             await using var colReader = await colCmd.ExecuteReaderAsync();
             while (await colReader.ReadAsync())
             {
@@ -1368,7 +1522,8 @@ public class DatabaseQueryService : IDatabaseQueryService
 
             // Primary keys
             await using var pkCmd = new OracleCommand(
-                $"SELECT cols.constraint_name, cols.column_name FROM user_cons_columns cols JOIN user_constraints cons ON cols.constraint_name = cons.constraint_name WHERE cons.constraint_type = 'P' AND cons.table_name = '{tableName}' ORDER BY cols.position", connection);
+                "SELECT cols.constraint_name, cols.column_name FROM user_cons_columns cols JOIN user_constraints cons ON cols.constraint_name = cons.constraint_name WHERE cons.constraint_type = 'P' AND cons.table_name = :tableName ORDER BY cols.position", connection);
+            pkCmd.Parameters.Add(new OracleParameter("tableName", tableName));
             await using var pkReader = await pkCmd.ExecuteReaderAsync();
             var pkDict = new Dictionary<string, List<string>>();
             while (await pkReader.ReadAsync())
@@ -1386,12 +1541,13 @@ public class DatabaseQueryService : IDatabaseQueryService
 
             // Foreign keys
             await using var fkCmd = new OracleCommand(
-                $@"SELECT a.constraint_name, a.column_name, c_pk.table_name, b.column_name
+                @"SELECT a.constraint_name, a.column_name, c_pk.table_name, b.column_name
                    FROM user_cons_columns a
                    JOIN user_constraints c ON a.constraint_name = c.constraint_name
                    JOIN user_constraints c_pk ON c.r_constraint_name = c_pk.constraint_name
                    JOIN user_cons_columns b ON c_pk.constraint_name = b.constraint_name AND a.position = b.position
-                   WHERE c.constraint_type = 'R' AND c.table_name = '{tableName}'", connection);
+                   WHERE c.constraint_type = 'R' AND c.table_name = :tableName", connection);
+            fkCmd.Parameters.Add(new OracleParameter("tableName", tableName));
             await using var fkReader = await fkCmd.ExecuteReaderAsync();
             while (await fkReader.ReadAsync())
             {
@@ -1409,7 +1565,8 @@ public class DatabaseQueryService : IDatabaseQueryService
             await fkReader.CloseAsync();
 
             // Row count
-            await using var countCmd = new OracleCommand($"SELECT num_rows FROM user_tables WHERE table_name = '{tableName}'", connection);
+            await using var countCmd = new OracleCommand("SELECT num_rows FROM user_tables WHERE table_name = :tableName", connection);
+            countCmd.Parameters.Add(new OracleParameter("tableName", tableName));
             var rowCount = await countCmd.ExecuteScalarAsync();
             table.RowCount = rowCount != null && rowCount != DBNull.Value ? Convert.ToInt64(rowCount) : null;
 
@@ -1421,9 +1578,19 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteOracleQueryAsync(string host, int port, string database, string username, string password, string query)
     {
+        ValidateReadOnlyQuery(query);
+
         await using var connection = new OracleConnection(BuildOracleConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
+
+        // Set transaction to read-only to prevent destructive queries
+        await using (var roCmd = new OracleCommand("SET TRANSACTION READ ONLY", connection))
+        {
+            await roCmd.ExecuteNonQueryAsync();
+        }
+
         await using var command = new OracleCommand(query, connection);
+        command.CommandTimeout = 60;
         await using var reader = await command.ExecuteReaderAsync();
         return await DataReaderToJsonAsync(reader);
     }
@@ -1433,12 +1600,21 @@ public class DatabaseQueryService : IDatabaseQueryService
         await using var connection = new OracleConnection(BuildOracleConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
 
+        // Set transaction to read-only to prevent destructive queries
+        await using (var roCmd = new OracleCommand("SET TRANSACTION READ ONLY", connection))
+        {
+            await roCmd.ExecuteNonQueryAsync();
+        }
+
         var results = new List<string>();
         foreach (var query in queries)
         {
             try
             {
+                ValidateReadOnlyQuery(query);
+
                 await using var command = new OracleCommand(query, connection);
+                command.CommandTimeout = 60;
                 await using var reader = await command.ExecuteReaderAsync();
                 results.Add(await DataReaderToJsonAsync(reader));
             }
@@ -1454,11 +1630,12 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     #region SQLite
 
-    private static string BuildSqliteConnectionString(string host, int port, string database, string username, string password)
+    private static string BuildSqliteConnectionString(string host, int port, string database, string username, string password, bool readOnly = false)
     {
         // For SQLite, host is treated as the file path. If password is provided, use it.
         var builder = new SqliteConnectionStringBuilder { DataSource = string.IsNullOrEmpty(host) ? database : host };
         if (!string.IsNullOrEmpty(password)) builder.Password = password;
+        if (readOnly) builder.Mode = SqliteOpenMode.ReadOnly;
         return builder.ConnectionString;
     }
 
@@ -1563,16 +1740,19 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteSqliteQueryAsync(string host, int port, string database, string username, string password, string query)
     {
-        await using var connection = new SqliteConnection(BuildSqliteConnectionString(host, port, database, username, password));
+        ValidateReadOnlyQuery(query);
+
+        await using var connection = new SqliteConnection(BuildSqliteConnectionString(host, port, database, username, password, readOnly: true));
         await connection.OpenAsync();
         await using var command = new SqliteCommand(query, connection);
+        command.CommandTimeout = 60;
         await using var reader = await command.ExecuteReaderAsync();
         return await DataReaderToJsonAsync(reader);
     }
 
     private async Task<List<string>> ExecuteSqliteQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
     {
-        await using var connection = new SqliteConnection(BuildSqliteConnectionString(host, port, database, username, password));
+        await using var connection = new SqliteConnection(BuildSqliteConnectionString(host, port, database, username, password, readOnly: true));
         await connection.OpenAsync();
 
         var results = new List<string>();
@@ -1580,7 +1760,10 @@ public class DatabaseQueryService : IDatabaseQueryService
         {
             try
             {
+                ValidateReadOnlyQuery(query);
+
                 await using var command = new SqliteCommand(query, connection);
+                command.CommandTimeout = 60;
                 await using var reader = await command.ExecuteReaderAsync();
                 results.Add(await DataReaderToJsonAsync(reader));
             }
@@ -1597,7 +1780,11 @@ public class DatabaseQueryService : IDatabaseQueryService
     #region ClickHouse
 
     private static string BuildClickHouseConnectionString(string host, int port, string database, string username, string password)
-        => $"Host={host};Port={port};Database={database};Username={username};Password={password}";
+    {
+        // Sanitize values by removing semicolons to prevent connection string injection
+        static string Sanitize(string value) => value?.Replace(";", "") ?? "";
+        return $"Host={Sanitize(host)};Port={port};Database={Sanitize(database)};Username={Sanitize(username)};Password={Sanitize(password)}";
+    }
 
     private async Task<bool> TestClickHouseConnectionAsync(string host, int port, string database, string username, string password)
     {
@@ -1611,12 +1798,14 @@ public class DatabaseQueryService : IDatabaseQueryService
         await using var connection = new ClickHouseConnection(BuildClickHouseConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
 
+        var safeDatabase = ValidateIdentifier(database);
+
         var schema = new StringBuilder();
         schema.AppendLine("-- ClickHouse Database Schema");
         schema.AppendLine();
 
         await using var tableCmd = connection.CreateCommand();
-        tableCmd.CommandText = $"SELECT name FROM system.tables WHERE database = '{database}' ORDER BY name";
+        tableCmd.CommandText = $"SELECT name FROM system.tables WHERE database = '{safeDatabase}' ORDER BY name";
         await using var tableReader = await tableCmd.ExecuteReaderAsync();
 
         var tableNames = new List<string>();
@@ -1625,9 +1814,10 @@ public class DatabaseQueryService : IDatabaseQueryService
 
         foreach (var tableName in tableNames)
         {
-            schema.AppendLine($"CREATE TABLE \"{tableName}\" (");
+            var safeTableName = ValidateIdentifier(tableName);
+            schema.AppendLine($"CREATE TABLE \"{safeTableName}\" (");
             await using var colCmd = connection.CreateCommand();
-            colCmd.CommandText = $"SELECT name, type FROM system.columns WHERE database = '{database}' AND table = '{tableName}' ORDER BY position";
+            colCmd.CommandText = $"SELECT name, type FROM system.columns WHERE database = '{safeDatabase}' AND table = '{safeTableName}' ORDER BY position";
             await using var colReader = await colCmd.ExecuteReaderAsync();
 
             var cols = new List<string>();
@@ -1648,10 +1838,11 @@ public class DatabaseQueryService : IDatabaseQueryService
         await using var connection = new ClickHouseConnection(BuildClickHouseConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
 
+        var safeDatabase = ValidateIdentifier(database);
         var tables = new List<TableSchema>();
 
         await using var tableCmd = connection.CreateCommand();
-        tableCmd.CommandText = $"SELECT name FROM system.tables WHERE database = '{database}' ORDER BY name";
+        tableCmd.CommandText = $"SELECT name FROM system.tables WHERE database = '{safeDatabase}' ORDER BY name";
         await using var tableReader = await tableCmd.ExecuteReaderAsync();
 
         var tableNames = new List<string>();
@@ -1660,10 +1851,11 @@ public class DatabaseQueryService : IDatabaseQueryService
 
         foreach (var tableName in tableNames)
         {
+            var safeTableName = ValidateIdentifier(tableName);
             var table = new TableSchema { Name = tableName, Schema = database };
 
             await using var colCmd = connection.CreateCommand();
-            colCmd.CommandText = $"SELECT name, type, is_in_primary_key FROM system.columns WHERE database = '{database}' AND table = '{tableName}' ORDER BY position";
+            colCmd.CommandText = $"SELECT name, type, is_in_primary_key FROM system.columns WHERE database = '{safeDatabase}' AND table = '{safeTableName}' ORDER BY position";
             await using var colReader = await colCmd.ExecuteReaderAsync();
             while (await colReader.ReadAsync())
             {
@@ -1684,7 +1876,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
             // Row count
             await using var countCmd = connection.CreateCommand();
-            countCmd.CommandText = $"SELECT count() FROM \"{database}\".\"{tableName}\"";
+            countCmd.CommandText = $"SELECT count() FROM \"{safeDatabase}\".\"{safeTableName}\"";
             var rowCount = await countCmd.ExecuteScalarAsync();
             table.RowCount = rowCount != null ? Convert.ToInt64(rowCount) : null;
 
@@ -1696,10 +1888,21 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteClickHouseQueryAsync(string host, int port, string database, string username, string password, string query)
     {
+        ValidateReadOnlyQuery(query);
+
         await using var connection = new ClickHouseConnection(BuildClickHouseConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
+
+        // Set ClickHouse to read-only mode
+        await using (var roCmd = connection.CreateCommand())
+        {
+            roCmd.CommandText = "SET readonly = 1";
+            await roCmd.ExecuteNonQueryAsync();
+        }
+
         await using var command = connection.CreateCommand();
         command.CommandText = query;
+        command.CommandTimeout = 60;
         await using var reader = await command.ExecuteReaderAsync();
         return await DataReaderToJsonAsync(reader);
     }
@@ -1709,13 +1912,23 @@ public class DatabaseQueryService : IDatabaseQueryService
         await using var connection = new ClickHouseConnection(BuildClickHouseConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
 
+        // Set ClickHouse to read-only mode
+        await using (var roCmd = connection.CreateCommand())
+        {
+            roCmd.CommandText = "SET readonly = 1";
+            await roCmd.ExecuteNonQueryAsync();
+        }
+
         var results = new List<string>();
         foreach (var query in queries)
         {
             try
             {
+                ValidateReadOnlyQuery(query);
+
                 await using var command = connection.CreateCommand();
                 command.CommandText = query;
+                command.CommandTimeout = 60;
                 await using var reader = await command.ExecuteReaderAsync();
                 results.Add(await DataReaderToJsonAsync(reader));
             }
@@ -1732,7 +1945,11 @@ public class DatabaseQueryService : IDatabaseQueryService
     #region Firebird
 
     private static string BuildFirebirdConnectionString(string host, int port, string database, string username, string password)
-        => $"Server={host};Port={port};Database={database};User={username};Password={password};Connection Timeout=30";
+    {
+        // Sanitize values by removing semicolons to prevent connection string injection
+        static string Sanitize(string value) => value?.Replace(";", "") ?? "";
+        return $"Server={Sanitize(host)};Port={port};Database={Sanitize(database)};User={Sanitize(username)};Password={Sanitize(password)};Connection Timeout=30";
+    }
 
     private async Task<bool> TestFirebirdConnectionAsync(string host, int port, string database, string username, string password)
     {
@@ -1762,11 +1979,12 @@ public class DatabaseQueryService : IDatabaseQueryService
         {
             schema.AppendLine($"CREATE TABLE \"{tableName}\" (");
             await using var colCmd = new FbCommand(
-                $@"SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, rf.RDB$NULL_FLAG
+                @"SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, rf.RDB$NULL_FLAG
                    FROM RDB$RELATION_FIELDS rf
                    JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
-                   WHERE rf.RDB$RELATION_NAME = '{tableName}'
+                   WHERE rf.RDB$RELATION_NAME = @tableName
                    ORDER BY rf.RDB$FIELD_POSITION", connection);
+            colCmd.Parameters.AddWithValue("@tableName", tableName);
             await using var colReader = await colCmd.ExecuteReaderAsync();
 
             var cols = new List<string>();
@@ -1814,11 +2032,12 @@ public class DatabaseQueryService : IDatabaseQueryService
             var table = new TableSchema { Name = tableName, Schema = "DEFAULT" };
 
             await using var colCmd = new FbCommand(
-                $@"SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, rf.RDB$NULL_FLAG, f.RDB$FIELD_LENGTH, f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE
+                @"SELECT rf.RDB$FIELD_NAME, f.RDB$FIELD_TYPE, rf.RDB$NULL_FLAG, f.RDB$FIELD_LENGTH, f.RDB$FIELD_PRECISION, f.RDB$FIELD_SCALE
                    FROM RDB$RELATION_FIELDS rf
                    JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME
-                   WHERE rf.RDB$RELATION_NAME = '{tableName}'
+                   WHERE rf.RDB$RELATION_NAME = @tableName
                    ORDER BY rf.RDB$FIELD_POSITION", connection);
+            colCmd.Parameters.AddWithValue("@tableName", tableName);
             await using var colReader = await colCmd.ExecuteReaderAsync();
             while (await colReader.ReadAsync())
             {
@@ -1842,11 +2061,25 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteFirebirdQueryAsync(string host, int port, string database, string username, string password, string query)
     {
+        ValidateReadOnlyQuery(query);
+
         await using var connection = new FbConnection(BuildFirebirdConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
-        await using var command = new FbCommand(query, connection);
-        await using var reader = await command.ExecuteReaderAsync();
-        return await DataReaderToJsonAsync(reader);
+
+        // Use snapshot transaction (read-only) to prevent writes
+        var transaction = await connection.BeginTransactionAsync(IsolationLevel.Snapshot);
+        try
+        {
+            await using var command = new FbCommand(query, connection, transaction);
+            command.CommandTimeout = 60;
+            await using var reader = await command.ExecuteReaderAsync();
+            var result = await DataReaderToJsonAsync(reader);
+            return result;
+        }
+        finally
+        {
+            try { await transaction.RollbackAsync(); } catch { /* connection may already be closed */ }
+        }
     }
 
     private async Task<List<string>> ExecuteFirebirdQueriesAsync(string host, int port, string database, string username, string password, List<string> queries)
@@ -1857,15 +2090,23 @@ public class DatabaseQueryService : IDatabaseQueryService
         var results = new List<string>();
         foreach (var query in queries)
         {
+            var transaction = await connection.BeginTransactionAsync(IsolationLevel.Snapshot);
             try
             {
-                await using var command = new FbCommand(query, connection);
+                ValidateReadOnlyQuery(query);
+
+                await using var command = new FbCommand(query, connection, transaction);
+                command.CommandTimeout = 60;
                 await using var reader = await command.ExecuteReaderAsync();
                 results.Add(await DataReaderToJsonAsync(reader));
             }
             catch (Exception ex)
             {
                 results.Add(JsonSerializer.Serialize(new { error = ex.Message, columns = Array.Empty<string>(), rows = Array.Empty<object>(), rowCount = 0 }));
+            }
+            finally
+            {
+                try { await transaction.RollbackAsync(); } catch { /* connection may already be closed */ }
             }
         }
         return results;
@@ -1879,7 +2120,8 @@ public class DatabaseQueryService : IDatabaseQueryService
     {
         // DuckDB uses file path as the data source. Host is treated as file path.
         var path = string.IsNullOrEmpty(host) ? database : host;
-        return $"Data Source={path}";
+        // Sanitize by removing semicolons to prevent connection string injection
+        return $"Data Source={path?.Replace(";", "") ?? ""}";
     }
 
     private async Task<bool> TestDuckDbConnectionAsync(string host, int port, string database, string username, string password)
@@ -1907,9 +2149,10 @@ public class DatabaseQueryService : IDatabaseQueryService
 
         foreach (var tableName in tableNames)
         {
-            schema.AppendLine($"CREATE TABLE \"{tableName}\" (");
+            var safeTableName = ValidateIdentifier(tableName);
+            schema.AppendLine($"CREATE TABLE \"{safeTableName}\" (");
             await using var colCmd = new DuckDBCommand(
-                $"SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'main' AND table_name = '{tableName}' ORDER BY ordinal_position", connection);
+                $"SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'main' AND table_name = '{safeTableName}' ORDER BY ordinal_position", connection);
             await using var colReader = await colCmd.ExecuteReaderAsync();
 
             var cols = new List<string>();
@@ -1946,10 +2189,11 @@ public class DatabaseQueryService : IDatabaseQueryService
 
         foreach (var tableName in tableNames)
         {
+            var safeTableName = ValidateIdentifier(tableName);
             var table = new TableSchema { Name = tableName, Schema = "main" };
 
             await using var colCmd = new DuckDBCommand(
-                $"SELECT column_name, data_type, is_nullable, column_default, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_schema = 'main' AND table_name = '{tableName}' ORDER BY ordinal_position", connection);
+                $"SELECT column_name, data_type, is_nullable, column_default, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_schema = 'main' AND table_name = '{safeTableName}' ORDER BY ordinal_position", connection);
             await using var colReader = await colCmd.ExecuteReaderAsync();
             while (await colReader.ReadAsync())
             {
@@ -1966,7 +2210,7 @@ public class DatabaseQueryService : IDatabaseQueryService
             await colReader.CloseAsync();
 
             // Row count
-            await using var countCmd = new DuckDBCommand($"SELECT COUNT(*) FROM \"{tableName}\"", connection);
+            await using var countCmd = new DuckDBCommand($"SELECT COUNT(*) FROM \"{safeTableName}\"", connection);
             var rowCount = await countCmd.ExecuteScalarAsync();
             table.RowCount = rowCount != null ? Convert.ToInt64(rowCount) : null;
 
@@ -1978,9 +2222,19 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteDuckDbQueryAsync(string host, int port, string database, string username, string password, string query)
     {
+        ValidateReadOnlyQuery(query);
+
         await using var connection = new DuckDBConnection(BuildDuckDbConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
+
+        // Set DuckDB to read-only access mode
+        await using (var roCmd = new DuckDBCommand("SET access_mode = 'read_only'", connection))
+        {
+            await roCmd.ExecuteNonQueryAsync();
+        }
+
         await using var command = new DuckDBCommand(query, connection);
+        command.CommandTimeout = 60;
         await using var reader = await command.ExecuteReaderAsync();
         return await DataReaderToJsonAsync(reader);
     }
@@ -1990,12 +2244,21 @@ public class DatabaseQueryService : IDatabaseQueryService
         await using var connection = new DuckDBConnection(BuildDuckDbConnectionString(host, port, database, username, password));
         await connection.OpenAsync();
 
+        // Set DuckDB to read-only access mode
+        await using (var roCmd = new DuckDBCommand("SET access_mode = 'read_only'", connection))
+        {
+            await roCmd.ExecuteNonQueryAsync();
+        }
+
         var results = new List<string>();
         foreach (var query in queries)
         {
             try
             {
+                ValidateReadOnlyQuery(query);
+
                 await using var command = new DuckDBCommand(query, connection);
+                command.CommandTimeout = 60;
                 await using var reader = await command.ExecuteReaderAsync();
                 results.Add(await DataReaderToJsonAsync(reader));
             }
@@ -2012,7 +2275,11 @@ public class DatabaseQueryService : IDatabaseQueryService
     #region Snowflake
 
     private static string BuildSnowflakeConnectionString(string host, int port, string database, string username, string password)
-        => $"account={host};user={username};password={password};db={database};scheme=https;port={port}";
+    {
+        // Sanitize values by removing semicolons to prevent connection string injection
+        static string Sanitize(string value) => value?.Replace(";", "") ?? "";
+        return $"account={Sanitize(host)};user={Sanitize(username)};password={Sanitize(password)};db={Sanitize(database)};scheme=https;port={port}";
+    }
 
     private async Task<bool> TestSnowflakeConnectionAsync(string host, int port, string database, string username, string password)
     {
@@ -2040,9 +2307,10 @@ public class DatabaseQueryService : IDatabaseQueryService
 
         foreach (var tableName in tableNames)
         {
-            schema.AppendLine($"CREATE TABLE \"{tableName}\" (");
+            var safeTableName = ValidateIdentifier(tableName);
+            schema.AppendLine($"CREATE TABLE \"{safeTableName}\" (");
             var colCmd = connection.CreateCommand();
-            colCmd.CommandText = $"SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'PUBLIC' AND table_name = '{tableName}' ORDER BY ordinal_position";
+            colCmd.CommandText = $"SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'PUBLIC' AND table_name = '{safeTableName}' ORDER BY ordinal_position";
             await using var colReader = await colCmd.ExecuteReaderAsync();
 
             var cols = new List<string>();
@@ -2080,10 +2348,11 @@ public class DatabaseQueryService : IDatabaseQueryService
 
         foreach (var tableName in tableNames)
         {
+            var safeTableName = ValidateIdentifier(tableName);
             var table = new TableSchema { Name = tableName, Schema = "PUBLIC" };
 
             var colCmd = connection.CreateCommand();
-            colCmd.CommandText = $"SELECT column_name, data_type, is_nullable, column_default, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_schema = 'PUBLIC' AND table_name = '{tableName}' ORDER BY ordinal_position";
+            colCmd.CommandText = $"SELECT column_name, data_type, is_nullable, column_default, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_schema = 'PUBLIC' AND table_name = '{safeTableName}' ORDER BY ordinal_position";
             await using var colReader = await colCmd.ExecuteReaderAsync();
             while (await colReader.ReadAsync())
             {
@@ -2101,7 +2370,7 @@ public class DatabaseQueryService : IDatabaseQueryService
 
             // Row count
             var countCmd = connection.CreateCommand();
-            countCmd.CommandText = $"SELECT row_count FROM information_schema.tables WHERE table_schema = 'PUBLIC' AND table_name = '{tableName}'";
+            countCmd.CommandText = $"SELECT row_count FROM information_schema.tables WHERE table_schema = 'PUBLIC' AND table_name = '{safeTableName}'";
             var rowCount = await countCmd.ExecuteScalarAsync();
             table.RowCount = rowCount != null && rowCount != DBNull.Value ? Convert.ToInt64(rowCount) : null;
 
@@ -2113,10 +2382,13 @@ public class DatabaseQueryService : IDatabaseQueryService
 
     private async Task<string> ExecuteSnowflakeQueryAsync(string host, int port, string database, string username, string password, string query)
     {
+        ValidateReadOnlyQuery(query);
+
         await using var connection = new SnowflakeDbConnection { ConnectionString = BuildSnowflakeConnectionString(host, port, database, username, password) };
         await connection.OpenAsync();
         var command = connection.CreateCommand();
         command.CommandText = query;
+        command.CommandTimeout = 60;
         await using var reader = await command.ExecuteReaderAsync();
         return await DataReaderToJsonAsync(reader);
     }
@@ -2131,8 +2403,11 @@ public class DatabaseQueryService : IDatabaseQueryService
         {
             try
             {
+                ValidateReadOnlyQuery(query);
+
                 var command = connection.CreateCommand();
                 command.CommandText = query;
+                command.CommandTimeout = 60;
                 await using var reader = await command.ExecuteReaderAsync();
                 results.Add(await DataReaderToJsonAsync(reader));
             }

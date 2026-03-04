@@ -38,15 +38,11 @@ public class DataExplorationService : IDataExplorationService
         var connection = await GetDatabaseConnectionAsync(databaseId, userId);
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
-        // Sanitize table name to prevent SQL injection
-        var safeTableName = SanitizeIdentifier(tableName);
-        var query = $"SELECT * FROM {safeTableName} LIMIT {Math.Min(limit, 100)}";
-
-        // Adjust for SQL Server
-        if (connection.DatabaseType == Core.Enums.DatabaseType.SQLServer)
-        {
-            query = $"SELECT TOP {Math.Min(limit, 100)} * FROM [{safeTableName}]";
-        }
+        // Quote table name to prevent SQL injection and support special characters
+        var safeTableName = QuoteIdentifier(tableName, connection.DatabaseType);
+        var query = connection.DatabaseType == Core.Enums.DatabaseType.SQLServer
+            ? $"SELECT TOP {Math.Min(limit, 100)} * FROM {safeTableName}"
+            : $"SELECT * FROM {safeTableName} LIMIT {Math.Min(limit, 100)}";
 
         var result = await _databaseQueryService.ExecuteQueryAsync(
             connection.DatabaseType,
@@ -79,10 +75,17 @@ public class DataExplorationService : IDataExplorationService
     {
         var connection = await GetDatabaseConnectionAsync(databaseId, userId);
 
-        var safeTable = SanitizeIdentifier(tableName);
-        var safeColumn = SanitizeIdentifier(columnName);
+        // Decrypt connection fields once and reuse for all queries
+        var host = _encryptionService.Decrypt(connection.EncryptedHost);
+        var port = int.Parse(_encryptionService.Decrypt(connection.EncryptedPort));
+        var database = _encryptionService.Decrypt(connection.EncryptedDatabaseName);
+        var username = _encryptionService.Decrypt(connection.EncryptedUsername);
+        var password = _encryptionService.Decrypt(connection.EncryptedPassword);
 
-        // Build stats query based on database type
+        var safeTable = QuoteIdentifier(tableName, connection.DatabaseType);
+        var safeColumn = QuoteIdentifier(columnName, connection.DatabaseType);
+
+        // Build stats query based on database type — identifiers are already properly quoted
         var statsQuery = connection.DatabaseType switch
         {
             Core.Enums.DatabaseType.PostgreSQL => $@"
@@ -106,23 +109,17 @@ public class DataExplorationService : IDataExplorationService
             Core.Enums.DatabaseType.SQLServer => $@"
                 SELECT
                     COUNT(*) as total_count,
-                    SUM(CASE WHEN [{safeColumn}] IS NULL THEN 1 ELSE 0 END) as null_count,
-                    COUNT(DISTINCT [{safeColumn}]) as unique_count,
-                    MIN(CAST([{safeColumn}] AS NVARCHAR(MAX))) as min_value,
-                    MAX(CAST([{safeColumn}] AS NVARCHAR(MAX))) as max_value,
-                    AVG(TRY_CAST([{safeColumn}] AS FLOAT)) as avg_value
-                FROM [{safeTable}]",
+                    SUM(CASE WHEN {safeColumn} IS NULL THEN 1 ELSE 0 END) as null_count,
+                    COUNT(DISTINCT {safeColumn}) as unique_count,
+                    MIN(CAST({safeColumn} AS NVARCHAR(MAX))) as min_value,
+                    MAX(CAST({safeColumn} AS NVARCHAR(MAX))) as max_value,
+                    AVG(TRY_CAST({safeColumn} AS FLOAT)) as avg_value
+                FROM {safeTable}",
             _ => throw new NotSupportedException($"Database type {connection.DatabaseType} not supported for stats")
         };
 
         var result = await _databaseQueryService.ExecuteQueryAsync(
-            connection.DatabaseType,
-            _encryptionService.Decrypt(connection.EncryptedHost),
-            int.Parse(_encryptionService.Decrypt(connection.EncryptedPort)),
-            _encryptionService.Decrypt(connection.EncryptedDatabaseName),
-            _encryptionService.Decrypt(connection.EncryptedUsername),
-            _encryptionService.Decrypt(connection.EncryptedPassword),
-            statsQuery);
+            connection.DatabaseType, host, port, database, username, password, statsQuery);
 
         var parsed = JsonSerializer.Deserialize<JsonElement>(result);
         var rows = parsed.GetProperty("rows").EnumerateArray().ToList();
@@ -138,17 +135,11 @@ public class DataExplorationService : IDataExplorationService
 
         // Get sample values
         var sampleQuery = connection.DatabaseType == Core.Enums.DatabaseType.SQLServer
-            ? $"SELECT DISTINCT TOP 10 [{safeColumn}] FROM [{safeTable}] WHERE [{safeColumn}] IS NOT NULL"
+            ? $"SELECT DISTINCT TOP 10 {safeColumn} FROM {safeTable} WHERE {safeColumn} IS NOT NULL"
             : $"SELECT DISTINCT {safeColumn} FROM {safeTable} WHERE {safeColumn} IS NOT NULL LIMIT 10";
 
         var sampleResult = await _databaseQueryService.ExecuteQueryAsync(
-            connection.DatabaseType,
-            _encryptionService.Decrypt(connection.EncryptedHost),
-            int.Parse(_encryptionService.Decrypt(connection.EncryptedPort)),
-            _encryptionService.Decrypt(connection.EncryptedDatabaseName),
-            _encryptionService.Decrypt(connection.EncryptedUsername),
-            _encryptionService.Decrypt(connection.EncryptedPassword),
-            sampleQuery);
+            connection.DatabaseType, host, port, database, username, password, sampleQuery);
 
         var sampleParsed = JsonSerializer.Deserialize<JsonElement>(sampleResult);
         var sampleValues = sampleParsed.GetProperty("rows").EnumerateArray()
@@ -156,17 +147,8 @@ public class DataExplorationService : IDataExplorationService
             .Select(v => GetJsonValue(v))
             .ToList();
 
-        // Get data type from schema
-        var schemas = await _databaseQueryService.GetStructuredSchemaAsync(
-            connection.DatabaseType,
-            _encryptionService.Decrypt(connection.EncryptedHost),
-            int.Parse(_encryptionService.Decrypt(connection.EncryptedPort)),
-            _encryptionService.Decrypt(connection.EncryptedDatabaseName),
-            _encryptionService.Decrypt(connection.EncryptedUsername),
-            _encryptionService.Decrypt(connection.EncryptedPassword));
-
-        var dataType = schemas.FirstOrDefault(t => t.Name == tableName)
-            ?.Columns.FirstOrDefault(c => c.Name == columnName)?.DataType ?? "unknown";
+        // Infer data type from sample values instead of fetching the entire schema
+        var dataType = InferColumnDataType(sampleValues);
 
         return new ColumnStatsDto
         {
@@ -980,10 +962,17 @@ RULES:
         return file;
     }
 
-    private static string SanitizeIdentifier(string identifier)
+    private static string QuoteIdentifier(string identifier, Core.Enums.DatabaseType dbType)
     {
-        // Remove any characters that aren't alphanumeric or underscore
-        return new string(identifier.Where(c => char.IsLetterOrDigit(c) || c == '_').ToArray());
+        return dbType switch
+        {
+            Core.Enums.DatabaseType.MySQL or Core.Enums.DatabaseType.MariaDB or Core.Enums.DatabaseType.ClickHouse
+                => "`" + identifier.Replace("`", "``") + "`",
+            Core.Enums.DatabaseType.SQLServer
+                => "[" + identifier.Replace("]", "]]") + "]",
+            // PostgreSQL, DuckDB, Oracle, and all others use double-quote quoting
+            _ => "\"" + identifier.Replace("\"", "\"\"") + "\""
+        };
     }
 
     private static object? GetJsonValue(JsonElement element)
@@ -1030,6 +1019,39 @@ RULES:
             }
         }
         return null;
+    }
+
+    private static string InferColumnDataType(List<object?> sampleValues)
+    {
+        var nonNullValues = sampleValues.Where(v => v != null).ToList();
+        if (!nonNullValues.Any()) return "unknown";
+
+        // Check the .NET types returned from the query result
+        var firstValue = nonNullValues[0];
+        if (firstValue is long or int or short or byte)
+            return "integer";
+        if (firstValue is double or float or decimal)
+            return "number";
+        if (firstValue is bool)
+            return "boolean";
+
+        // For string values, try to infer from content
+        var strValues = nonNullValues.Select(v => v!.ToString()!).ToList();
+
+        // Check if all values look like dates
+        if (strValues.All(v => DateTime.TryParse(v, out _)))
+            return "datetime";
+
+        // Check if all values look numeric
+        if (strValues.All(v => double.TryParse(v, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out _)))
+            return "number";
+
+        // Check if all values are boolean-like
+        var boolLike = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "true", "false", "yes", "no", "0", "1" };
+        if (strValues.All(v => boolLike.Contains(v)))
+            return "boolean";
+
+        return "text";
     }
 
     private static bool IsNumericType(string dataType)

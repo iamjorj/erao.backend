@@ -28,6 +28,8 @@ public class MappingProfile : Profile
                 opt => opt.MapFrom(src => src.AppConnector != null ? src.AppConnector.Name : null))
             .ForMember(dest => dest.LastMessageAt,
                 opt => opt.MapFrom(src => src.Messages.Any() ? src.Messages.Max(m => m.CreatedAt) : (DateTime?)null))
+            .ForMember(dest => dest.HasContextSummary,
+                opt => opt.MapFrom(src => !string.IsNullOrEmpty(src.ContextSummary)))
             .ForMember(dest => dest.Messages,
                 opt => opt.MapFrom(src => src.Messages.OrderBy(m => m.CreatedAt)));
 

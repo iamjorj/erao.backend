@@ -799,14 +799,17 @@ public class ConnectorSyncService : IConnectorSyncService
         var client = _httpClientFactory.CreateClient();
         client.Timeout = TimeSpan.FromSeconds(30);
 
+        // Use HTTP Basic Auth instead of passing credentials in query string
+        var basicAuthValue = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{consumerKey}:{consumerSecret}"));
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", basicAuthValue);
+
         var allRecords = new List<Dictionary<string, object?>>();
         var page = 1;
         var hasMore = true;
 
         while (hasMore)
         {
-            var url = $"{storeUrl}/wp-json/wc/v3/{tableName}?per_page=100&page={page}" +
-                      $"&consumer_key={Uri.EscapeDataString(consumerKey)}&consumer_secret={Uri.EscapeDataString(consumerSecret)}";
+            var url = $"{storeUrl}/wp-json/wc/v3/{tableName}?per_page=100&page={page}";
 
             var response = await client.GetAsync(url);
             var json = await response.Content.ReadAsStringAsync();

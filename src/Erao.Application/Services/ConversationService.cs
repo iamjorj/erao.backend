@@ -103,6 +103,13 @@ public class ConversationService : IConversationService
             conversation.Title = request.Title;
         }
 
+        if (request.CustomInstructions != null)
+        {
+            conversation.CustomInstructions = request.CustomInstructions.Length > 2000
+                ? request.CustomInstructions[..2000]
+                : request.CustomInstructions;
+        }
+
         await _unitOfWork.Conversations.UpdateAsync(conversation);
         await _unitOfWork.SaveChangesAsync();
 

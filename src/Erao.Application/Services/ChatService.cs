@@ -3,7 +3,9 @@ using AutoMapper;
 using Erao.Core.DTOs.Chat;
 using Erao.Core.Entities;
 using Erao.Core.Enums;
+using Erao.Core.Helpers;
 using Erao.Core.Interfaces;
+using Microsoft.Extensions.Logging;
 
 namespace Erao.Application.Services;
 
@@ -22,8 +24,14 @@ public class ChatService : IChatService
     private readonly IConnectorSyncService _connectorSyncService;
     private readonly IEncryptionService _encryptionService;
     private readonly IMapper _mapper;
+    private readonly ILogger<ChatService> _logger;
 
     private static readonly TimeSpan ConnectorSyncStaleThreshold = TimeSpan.FromHours(1);
+
+    // Token-aware context window constants
+    private const int HistoryTokenBudget = 55_000;  // from 128k window minus system prompt reserve minus output reserve
+    private const int MaxMessagesToLoad = 100;       // DB fetch cap
+    private const int SummaryTriggerThreshold = 6;   // re-summarize when 6+ new messages overflow
 
     public ChatService(
         IUnitOfWork unitOfWork,
@@ -33,7 +41,8 @@ public class ChatService : IChatService
         IConnectorQueryService connectorQueryService,
         IConnectorSyncService connectorSyncService,
         IEncryptionService encryptionService,
-        IMapper mapper)
+        IMapper mapper,
+        ILogger<ChatService> logger)
     {
         _unitOfWork = unitOfWork;
         _ollamaService = ollamaService;
@@ -43,6 +52,7 @@ public class ChatService : IChatService
         _connectorSyncService = connectorSyncService;
         _encryptionService = encryptionService;
         _mapper = mapper;
+        _logger = logger;
     }
 
     public async Task<ChatResponse> ProcessMessageAsync(Guid userId, ChatRequest request)
@@ -59,8 +69,13 @@ public class ChatService : IChatService
         // Reset billing cycle if needed
         if (DateTime.UtcNow >= user.BillingCycleReset)
         {
+            // Calculate next reset from the original date, not now, to avoid
+            // race conditions where concurrent requests both reset the counter
+            var nextReset = user.BillingCycleReset;
+            while (nextReset <= DateTime.UtcNow)
+                nextReset = nextReset.AddMonths(1);
             user.QueriesUsedThisMonth = 0;
-            user.BillingCycleReset = DateTime.UtcNow.AddMonths(1);
+            user.BillingCycleReset = nextReset;
         }
 
         if (user.QueryLimitPerMonth != -1 && user.QueriesUsedThisMonth >= user.QueryLimitPerMonth)
@@ -75,9 +90,9 @@ public class ChatService : IChatService
             throw new InvalidOperationException("Conversation not found");
         }
 
-        // Load only recent messages for AI context (not all messages)
-        const int maxContextMessages = 20;
-        var recentMessages = await _unitOfWork.Messages.GetRecentAsync(conversation.Id, maxContextMessages);
+        // Load recent messages for token-aware context assembly
+        var recentMessages = await _unitOfWork.Messages.GetRecentAsync(conversation.Id, MaxMessagesToLoad);
+        var totalMessageCount = await _unitOfWork.Messages.GetCountAsync(conversation.Id);
 
         // Auto-generate conversation title from first message if empty
         var isFirstMessage = string.IsNullOrEmpty(conversation.Title) || conversation.Title == "New Chat";
@@ -115,16 +130,20 @@ public class ChatService : IChatService
 
                     if (isStale)
                     {
-                        try
+                        // Fire-and-forget: don't block the chat request waiting for sync
+                        var connectorId = appConnector.Id;
+                        _ = Task.Run(async () =>
                         {
-                            await _connectorSyncService.SyncAsync(appConnector.Id, userId);
-                            // Reload connector to get updated fields
-                            appConnector = await _unitOfWork.AppConnectors.GetByIdAsync(appConnector.Id);
-                        }
-                        catch
-                        {
-                            // Sync failure is non-blocking — continue with existing data
-                        }
+                            try
+                            {
+                                await _connectorSyncService.SyncAsync(connectorId, userId);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Background connector sync failed for {ConnectorId}", connectorId);
+                            }
+                        });
+                        _logger.LogInformation("Connector sync triggered in background for {ConnectorId}, continuing with existing data", connectorId);
                     }
                 }
 
@@ -182,55 +201,8 @@ public class ChatService : IChatService
             }
         }
 
-        // Build chat history from recent messages - include query results for context
-        // Use [DATA_CONTEXT] tags so AI understands this is reference info, not text to repeat
-        var history = recentMessages
-            .Select(m => {
-                var role = m.Role == MessageRole.User ? "user" : "assistant";
-                var content = m.Content;
-
-                // For assistant messages, append query results as context for follow-up questions
-                // Format as hidden context that AI should reference but NOT repeat in responses
-                if (m.Role == MessageRole.Assistant && !string.IsNullOrEmpty(m.QueryResult))
-                {
-                    try
-                    {
-                        using var doc = System.Text.Json.JsonDocument.Parse(m.QueryResult);
-                        var root = doc.RootElement;
-                        if (root.TryGetProperty("rows", out var rows) && rows.GetArrayLength() > 0)
-                        {
-                            var rowCount = rows.GetArrayLength();
-                            if (rowCount <= 5)
-                            {
-                                // Small result set - include actual data for context
-                                var dataLines = new List<string>();
-                                foreach (var row in rows.EnumerateArray())
-                                {
-                                    var vals = new List<string>();
-                                    foreach (var prop in row.EnumerateObject())
-                                    {
-                                        vals.Add($"{prop.Name}={prop.Value}");
-                                    }
-                                    dataLines.Add(string.Join(", ", vals));
-                                }
-                                content += $"\n[DATA_CONTEXT: {rowCount} row(s): {string.Join(" | ", dataLines)}]";
-                            }
-                            else
-                            {
-                                // Large result set - just note the count
-                                content += $"\n[DATA_CONTEXT: Query returned {rowCount} rows]";
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        // If JSON parsing fails, skip adding result context
-                    }
-                }
-
-                return (role, content);
-            })
-            .ToList();
+        // Token-aware context assembly with compaction
+        var (history, contextMetadata) = await BuildContextWindow(conversation, recentMessages, totalMessageCount);
 
         // Build system prompt - different for database vs file vs connector
         string systemPrompt;
@@ -264,8 +236,18 @@ public class ChatService : IChatService
             systemPrompt = BuildSystemPrompt(schemaContext, dbConnection?.DatabaseType);
         }
 
+        // Custom instructions: append to user message + relax the GOLDEN RULE
+        var effectiveMessage = request.Message;
+        if (!string.IsNullOrWhiteSpace(conversation.CustomInstructions))
+        {
+            effectiveMessage = request.Message + ". " + conversation.CustomInstructions;
+            systemPrompt = systemPrompt.Replace(
+                "**GOLDEN RULE — PLAIN LANGUAGE**: The user is a business person, NOT a developer.",
+                "**GOLDEN RULE**: Follow the user's custom instructions. The user may request technical details, SQL explanations, or detailed calculations — if so, provide them.");
+        }
+
         // Get AI response with full conversation history
-        var (aiResponse, tokensUsed) = await _ollamaService.ChatAsync(request.Message, history, systemPrompt);
+        var (aiResponse, tokensUsed) = await _ollamaService.ChatAsync(effectiveMessage, history, systemPrompt);
 
         // Layer 2: Check if AI wants to clarify before proceeding
         var clarification = ExtractClarification(aiResponse);
@@ -303,7 +285,8 @@ public class ChatService : IChatService
                 AssistantMessage = _mapper.Map<MessageDto>(clarificationAssistantMessage),
                 QueryResult = null,
                 TokensUsed = tokensUsed,
-                Clarification = clarification
+                Clarification = clarification,
+                Context = contextMetadata
             };
         }
 
@@ -685,6 +668,7 @@ public class ChatService : IChatService
             cleanedContent = "";
         }
 
+
         // Save assistant message
         var assistantMessage = new Message
         {
@@ -728,8 +712,199 @@ public class ChatService : IChatService
             TokensUsed = tokensUsed,
             VisualizationHint = visualizationHint,
             Insight = insight,
-            FollowUpQuestions = followUpQuestions
+            FollowUpQuestions = followUpQuestions,
+            Context = contextMetadata
         };
+    }
+
+    /// <summary>
+    /// Token-aware context assembly: walks messages backwards, estimating tokens,
+    /// and compacts older messages into a summary when budget is exceeded.
+    /// </summary>
+    private async Task<(List<(string role, string content)> history, ContextMetadata metadata)> BuildContextWindow(
+        Conversation conversation, List<Message> recentMessages, int totalMessageCount)
+    {
+        var enriched = recentMessages
+            .Select(m => (message: m, role: m.Role == MessageRole.User ? "user" : "assistant", content: EnrichMessageContent(m)))
+            .ToList();
+
+        var history = new List<(string role, string content)>();
+        int tokensUsed = 0;
+        int cutoffIndex = -1; // index in enriched where we stopped fitting
+
+        // Walk backwards from newest, estimating tokens per message
+        for (int i = enriched.Count - 1; i >= 0; i--)
+        {
+            var msgTokens = TokenEstimator.EstimateMessageTokens(enriched[i].content);
+            if (tokensUsed + msgTokens > HistoryTokenBudget)
+            {
+                cutoffIndex = i;
+                break;
+            }
+            tokensUsed += msgTokens;
+            history.Insert(0, (enriched[i].role, enriched[i].content));
+        }
+
+        bool usingSummary = false;
+        int summarizedMessages = conversation.SummarizedMessageCount;
+
+        // If older messages remain beyond the budget
+        if (cutoffIndex >= 0)
+        {
+            var overflowCount = cutoffIndex + 1;
+            var totalBeforeContext = totalMessageCount - recentMessages.Count;
+            var messagesNotInContext = totalBeforeContext + overflowCount;
+
+            // Check if we need to (re-)generate a summary
+            bool needsSummary = string.IsNullOrEmpty(conversation.ContextSummary)
+                || (messagesNotInContext - conversation.SummarizedMessageCount) >= SummaryTriggerThreshold;
+
+            if (needsSummary)
+            {
+                var messagesToSummarize = enriched.Take(overflowCount)
+                    .Select(e => (e.role, e.content))
+                    .ToList();
+
+                var summary = await GenerateContextSummary(messagesToSummarize, conversation.ContextSummary);
+                conversation.ContextSummary = summary;
+                conversation.SummarizedMessageCount = messagesNotInContext;
+                await _unitOfWork.Conversations.UpdateAsync(conversation);
+                // Note: SaveChanges happens later in the main flow
+            }
+
+            // Prepend summary as a system message if available
+            if (!string.IsNullOrEmpty(conversation.ContextSummary))
+            {
+                var summaryContent = $"[CONVERSATION_SUMMARY]\n{conversation.ContextSummary}\n[END_SUMMARY]";
+                var summaryTokens = TokenEstimator.EstimateMessageTokens(summaryContent);
+                history.Insert(0, ("system", summaryContent));
+                tokensUsed += summaryTokens;
+                usingSummary = true;
+                summarizedMessages = conversation.SummarizedMessageCount;
+            }
+        }
+
+        var metadata = new ContextMetadata
+        {
+            TotalMessages = totalMessageCount,
+            MessagesInContext = history.Count(h => h.role != "system"),
+            UsingSummary = usingSummary,
+            SummarizedMessages = summarizedMessages,
+            EstimatedInputTokens = tokensUsed,
+            TokenBudget = HistoryTokenBudget,
+            HasCustomInstructions = !string.IsNullOrWhiteSpace(conversation.CustomInstructions)
+        };
+
+        return (history, metadata);
+    }
+
+    /// <summary>
+    /// Enriches a message with DATA_CONTEXT from query results.
+    /// For ≤5 rows: full data. For 6+: column headers + first 5 sample rows + total count.
+    /// </summary>
+    private static string EnrichMessageContent(Message message)
+    {
+        var content = message.Content;
+
+        if (message.Role != MessageRole.Assistant || string.IsNullOrEmpty(message.QueryResult))
+            return content;
+
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(message.QueryResult);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("rows", out var rows) || rows.GetArrayLength() == 0)
+                return content;
+
+            var rowCount = rows.GetArrayLength();
+
+            if (rowCount <= 5)
+            {
+                // Small result set - include actual data for context
+                var dataLines = new List<string>();
+                foreach (var row in rows.EnumerateArray())
+                {
+                    var vals = new List<string>();
+                    foreach (var prop in row.EnumerateObject())
+                        vals.Add($"{prop.Name}={prop.Value}");
+                    dataLines.Add(string.Join(", ", vals));
+                }
+                content += $"\n[DATA_CONTEXT: {rowCount} row(s): {string.Join(" | ", dataLines)}]";
+            }
+            else
+            {
+                // Large result set: column headers + first 5 sample rows + total count
+                var columns = new List<string>();
+                var sampleLines = new List<string>();
+                int sampleCount = 0;
+
+                foreach (var row in rows.EnumerateArray())
+                {
+                    if (columns.Count == 0)
+                    {
+                        foreach (var prop in row.EnumerateObject())
+                            columns.Add(prop.Name);
+                    }
+
+                    if (sampleCount < 5)
+                    {
+                        var vals = new List<string>();
+                        foreach (var prop in row.EnumerateObject())
+                            vals.Add($"{prop.Name}={prop.Value}");
+                        sampleLines.Add(string.Join(", ", vals));
+                        sampleCount++;
+                    }
+                    else break;
+                }
+
+                content += $"\n[DATA_CONTEXT: {rowCount} total rows, columns: [{string.Join(", ", columns)}], sample (5 rows): {string.Join(" | ", sampleLines)}]";
+            }
+        }
+        catch
+        {
+            // If JSON parsing fails, skip adding result context
+        }
+
+        return content;
+    }
+
+    /// <summary>
+    /// Generates or updates a conversation summary by calling the AI model.
+    /// </summary>
+    private async Task<string> GenerateContextSummary(List<(string role, string content)> messagesToSummarize, string? existingSummary)
+    {
+        var conversationText = string.Join("\n", messagesToSummarize.Select(m => $"[{m.role}]: {m.content}"));
+
+        string prompt;
+        if (!string.IsNullOrEmpty(existingSummary))
+        {
+            prompt = $@"You have an existing summary of a data analysis conversation:
+
+{existingSummary}
+
+Here are newer messages that need to be incorporated:
+
+{conversationText}
+
+Update the summary to include the new messages. Focus on: data sources discussed, questions asked, SQL patterns used, key findings. Keep it under 500 words. Return ONLY the updated summary, no preamble.";
+        }
+        else
+        {
+            prompt = $@"Summarize this data analysis conversation. Focus on: data sources discussed, questions asked, SQL patterns used, key findings. Keep it under 500 words. Return ONLY the summary, no preamble.
+
+{conversationText}";
+        }
+
+        try
+        {
+            var (summary, _) = await _ollamaService.ChatAsync("Generate summary", new List<(string, string)>(), prompt);
+            return summary.Trim();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to generate context summary");
+            return existingSummary ?? "";
+        }
     }
 
     private static string BuildSystemPrompt(string? schemaContext, DatabaseType? dbType = null)
@@ -867,7 +1042,8 @@ Classify the user's intent, then follow the matching format:
 
 **DATA** (DEFAULT — use this for almost everything):
 - This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, and ANY request that could involve querying the data.
-- Start with 1 sentence framing the business question in plain language — what the data will reveal about their business, not what you're about to do. Example: 'This will show how much your revenue depends on just a few big customers.' Never say 'I'll look at...' or 'Let me query...'.
+- NEVER start your response with a code block. Always write plain text FIRST.
+- Write 1-2 sentences framing the business question in plain language — what the data will reveal about their business, not what you're about to do. Example: 'This will show how much your revenue depends on just a few big customers.' Never say 'I'll look at...' or 'Let me query...'.
 - THEN include ```sql + ```viz blocks. The ```sql block is MANDATORY — without it, the user sees nothing.
 - For complex concepts (""best"", ""most valuable""): briefly mention what business factors you considered (e.g. ""based on revenue, order frequency, and how long they've been a customer"") — never explain the technical scoring method.
 - You MUST write fresh SQL for EVERY request. [DATA_CONTEXT] tags in history are past references only — never mention them.
@@ -1375,7 +1551,8 @@ Classify the user's intent, then follow the matching format:
 
 **DATA** (DEFAULT — use this for almost everything):
 - This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, and ANY request that could involve querying the data.
-- Start with 1 sentence framing the business question in plain language — what the data will reveal, not what you're about to do. Example: 'This will show how much your revenue depends on just a few big customers.' Never say 'I'll look at...' or 'Let me query...'.
+- NEVER start your response with a code block. Always write plain text FIRST.
+- Write 1-2 sentences framing the business question in plain language — what the data will reveal, not what you're about to do. Example: 'This will show how much your revenue depends on just a few big customers.' Never say 'I'll look at...' or 'Let me query...'.
 - THEN include ```sql + ```viz blocks. The ```sql block is MANDATORY — without it, the user sees nothing.
 - For complex concepts (""most productive"", ""healthiest""): briefly mention what business factors you considered (e.g. ""based on output, consistency, and experience"") — never explain the technical scoring method.
 - You MUST write fresh SQL for EVERY request. [DATA_CONTEXT] tags in history are past references only — never mention them.
@@ -1857,7 +2034,8 @@ Classify the user's intent, then follow the matching format:
 
 **DATA** (DEFAULT — use this for almost everything):
 - This includes: ""give me"", ""show me"", ""top 10"", ""how many"", ""compare"", ""best"", ""worst"", rankings, lists, charts, and ANY request that could involve querying the data.
-- Start with 1 sentence framing the business question in plain language — what the data will reveal about their business. Never say 'I'll look at...' or 'Let me query...'.
+- NEVER start your response with a code block. Always write plain text FIRST.
+- Write 1-2 sentences framing the business question in plain language — what the data will reveal about their business. Never say 'I'll look at...' or 'Let me query...'.
 - THEN include ```sql + ```viz blocks. The ```sql block is MANDATORY — without it, the user sees nothing.
 - You MUST write fresh SQL for EVERY request. [DATA_CONTEXT] tags in history are past references only — never mention them.
 

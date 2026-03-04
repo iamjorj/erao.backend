@@ -1,9 +1,11 @@
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using AutoMapper;
 using Erao.Core.DTOs.Connector;
 using Erao.Core.Entities;
 using Erao.Core.Enums;
+using Erao.Core.Helpers;
 using Erao.Core.Interfaces;
 using Microsoft.Extensions.Logging;
 
@@ -264,7 +266,13 @@ public class ConnectorService : IConnectorService
 
         var client = _httpClientFactory.CreateClient();
         client.Timeout = TimeSpan.FromSeconds(10);
-        var url = $"{storeUrl}/wp-json/wc/v3/system_status?consumer_key={Uri.EscapeDataString(consumerKey)}&consumer_secret={Uri.EscapeDataString(consumerSecret)}";
+
+        // Use HTTP Basic Auth instead of passing credentials in query string (more secure -- avoids
+        // credentials appearing in server access logs, proxy logs, and browser history)
+        var basicAuthValue = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{consumerKey}:{consumerSecret}"));
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", basicAuthValue);
+
+        var url = $"{storeUrl}/wp-json/wc/v3/system_status";
 
         var response = await client.GetAsync(url);
         if (response.IsSuccessStatusCode)

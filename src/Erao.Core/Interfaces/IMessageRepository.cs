@@ -10,4 +10,5 @@ public interface IMessageRepository : IRepository<Message>
     /// Only loads Content, Role, QueryResult — not the full entity graph.
     /// </summary>
     Task<List<Message>> GetRecentAsync(Guid conversationId, int count);
+    Task<int> GetCountAsync(Guid conversationId);
 }

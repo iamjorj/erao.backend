@@ -8,6 +8,15 @@ public class Conversation : BaseEntity
     public Guid? AppConnectorId { get; set; }
     public string Title { get; set; } = string.Empty;
 
+    /// <summary>AI-generated summary of compacted older messages</summary>
+    public string? ContextSummary { get; set; }
+
+    /// <summary>How many messages the summary covers (for staleness check)</summary>
+    public int SummarizedMessageCount { get; set; }
+
+    /// <summary>User-editable per-conversation instructions (max 2000 chars)</summary>
+    public string? CustomInstructions { get; set; }
+
     // Navigation properties
     public virtual User User { get; set; } = null!;
     public virtual DatabaseConnection? DatabaseConnection { get; set; }

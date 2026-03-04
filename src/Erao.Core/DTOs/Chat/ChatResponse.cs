@@ -26,4 +26,9 @@ public class ChatResponse
     /// Suggested follow-up questions the user might want to ask next
     /// </summary>
     public List<string>? FollowUpQuestions { get; set; }
+
+    /// <summary>
+    /// Metadata about the context window used for this request
+    /// </summary>
+    public ContextMetadata? Context { get; set; }
 }
