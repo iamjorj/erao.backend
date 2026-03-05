@@ -1,6 +1,7 @@
 using AutoMapper;
 using Erao.Core.DTOs.Chat;
 using Erao.Core.Entities;
+using Erao.Core.Enums;
 using Erao.Core.Interfaces;
 
 namespace Erao.Application.Services;
@@ -12,6 +13,7 @@ public interface IConversationService
     Task<ConversationDto> CreateAsync(Guid userId, CreateConversationRequest request);
     Task<ConversationDto> UpdateAsync(Guid id, Guid userId, UpdateConversationRequest request);
     Task DeleteAsync(Guid id, Guid userId);
+    Task<ConversationDto> GetOrCreateBySourceAsync(Guid userId, DataSourceType sourceType, Guid sourceId);
 }
 
 public class ConversationService : IConversationService
@@ -110,6 +112,11 @@ public class ConversationService : IConversationService
                 : request.CustomInstructions;
         }
 
+        if (request.ContextSummary != null)
+        {
+            conversation.ContextSummary = request.ContextSummary;
+        }
+
         await _unitOfWork.Conversations.UpdateAsync(conversation);
         await _unitOfWork.SaveChangesAsync();
 
@@ -126,5 +133,58 @@ public class ConversationService : IConversationService
 
         await _unitOfWork.Conversations.DeleteAsync(conversation);
         await _unitOfWork.SaveChangesAsync();
+    }
+
+    public async Task<ConversationDto> GetOrCreateBySourceAsync(Guid userId, DataSourceType sourceType, Guid sourceId)
+    {
+        // Try to find existing conversation for this source
+        var existing = await _unitOfWork.Conversations.FindBySourceAsync(userId, sourceType, sourceId);
+        if (existing != null)
+        {
+            return _mapper.Map<ConversationDto>(existing);
+        }
+
+        // Validate source ownership and get name for title
+        string sourceName;
+        switch (sourceType)
+        {
+            case DataSourceType.Database:
+                var db = await _unitOfWork.DatabaseConnections.GetByIdAsync(sourceId);
+                if (db == null || db.UserId != userId)
+                    throw new InvalidOperationException("Database connection not found");
+                sourceName = db.Name;
+                break;
+            case DataSourceType.File:
+                var file = await _unitOfWork.FileDocuments.GetByIdAsync(sourceId);
+                if (file == null || file.UserId != userId)
+                    throw new InvalidOperationException("File document not found");
+                sourceName = file.OriginalFileName;
+                break;
+            case DataSourceType.Connector:
+                var connector = await _unitOfWork.AppConnectors.GetByIdAsync(sourceId);
+                if (connector == null || connector.UserId != userId)
+                    throw new InvalidOperationException("App connector not found");
+                sourceName = connector.Name;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(sourceType));
+        }
+
+        // Create new conversation
+        var conversation = new Conversation
+        {
+            UserId = userId,
+            Title = $"Chat - {sourceName}",
+            DatabaseConnectionId = sourceType == DataSourceType.Database ? sourceId : null,
+            FileDocumentId = sourceType == DataSourceType.File ? sourceId : null,
+            AppConnectorId = sourceType == DataSourceType.Connector ? sourceId : null,
+        };
+
+        await _unitOfWork.Conversations.AddAsync(conversation);
+        await _unitOfWork.SaveChangesAsync();
+
+        // Reload with navigation properties
+        var saved = await _unitOfWork.Conversations.GetWithMessagesAsync(conversation.Id);
+        return _mapper.Map<ConversationDto>(saved);
     }
 }

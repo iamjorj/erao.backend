@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using Erao.Application.Services;
 using Erao.Core.DTOs.Chat;
 using Erao.Core.DTOs.Common;
+using Erao.Core.Enums;
 using System.Security.Claims;
 
 namespace Erao.API.Controllers;
@@ -34,6 +35,33 @@ public class ConversationsController : ControllerBase
         {
             _logger.LogError(ex, "Error getting conversations");
             return StatusCode(500, ApiResponse<IEnumerable<ConversationDto>>.ErrorResponse("An error occurred"));
+        }
+    }
+
+    [HttpGet("by-source")]
+    public async Task<ActionResult<ApiResponse<ConversationDto>>> GetBySource(
+        [FromQuery] string type, [FromQuery] Guid sourceId)
+    {
+        try
+        {
+            var userId = GetUserId();
+            if (!Enum.TryParse<DataSourceType>(type, ignoreCase: true, out var sourceType))
+            {
+                return BadRequest(ApiResponse<ConversationDto>.ErrorResponse(
+                    "Invalid source type. Must be 'database', 'file', or 'connector'."));
+            }
+
+            var conversation = await _conversationService.GetOrCreateBySourceAsync(userId, sourceType, sourceId);
+            return Ok(ApiResponse<ConversationDto>.SuccessResponse(conversation));
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(ApiResponse<ConversationDto>.ErrorResponse(ex.Message));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting conversation by source {Type}/{SourceId}", type, sourceId);
+            return StatusCode(500, ApiResponse<ConversationDto>.ErrorResponse("An error occurred"));
         }
     }
 

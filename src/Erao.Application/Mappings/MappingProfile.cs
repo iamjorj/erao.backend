@@ -1,3 +1,4 @@
+using System.Text.Json;
 using AutoMapper;
 using Erao.Core.DTOs;
 using Erao.Core.DTOs.Chat;
@@ -30,6 +31,10 @@ public class MappingProfile : Profile
                 opt => opt.MapFrom(src => src.Messages.Any() ? src.Messages.Max(m => m.CreatedAt) : (DateTime?)null))
             .ForMember(dest => dest.HasContextSummary,
                 opt => opt.MapFrom(src => !string.IsNullOrEmpty(src.ContextSummary)))
+            .ForMember(dest => dest.LastContextMetadata,
+                opt => opt.MapFrom(src => string.IsNullOrEmpty(src.LastContextMetadataJson)
+                    ? null
+                    : JsonSerializer.Deserialize<ContextMetadata>(src.LastContextMetadataJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })))
             .ForMember(dest => dest.Messages,
                 opt => opt.MapFrom(src => src.Messages.OrderBy(m => m.CreatedAt)));
 

@@ -84,6 +84,7 @@ public class EraoDbContext : DbContext
             entity.Property(e => e.ContextSummary).HasColumnType("text");
             entity.Property(e => e.CustomInstructions).HasColumnType("text").HasMaxLength(2000);
             entity.Property(e => e.SummarizedMessageCount).HasDefaultValue(0);
+            entity.Property(e => e.LastContextMetadataJson).HasColumnType("text");
 
             entity.HasOne(e => e.User)
                 .WithMany(u => u.Conversations)
@@ -104,6 +105,11 @@ public class EraoDbContext : DbContext
                 .WithMany(a => a.Conversations)
                 .HasForeignKey(e => e.AppConnectorId)
                 .OnDelete(DeleteBehavior.SetNull);
+
+            // Composite indexes for finding conversations by source
+            entity.HasIndex(e => new { e.UserId, e.DatabaseConnectionId });
+            entity.HasIndex(e => new { e.UserId, e.FileDocumentId });
+            entity.HasIndex(e => new { e.UserId, e.AppConnectorId });
         });
 
         // Message configuration

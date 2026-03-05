@@ -15,5 +15,8 @@ public class ConversationDto
     public DateTime? LastMessageAt { get; set; }
     public string? CustomInstructions { get; set; }
     public bool HasContextSummary { get; set; }
+    public string? ContextSummary { get; set; }
+    public int SummarizedMessageCount { get; set; }
+    public ContextMetadata? LastContextMetadata { get; set; }
     public List<MessageDto> Messages { get; set; } = new();
 }

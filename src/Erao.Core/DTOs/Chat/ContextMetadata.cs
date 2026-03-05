@@ -9,4 +9,6 @@ public class ContextMetadata
     public int EstimatedInputTokens { get; set; }
     public int TokenBudget { get; set; }
     public bool HasCustomInstructions { get; set; }
+    public string? ContextSummary { get; set; }
+    public int SummarizedMessageCount { get; set; }
 }

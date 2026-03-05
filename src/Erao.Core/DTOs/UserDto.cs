@@ -11,5 +11,6 @@ public class UserDto
     public SubscriptionTier SubscriptionTier { get; set; }
     public int QueryLimitPerMonth { get; set; }
     public int QueriesUsedThisMonth { get; set; }
+    public string? GlobalCustomInstructions { get; set; }
     public DateTime CreatedAt { get; set; }
 }

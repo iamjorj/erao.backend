@@ -8,7 +8,7 @@ namespace Erao.Application.Services;
 public interface IAccountService
 {
     Task<UserDto?> GetAccountAsync(Guid userId);
-    Task<UserDto> UpdateAccountAsync(Guid userId, string? firstName, string? lastName);
+    Task<UserDto> UpdateAccountAsync(Guid userId, string? firstName, string? lastName, string? globalCustomInstructions = null);
     Task DeleteAccountAsync(Guid userId);
 }
 
@@ -33,7 +33,7 @@ public class AccountService : IAccountService
         return _mapper.Map<UserDto>(user);
     }
 
-    public async Task<UserDto> UpdateAccountAsync(Guid userId, string? firstName, string? lastName)
+    public async Task<UserDto> UpdateAccountAsync(Guid userId, string? firstName, string? lastName, string? globalCustomInstructions = null)
     {
         var user = await _unitOfWork.Users.GetByIdAsync(userId);
         if (user == null)
@@ -46,6 +46,8 @@ public class AccountService : IAccountService
             user.FirstName = firstName;
         if (lastName != null)
             user.LastName = lastName;
+        if (globalCustomInstructions != null)
+            user.GlobalCustomInstructions = globalCustomInstructions.Length > 2000 ? globalCustomInstructions[..2000] : globalCustomInstructions;
 
         // Mark entity as modified and save
         await _unitOfWork.Users.UpdateAsync(user);

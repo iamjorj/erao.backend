@@ -17,6 +17,9 @@ public class Conversation : BaseEntity
     /// <summary>User-editable per-conversation instructions (max 2000 chars)</summary>
     public string? CustomInstructions { get; set; }
 
+    /// <summary>Last computed context metadata (JSON), persisted so frontend can show it on load</summary>
+    public string? LastContextMetadataJson { get; set; }
+
     // Navigation properties
     public virtual User User { get; set; } = null!;
     public virtual DatabaseConnection? DatabaseConnection { get; set; }

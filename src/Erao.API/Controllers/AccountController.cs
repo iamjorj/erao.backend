@@ -47,7 +47,7 @@ public class AccountController : ControllerBase
         try
         {
             var userId = GetUserId();
-            var user = await _accountService.UpdateAccountAsync(userId, request.FirstName, request.LastName);
+            var user = await _accountService.UpdateAccountAsync(userId, request.FirstName, request.LastName, request.GlobalCustomInstructions);
             return Ok(ApiResponse<UserDto>.SuccessResponse(user, "Account updated"));
         }
         catch (InvalidOperationException ex)
@@ -96,4 +96,5 @@ public class UpdateAccountRequest
 {
     public string? FirstName { get; set; }
     public string? LastName { get; set; }
+    public string? GlobalCustomInstructions { get; set; }
 }

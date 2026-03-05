@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using AutoMapper;
 using Erao.Core.DTOs.Chat;
 using Erao.Core.Entities;
@@ -277,6 +278,9 @@ public class ChatService : IChatService
                 ExecutionTimeMs = (int)stopwatch.ElapsedMilliseconds
             };
             await _unitOfWork.UsageLogs.AddAsync(clarificationUsageLog);
+
+            // Persist context metadata so frontend can restore it on page load
+            conversation.LastContextMetadataJson = JsonSerializer.Serialize(contextMetadata);
             await _unitOfWork.SaveChangesAsync();
 
             return new ChatResponse
@@ -697,6 +701,8 @@ public class ChatService : IChatService
         };
         await _unitOfWork.UsageLogs.AddAsync(usageLog);
 
+        // Persist context metadata so frontend can restore it on page load
+        conversation.LastContextMetadataJson = JsonSerializer.Serialize(contextMetadata, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
         await _unitOfWork.SaveChangesAsync();
 
         var assistantDto = _mapper.Map<MessageDto>(assistantMessage);
@@ -792,7 +798,9 @@ public class ChatService : IChatService
             SummarizedMessages = summarizedMessages,
             EstimatedInputTokens = tokensUsed,
             TokenBudget = HistoryTokenBudget,
-            HasCustomInstructions = !string.IsNullOrWhiteSpace(conversation.CustomInstructions)
+            HasCustomInstructions = !string.IsNullOrWhiteSpace(conversation.CustomInstructions),
+            ContextSummary = conversation.ContextSummary,
+            SummarizedMessageCount = conversation.SummarizedMessageCount
         };
 
         return (history, metadata);
@@ -1073,7 +1081,7 @@ A. **Dialect**: {dialect}. {quoteStyle}. Use {dateFunc} for relative dates — n
 B. **Data cleaning**: Before ANY numeric operation, filter out NULL and empty values. Use NULLS LAST in ORDER BY. COALESCE every computed score to 0. Use NULLIF(x, 0) in denominators. If a column mixes numbers with text, filter non-numeric rows in a CTE first, then convert and rank.
 
 C. **Composite scores**: For abstract concepts (""best"", ""most valuable"", ""at-risk""), NEVER sort by one column. Identify all relevant factors, normalize each with PERCENT_RANK() OVER (ORDER BY col) to 0-1 scale, weight by importance, sum into a final score. Use CTEs for cleaning → scoring → final SELECT.
-- PERCENT_RANK: 0.0 = first row, 1.0 = last row. Higher-is-better → ORDER BY ASC. Lower-is-better → ORDER BY DESC.
+- PERCENT_RANK: 0.0 = first row, 1.0 = last row. Higher-is-better → ORDER BY ASC. Lower-is-better → ORDER BY DESC. NEVER use (1 - PERCENT_RANK(...)) — this inverts the ranking and rewards worse values. Just use PERCENT_RANK() directly with the correct ORDER BY direction.
 - Boolean columns: convert to 0/1, multiply by weight directly (no PERCENT_RANK).
 - Weights by importance to the question. Sum ≈ 1.0.
 
@@ -1581,7 +1589,7 @@ Classify the user's intent, then follow the matching format:
 {dataCleaning}
 
 C. **Composite scores**: For abstract concepts (""most productive"", ""healthiest"", ""at-risk""), NEVER sort by one column. Look at ALL scoreable columns in the schema (tagged NUMERIC, MIXED, BOOLEAN), normalize each with PERCENT_RANK() OVER (ORDER BY col) to 0-1 scale, weight by importance to the question, sum into a final score. Use CTEs for cleaning → scoring → final SELECT.
-- PERCENT_RANK: 0.0 = first row, 1.0 = last row. Higher-is-better → ORDER BY ASC. Lower-is-better → ORDER BY DESC.
+- PERCENT_RANK: 0.0 = first row, 1.0 = last row. Higher-is-better → ORDER BY ASC. Lower-is-better → ORDER BY DESC. NEVER use (1 - PERCENT_RANK(...)) — this inverts the ranking and rewards worse values. Just use PERCENT_RANK() directly with the correct ORDER BY direction.
 - Boolean columns (YES/NO): convert to 0/1 flag, multiply by weight directly (no PERCENT_RANK).
 - Weights by importance to the question. Sum ≈ 1.0.
 
