@@ -6,8 +6,8 @@ services:
       - "5432:5432"
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=erao_dev
+      - POSTGRES_PASSWORD=xusanov
+      - POSTGRES_DB=erao
     volumes:
       - postgres-data-dev:/var/lib/postgresql/data
     healthcheck:

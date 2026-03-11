@@ -6,12 +6,16 @@ using Microsoft.OpenApi.Models;
 using FluentValidation;
 using Erao.Application.Mappings;
 using Erao.Application.Services;
+using Erao.Application.Services.Analytics;
 using Erao.Application.Validators;
 using Erao.Core.Interfaces;
+using Erao.Core.Interfaces.Analytics;
 using Erao.Infrastructure.Data;
 using Erao.Infrastructure.Repositories;
+using Erao.Infrastructure.Repositories.Analytics;
 using Erao.Infrastructure.Security;
 using Erao.Infrastructure.Services;
+using Erao.Infrastructure.Services.Analytics;
 using Erao.Infrastructure.Services.Parsers;
 
 namespace Erao.API.Extensions;
@@ -72,6 +76,17 @@ public static class ServiceExtensions
 
         // MinIO storage
         services.AddSingleton<IMinioService, MinioService>();
+
+        // Analytics module
+        services.AddMemoryCache();
+        services.AddScoped<IAnalyticsDatasetRepository, AnalyticsDatasetRepository>();
+        services.AddScoped<IAnalyticsRecordRepository, AnalyticsRecordRepository>();
+        services.AddScoped<IAnalyticsMetricDefinitionRepository, AnalyticsMetricDefinitionRepository>();
+        services.AddSingleton<IAnalyticsCacheService, AnalyticsCacheService>();
+        services.AddScoped<IAnalyticsIngestionService, AnalyticsIngestionService>();
+        services.AddScoped<IAnalyticsQueryService, AnalyticsQueryService>();
+        services.AddScoped<IAnalyticsMetricsService, AnalyticsMetricsService>();
+        services.AddScoped<IAnalyticsAggregationService, AnalyticsAggregationService>();
 
         // AutoMapper
         services.AddAutoMapper(typeof(MappingProfile));

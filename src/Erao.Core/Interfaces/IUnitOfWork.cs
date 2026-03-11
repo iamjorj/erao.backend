@@ -1,3 +1,5 @@
+using Erao.Core.Interfaces.Analytics;
+
 namespace Erao.Core.Interfaces;
 
 public interface IUnitOfWork : IDisposable
@@ -9,5 +11,11 @@ public interface IUnitOfWork : IDisposable
     IUsageLogRepository UsageLogs { get; }
     IFileDocumentRepository FileDocuments { get; }
     IAppConnectorRepository AppConnectors { get; }
+
+    // Analytics
+    IAnalyticsDatasetRepository AnalyticsDatasets { get; }
+    IAnalyticsRecordRepository AnalyticsRecords { get; }
+    IAnalyticsMetricDefinitionRepository AnalyticsMetricDefinitions { get; }
+
     Task<int> SaveChangesAsync();
 }

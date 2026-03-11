@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Erao.Core.Entities;
+using Erao.Core.Entities.Analytics;
 using Erao.Core.Enums;
 
 namespace Erao.Infrastructure.Data;
@@ -17,6 +18,11 @@ public class EraoDbContext : DbContext
     public DbSet<UsageLog> UsageLogs { get; set; }
     public DbSet<FileDocument> FileDocuments { get; set; }
     public DbSet<AppConnector> AppConnectors { get; set; }
+
+    // Analytics
+    public DbSet<AnalyticsDataset> AnalyticsDatasets { get; set; }
+    public DbSet<AnalyticsRecord> AnalyticsRecords { get; set; }
+    public DbSet<AnalyticsMetricDefinition> AnalyticsMetricDefinitions { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -162,6 +168,70 @@ public class EraoDbContext : DbContext
                 .WithMany(d => d.UsageLogs)
                 .HasForeignKey(e => e.DatabaseConnectionId)
                 .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // AnalyticsDataset configuration
+        modelBuilder.Entity<AnalyticsDataset>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Name).IsRequired().HasMaxLength(200);
+            entity.Property(e => e.Source).IsRequired().HasMaxLength(200);
+            entity.Property(e => e.Description).HasMaxLength(1000);
+            entity.Property(e => e.MetadataJson).HasColumnType("text");
+
+            entity.HasIndex(e => new { e.UserId, e.Name }).IsUnique();
+
+            entity.HasOne(e => e.User)
+                .WithMany()
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasMany(e => e.Records)
+                .WithOne(r => r.Dataset)
+                .HasForeignKey(r => r.DatasetId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // AnalyticsRecord configuration
+        modelBuilder.Entity<AnalyticsRecord>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+
+            entity.HasIndex(e => new { e.UserId, e.DatasetId, e.OccurredAt });
+            entity.HasIndex(e => new { e.UserId, e.OccurredAt });
+
+            // JSONB columns for flexible dimensions and measures.
+            // This avoids rigid schema while allowing PostgreSQL to index
+            // JSONB contents if needed in the future via GIN indexes.
+            entity.Property(e => e.Dimensions)
+                .HasColumnType("jsonb")
+                .HasConversion(
+                    v => System.Text.Json.JsonSerializer.Serialize(v, (System.Text.Json.JsonSerializerOptions?)null),
+                    v => System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(v, (System.Text.Json.JsonSerializerOptions?)null) ?? new Dictionary<string, string>());
+
+            entity.Property(e => e.Measures)
+                .HasColumnType("jsonb")
+                .HasConversion(
+                    v => System.Text.Json.JsonSerializer.Serialize(v, (System.Text.Json.JsonSerializerOptions?)null),
+                    v => System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, decimal>>(v, (System.Text.Json.JsonSerializerOptions?)null) ?? new Dictionary<string, decimal>());
+        });
+
+        // AnalyticsMetricDefinition configuration
+        modelBuilder.Entity<AnalyticsMetricDefinition>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Name).IsRequired().HasMaxLength(200);
+            entity.Property(e => e.DatasetName).IsRequired().HasMaxLength(200);
+            entity.Property(e => e.MeasureField).HasMaxLength(200);
+            entity.Property(e => e.Description).HasMaxLength(1000);
+            entity.Property(e => e.MetricType).HasConversion<int>();
+
+            entity.HasIndex(e => new { e.UserId, e.DatasetName, e.Name }).IsUnique();
+
+            entity.HasOne(e => e.User)
+                .WithMany()
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
     }
 
